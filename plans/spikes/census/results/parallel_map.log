@@ -1,0 +1,36 @@
+
+==== census report ====
+runtime 0.39 s, 16 threads, 126029 allocations (8686016 bytes), 1 untagged
+objects: 126029 total, 117485 escaped (93.22%); bytes: 8686016 total, 7549112 escaped (86.91%)
+died thread-local: 6039, died escaped: 79949, survivors: 40041
+stores observed: 126410, copies observed: 66213 (0 truncated)
+promotions: 61532, objects promoted via graphs: 117484, bytes 7549064, mean graph 1.9 objects, max 22 objects / 3728 bytes
+promotion graph sizes (objects): [1..2)=5600 [2..4)=55931 [16..32)=1
+stack-address escapes: 12 (30.8 per second), 0 into thread-local heap objects, threads with a visible stack: 1 of 16
+  thread 1: stack visible from 0.002 s for 0.375 s (first via std.parallelism)
+coverage audit: 1254 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 1 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  newarray            60007 objects        6186368 bytes, escaped 93.21% of objects, 84.36% of bytes
+  newclass            60021 objects        2403600 bytes, escaped 93.22% of objects, 93.23% of bytes
+  gc                   6000 objects          96000 bytes, escaped 93.33% of objects, 93.33% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  _Dmain                                  3 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  std.concurrency                         1 objects, escaped 100.00% (bytes 100.00%), 1 promotions moving 22 objects
+  std.parallelism                        24 objects, escaped 87.50% (bytes 3.59%), 5600 promotions moving 5600 objects
+  parallel_map.main                  120000 objects, escaped 93.22% (bytes 93.24%), 55931 promotions moving 111862 objects
+  core.internal                        6000 objects, escaped 93.33% (bytes 93.33%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+       5596416 bytes      60000 objects, escaped  93.22%  [newarray] int parallel_map.main(immutable(char)[][]).__foreachbody_L36_C9(ulong, ref parallel_map.Item)
+       2400000 bytes      60000 objects, escaped  93.22%  [newclass] int parallel_map.main(immutable(char)[][]).__foreachbody_L36_C9(ulong, ref parallel_map.Item)
+        491520 bytes          3 objects, escaped   0.00%  [newarray] _Dmain
+         98304 bytes          3 objects, escaped   0.00%  [newarray] immutable(char)[][] std.parallelism.TaskPool.amap!(parallel_map.toStr(ulong)).amap!(std.range.iota!(
+         96000 bytes       6000 objects, escaped  93.33%  [gc] pure nothrow @trusted char[] core.internal.array.construction._d_newarrayU!(char)._d_newarrayU(ulong
+          3408 bytes         19 objects, escaped 100.00%  [newclass] @trusted std.parallelism.TaskPool std.parallelism.TaskPool.__ctor(ulong)
+           128 bytes          1 objects, escaped 100.00%  [newarray] @trusted std.parallelism.TaskPool std.parallelism.TaskPool.__ctor(ulong)
+           120 bytes          1 objects, escaped 100.00%  [newclass] pure @nogc @safe std.parallelism.TaskPool std.parallelism.taskPool().__dgliteral_L3577_C6()
+top store sites by promoted objects:
+      111862 promoted objects in    55931 promotions (7455736 bytes)  int parallel_map.main(immutable(char)[][]).__foreachbody_L36_C9(ulong, ref parallel_map.Item)
+        5600 promoted objects in     5600 promotions (89600 bytes)  void std.parallelism.TaskPool.amap!(parallel_map.toStr(ulong)).amap!(std.range.iota!(ulong, ulong).iota(ulong,
+          22 promoted objects in        1 promotions (3728 bytes)  ref std.parallelism.TaskPool std.concurrency.initOnce!(std.parallelism.taskPool().pool).initOnce(lazy std.para
+CENSUS runtime_s=0.390 threads=16 allocs=126029 alloc_bytes=8686016 objs=126029 esc_objs=117485 esc_obj_pct=93.221 bytes=8686016 esc_bytes=7549112 esc_byte_pct=86.911 promotions=61532 promoted_objs=117484 max_graph=22 stack_escapes=12 stack_escapes_per_s=30.8 stack_visible_threads=1 unobserved_cross=0 unobserved_global=1 stores=126410

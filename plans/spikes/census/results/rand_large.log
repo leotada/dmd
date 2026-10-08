@@ -1,0 +1,22 @@
+
+==== census report ====
+runtime 4.17 s, 1 threads, 10240002 allocations (676239069271 bytes), 1 untagged
+objects: 10240002 total, 2 escaped (0.00%); bytes: 676239069271 total, 106036 escaped (0.00%)
+died thread-local: 10239999, died escaped: 0, survivors: 3
+stores observed: 10240000, copies observed: 0 (0 truncated)
+promotions: 0, objects promoted via graphs: 0, bytes 0, mean graph 0.0 objects, max 0 objects / 0 bytes
+promotion graph sizes (objects):
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 1
+coverage audit: 1 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 2 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  newarray                1 objects          12288 bytes, escaped 0.00% of objects, 0.00% of bytes
+  gc               10240000 objects   676239056935 bytes, escaped 0.00% of objects, 0.00% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  _Dmain                           10240001 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+  676239056935 bytes   10240000 objects, escaped   0.00%  [gc] _Dmain
+         12288 bytes          1 objects, escaped   0.00%  [newarray] _Dmain
+            48 bytes          1 objects, escaped 100.00%  [] unknown
+top store sites by promoted objects:
+CENSUS runtime_s=4.167 threads=1 allocs=10240002 alloc_bytes=676239069271 objs=10240002 esc_objs=2 esc_obj_pct=0.000 bytes=676239069271 esc_bytes=106036 esc_byte_pct=0.000 promotions=0 promoted_objs=0 max_graph=0 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=2 stores=10240000

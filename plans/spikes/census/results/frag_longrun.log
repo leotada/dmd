@@ -1,0 +1,31 @@
+frag_longrun step=0 rss=6164 KiB live=2 KiB
+frag_longrun step=100000 rss=212064 KiB live=81134 KiB
+frag_longrun step=200000 rss=215140 KiB live=80657 KiB
+frag_longrun end rss=215148 KiB live=80906 KiB
+
+==== census report ====
+runtime 0.30 s, 1 threads, 300014 allocations (1382152919 bytes), 5 untagged
+objects: 300014 total, 2 escaped (0.00%); bytes: 1382136535 total, 28720 escaped (0.00%)
+died thread-local: 300009, died escaped: 0, survivors: 5
+stores observed: 300067, copies observed: 0 (0 truncated)
+promotions: 0, objects promoted via graphs: 0, bytes 0, mean graph 0.0 objects, max 0 objects / 0 bytes
+promotion graph sizes (objects):
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 1
+coverage audit: 3 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 2 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  newarray           300001 objects     1382135728 bytes, escaped 0.00% of objects, 0.00% of bytes
+  array                   4 objects            119 bytes, escaped 0.00% of objects, 0.00% of bytes
+  gc                      8 objects            640 bytes, escaped 0.00% of objects, 0.00% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  _Dmain                             300001 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  std.internal                            4 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  std.array                               8 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+    1382135728 bytes     300001 objects, escaped   0.00%  [newarray] _Dmain
+           512 bytes          4 objects, escaped   0.00%  [gc] pure nothrow @safe void std.array.Appender!(immutable(char)[][]).Appender.ensureAddable(ulong)
+           128 bytes          4 objects, escaped   0.00%  [gc] pure @safe immutable(char)[][] std.array.split!(immutable(char)[]).split(immutable(char)[])
+           119 bytes          4 objects, escaped   0.00%  [array] pure nothrow @nogc @safe std.internal.cstring.TempCStringBuffer!(char).TempCStringBuffer std.interna
+            48 bytes          1 objects, escaped 100.00%  [] unknown
+top store sites by promoted objects:
+CENSUS runtime_s=0.303 threads=1 allocs=300014 alloc_bytes=1382152919 objs=300014 esc_objs=2 esc_obj_pct=0.001 bytes=1382136535 esc_bytes=28720 esc_byte_pct=0.002 promotions=0 promoted_objs=0 max_graph=0 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=2 stores=300067

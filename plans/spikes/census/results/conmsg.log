@@ -1,0 +1,44 @@
+
+==== census report ====
+runtime 4.35 s, 2 threads, 7044470 allocations (487175574 bytes), 1396434 untagged
+objects: 7044470 total, 3726657 escaped (52.90%); bytes: 487175574 total, 329808385 escaped (67.70%)
+died thread-local: 3317804, died escaped: 3723807, survivors: 2859
+stores observed: 13984139, copies observed: 8579622 (0 truncated)
+promotions: 465488, objects promoted via graphs: 3726655, bytes 329808265, mean graph 8.0 objects, max 9 objects / 1080 bytes
+promotion graph sizes (objects): [1..2)=11 [4..8)=1 [8..16)=465476
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 2
+coverage audit: 10 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 2 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  allocmemory             1 objects             24 bytes, escaped 0.00% of objects, 0.00% of bytes
+  newclass               12 objects           1203 bytes, escaped 50.00% of objects, 43.97% of bytes
+  aa                1396429 objects       89371488 bytes, escaped 100.00% of objects, 100.00% of bytes
+  array                   1 objects         557043 bytes, escaped 0.00% of objects, 0.00% of bytes
+  gc                1135400 objects       29265184 bytes, escaped 41.25% of objects, 26.38% of bytes
+  newarray           930952 objects       99256832 bytes, escaped 50.00% of objects, 73.13% of bytes
+  append            2185241 objects      108599664 bytes, escaped 0.00% of objects, 0.00% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                           1396434 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  std.concurrency                      2856 objects, escaped 99.72% (bytes 99.71%), 2843 promotions moving 25499 objects
+  conmsg.producer                         1 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  std.algorithm                       97676 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  std.array                          569406 objects, escaped 81.75% (bytes 67.89%), 0 promotions moving 0 objects
+  conmsg.buildVal                   2792856 objects, escaped 66.67% (bytes 79.58%), 0 promotions moving 0 objects
+  std.variant                             0 objects, escaped 0.00% (bytes 0.00%), 10 promotions moving 80 objects
+  conmsg.serialize                  2185241 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  core.internal                           0 objects, escaped 0.00% (bytes 0.00%), 462635 promotions moving 3701076 objects
+top allocation sites by bytes:
+     160124136 bytes    1396434 objects, escaped 100.00%  [] unknown
+      99256832 bytes     930952 objects, escaped  50.00%  [newarray] pure std.json.JSONValue conmsg.buildVal(in dchar[])
+      91234576 bytes    1438551 objects, escaped   0.00%  [append] void conmsg.serialize(in std.json.JSONValue, ref ubyte[])
+      89371392 bytes    1396428 objects, escaped 100.00%  [aa] pure std.json.JSONValue conmsg.buildVal(in dchar[])
+      17365088 bytes     746690 objects, escaped   0.00%  [append] int conmsg.serialize(in std.json.JSONValue, ref ubyte[]).__foreachbody_L41_C9(ref immutable(char)[],
+      14895232 bytes     465476 objects, escaped   0.00%  [gc] pure std.json.JSONValue conmsg.buildVal(in dchar[])
+       7449632 bytes     465539 objects, escaped  99.99%  [gc] pure nothrow @safe void std.array.Appender!(immutable(char)[]).Appender.ensureAddable(ulong)
+       3521856 bytes     103867 objects, escaped   0.00%  [gc] pure nothrow @safe void std.array.Appender!(dchar[]).Appender.ensureAddable(ulong)
+top store sites by promoted objects:
+     3701076 promoted objects in   462635 promotions (327564401 bytes)  ref core.internal.lifetime.emplaceRef!(std.concurrency.List!(std.concurrency.Message).List.Node, std.concurren
+       25488 promoted objects in     2832 promotions (2236000 bytes)  void std.concurrency.MessageBox.put(ref std.concurrency.Message)
+          80 promoted objects in       10 promotions (6832 bytes)  long std.variant.VariantN!(32uL).VariantN.handler!(immutable(std.json.JSONValue)).handler(std.variant.VariantN
+          10 promoted objects in       10 promotions (960 bytes)  bool std.concurrency.MessageBox.get!(void delegate(std.variant.VariantN!(32uL).VariantN), void function(std.co
+           1 promoted objects in        1 promotions (72 bytes)  @property core.sync.mutex.Mutex std.concurrency.registryLock()
+CENSUS runtime_s=4.351 threads=2 allocs=7044470 alloc_bytes=487175574 objs=7044470 esc_objs=3726657 esc_obj_pct=52.902 bytes=487175574 esc_bytes=329808385 esc_byte_pct=67.698 promotions=465488 promoted_objs=3726655 max_graph=9 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=2 stores=13984139

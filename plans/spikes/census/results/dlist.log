@@ -1,0 +1,27 @@
+
+==== census report ====
+runtime 0.29 s, 1 threads, 488423 allocations (16975459 bytes), 1 untagged
+objects: 488423 total, 3 escaped (0.00%); bytes: 24909411 total, 2215971 escaped (8.90%)
+died thread-local: 390741, died escaped: 0, survivors: 97682
+stores observed: 3421991, copies observed: 26 (1 truncated)
+promotions: 1, objects promoted via graphs: 1, bytes 557043, mean graph 1.0 objects, max 1 objects / 557043 bytes
+promotion graph sizes (objects): [1..2)=1
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 1
+coverage audit: 97681 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 2 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  array                   1 objects         557043 bytes, escaped 100.00% of objects, 100.00% of bytes
+  gc                 488421 objects       24352320 bytes, escaped 0.00% of objects, 6.81% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  std.internal                            1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  _Dmain                             488385 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  std.array                              36 objects, escaped 2.78% (bytes 19.02%), 1 promotions moving 1 objects
+top allocation sites by bytes:
+      15628320 bytes     488385 objects, escaped   0.00%  [gc] _Dmain
+       8723840 bytes         31 objects, escaped   3.23%  [gc] pure nothrow @safe void std.array.Appender!(immutable(char)[][]).Appender.ensureAddable(ulong)
+        557043 bytes          1 objects, escaped 100.00%  [array] pure nothrow @nogc @safe std.internal.cstring.TempCStringBuffer!(char).TempCStringBuffer std.interna
+           160 bytes          5 objects, escaped   0.00%  [gc] pure @safe immutable(char)[][] std.array.split!(immutable(char)[]).split(immutable(char)[])
+            48 bytes          1 objects, escaped 100.00%  [] unknown
+top store sites by promoted objects:
+           1 promoted objects in        1 promotions (557043 bytes)  pure nothrow @safe int std.array.split!(immutable(char)[]).split(immutable(char)[]).__foreachbody_L1931_C5(ref
+CENSUS runtime_s=0.289 threads=1 allocs=488423 alloc_bytes=16975459 objs=488423 esc_objs=3 esc_obj_pct=0.001 bytes=24909411 esc_bytes=2215971 esc_byte_pct=8.896 promotions=1 promoted_objs=1 max_graph=1 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=2 stores=3421991

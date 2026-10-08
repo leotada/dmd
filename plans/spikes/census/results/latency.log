@@ -1,0 +1,37 @@
+latency: live=16 MiB requests=20000
+  p50=2 us  p99=4 us  p99.9=218 us  max=8559 us
+  [     0 us,      2 us): 5456
+  [     2 us,      4 us): 14127
+  [     4 us,      8 us): 366
+  [     8 us,     16 us): 25
+  [    64 us,    128 us): 1
+  [   128 us,    256 us): 17
+  [   256 us,    512 us): 4
+  [  2048 us,   4096 us): 2
+  [  4096 us,   8192 us): 1
+  [  8192 us,  16384 us): 1
+
+==== census report ====
+runtime 0.11 s, 1 threads, 265540 allocations (106201904 bytes), 1 untagged
+objects: 265540 total, 2 escaped (0.00%); bytes: 106201904 total, 560 escaped (0.00%)
+died thread-local: 265537, died escaped: 0, survivors: 3
+stores observed: 298305, copies observed: 52769 (1 truncated)
+promotions: 0, objects promoted via graphs: 0, bytes 0, mean graph 0.0 objects, max 0 objects / 0 bytes
+promotion graph sizes (objects):
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 1
+coverage audit: 1 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 2 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  newarray           212770 objects      103927296 bytes, escaped 0.00% of objects, 0.00% of bytes
+  newclass            52768 objects        2110720 bytes, escaped 0.00% of objects, 0.00% of bytes
+  gc                      1 objects         163840 bytes, escaped 0.00% of objects, 0.00% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  _Dmain                             265538 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  core.internal                           1 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+     103927296 bytes     212770 objects, escaped   0.00%  [newarray] _Dmain
+       2110720 bytes      52768 objects, escaped   0.00%  [newclass] _Dmain
+        163840 bytes          1 objects, escaped   0.00%  [gc] pure nothrow @trusted long[] core.internal.array.construction._d_newarrayU!(long)._d_newarrayU(ulong
+            48 bytes          1 objects, escaped 100.00%  [] unknown
+top store sites by promoted objects:
+CENSUS runtime_s=0.106 threads=1 allocs=265540 alloc_bytes=106201904 objs=265540 esc_objs=2 esc_obj_pct=0.001 bytes=106201904 esc_bytes=560 esc_byte_pct=0.001 promotions=0 promoted_objs=0 max_graph=0 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=2 stores=298305

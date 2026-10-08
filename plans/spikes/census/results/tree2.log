@@ -1,0 +1,24 @@
+
+==== census report ====
+runtime 0.16 s, 1 threads, 200003 allocations (6400120 bytes), 1 untagged
+objects: 200003 total, 2 escaped (0.00%); bytes: 6400120 total, 88 escaped (0.00%)
+died thread-local: 199899, died escaped: 0, survivors: 104
+stores observed: 2324474, copies observed: 1 (0 truncated)
+promotions: 0, objects promoted via graphs: 0, bytes 0, mean graph 0.0 objects, max 0 objects / 0 bytes
+promotion graph sizes (objects):
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 1
+coverage audit: 104 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 2 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  newclass                1 objects             40 bytes, escaped 100.00% of objects, 100.00% of bytes
+  gc                 200001 objects        6400032 bytes, escaped 0.00% of objects, 0.00% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  _Dmain                                  2 objects, escaped 50.00% (bytes 55.56%), 0 promotions moving 0 objects
+  std.container                      200000 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+       6400000 bytes     200000 objects, escaped   0.00%  [gc] pure nothrow @safe bool std.container.rbtree.RedBlackTree!(int, "a < b", false).RedBlackTree._add(sc
+            48 bytes          1 objects, escaped 100.00%  [] unknown
+            40 bytes          1 objects, escaped 100.00%  [newclass] _Dmain
+            32 bytes          1 objects, escaped   0.00%  [gc] _Dmain
+top store sites by promoted objects:
+CENSUS runtime_s=0.157 threads=1 allocs=200003 alloc_bytes=6400120 objs=200003 esc_objs=2 esc_obj_pct=0.001 bytes=6400120 esc_bytes=88 esc_byte_pct=0.001 promotions=0 promoted_objs=0 max_graph=0 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=2 stores=2324474

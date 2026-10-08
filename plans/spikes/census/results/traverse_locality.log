@@ -1,0 +1,24 @@
+
+==== census report ====
+runtime 0.06 s, 1 threads, 169455 allocations (22925976 bytes), 1 untagged
+objects: 169455 total, 2 escaped (0.00%); bytes: 22925976 total, 560 escaped (0.00%)
+died thread-local: 169450, died escaped: 0, survivors: 5
+stores observed: 169454, copies observed: 152787 (0 truncated)
+promotions: 0, objects promoted via graphs: 0, bytes 0, mean graph 0.0 objects, max 0 objects / 0 bytes
+promotion graph sizes (objects):
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 1
+coverage audit: 3 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 2 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  newclass           152787 objects       12826280 bytes, escaped 0.00% of objects, 0.00% of bytes
+  newarray            16667 objects       10099648 bytes, escaped 0.01% of objects, 0.01% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  traverse_locality.buildSmall       102787 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  _Dmain                              66667 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+      10099648 bytes      16667 objects, escaped   0.01%  [newarray] _Dmain
+      10026280 bytes     102787 objects, escaped   0.00%  [newclass] traverse_locality.Small traverse_locality.buildSmall(ulong, ref ulong)
+       2800000 bytes      50000 objects, escaped   0.00%  [newclass] _Dmain
+            48 bytes          1 objects, escaped 100.00%  [] unknown
+top store sites by promoted objects:
+CENSUS runtime_s=0.057 threads=1 allocs=169455 alloc_bytes=22925976 objs=169455 esc_objs=2 esc_obj_pct=0.001 bytes=22925976 esc_bytes=560 esc_byte_pct=0.002 promotions=0 promoted_objs=0 max_graph=0 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=2 stores=169454

@@ -1,0 +1,29 @@
+
+==== census report ====
+runtime 0.54 s, 5 threads, 12292 allocations (5491670231 bytes), 1 untagged
+objects: 12292 total, 4 escaped (0.03%); bytes: 5491670231 total, 1118291 escaped (0.02%)
+died thread-local: 12283, died escaped: 0, survivors: 9
+stores observed: 5, copies observed: 12289 (9785 truncated)
+promotions: 1, objects promoted via graphs: 1, bytes 557043, mean graph 1.0 objects, max 1 objects / 557043 bytes
+promotion graph sizes (objects): [1..2)=1
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 5
+coverage audit: 6 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 3 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  array                   1 objects         557043 bytes, escaped 100.00% of objects, 100.00% of bytes
+  newarray             9786 objects     5490872368 bytes, escaped 0.02% of objects, 0.01% of bytes
+  newclass                4 objects            772 bytes, escaped 0.00% of objects, 0.00% of bytes
+  gc                   2500 objects         240000 bytes, escaped 0.00% of objects, 0.00% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  std.internal                            1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  _Dmain                               9790 objects, escaped 0.02% (bytes 0.01%), 1 promotions moving 1 objects
+  conalloc.doSha                       2500 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+    5490872368 bytes       9786 objects, escaped   0.02%  [newarray] _Dmain
+        557043 bytes          1 objects, escaped 100.00%  [array] pure nothrow @nogc @safe std.internal.cstring.TempCStringBuffer!(char).TempCStringBuffer std.interna
+        240000 bytes       2500 objects, escaped   0.00%  [gc] void conalloc.doSha()
+           772 bytes          4 objects, escaped   0.00%  [newclass] _Dmain
+            48 bytes          1 objects, escaped 100.00%  [] unknown
+top store sites by promoted objects:
+           1 promoted objects in        1 promotions (557043 bytes)  _Dmain
+CENSUS runtime_s=0.537 threads=5 allocs=12292 alloc_bytes=5491670231 objs=12292 esc_objs=4 esc_obj_pct=0.033 bytes=5491670231 esc_bytes=1118291 esc_byte_pct=0.020 promotions=1 promoted_objs=1 max_graph=1 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=3 stores=5

@@ -1,0 +1,24 @@
+
+==== census report ====
+runtime 0.02 s, 1 threads, 25012 allocations (9476592 bytes), 1 untagged
+objects: 25012 total, 2 escaped (0.01%); bytes: 9476592 total, 8240 escaped (0.09%)
+died thread-local: 25009, died escaped: 0, survivors: 3
+stores observed: 1, copies observed: 0 (0 truncated)
+promotions: 0, objects promoted via graphs: 0, bytes 0, mean graph 0.0 objects, max 0 objects / 0 bytes
+promotion graph sizes (objects):
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 1
+coverage audit: 1 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 2 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  append              24510 objects        8788352 bytes, escaped 0.00% of objects, 0.00% of bytes
+  newarray                1 objects           8192 bytes, escaped 100.00% of objects, 100.00% of bytes
+  array                 500 objects         680000 bytes, escaped 0.00% of objects, 0.00% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  _Dmain                              25011 objects, escaped 0.00% (bytes 0.09%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+       8788352 bytes      24510 objects, escaped   0.00%  [append] _Dmain
+        680000 bytes        500 objects, escaped   0.00%  [array] _Dmain
+          8192 bytes          1 objects, escaped 100.00%  [newarray] _Dmain
+            48 bytes          1 objects, escaped 100.00%  [] unknown
+top store sites by promoted objects:
+CENSUS runtime_s=0.021 threads=1 allocs=25012 alloc_bytes=9476592 objs=25012 esc_objs=2 esc_obj_pct=0.008 bytes=9476592 esc_bytes=8240 esc_byte_pct=0.087 promotions=0 promoted_objs=0 max_graph=0 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=2 stores=1

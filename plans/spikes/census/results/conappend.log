@@ -1,0 +1,27 @@
+
+==== census report ====
+runtime 0.26 s, 5 threads, 152201 allocations (1342125399 bytes), 0 untagged
+objects: 152201 total, 4 escaped (0.00%); bytes: 1342125399 total, 1118291 escaped (0.08%)
+died thread-local: 152192, died escaped: 0, survivors: 9
+stores observed: 5, copies observed: 2198 (2194 truncated)
+promotions: 1, objects promoted via graphs: 1, bytes 557043, mean graph 1.0 objects, max 1 objects / 557043 bytes
+promotion graph sizes (objects): [1..2)=1
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 5
+coverage audit: 6 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 3 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  array                   1 objects         557043 bytes, escaped 100.00% of objects, 100.00% of bytes
+  newarray             2195 objects     1231167536 bytes, escaped 0.09% of objects, 0.05% of bytes
+  newclass                4 objects            772 bytes, escaped 0.00% of objects, 0.00% of bytes
+  append             150001 objects      110400048 bytes, escaped 0.00% of objects, 0.00% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  std.internal                            1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  _Dmain                               2199 objects, escaped 0.09% (bytes 0.05%), 1 promotions moving 1 objects
+  conappend.doAppend                 150001 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+    1231167536 bytes       2195 objects, escaped   0.09%  [newarray] _Dmain
+     110400048 bytes     150001 objects, escaped   0.00%  [append] void conappend.doAppend()
+        557043 bytes          1 objects, escaped 100.00%  [array] pure nothrow @nogc @safe std.internal.cstring.TempCStringBuffer!(char).TempCStringBuffer std.interna
+           772 bytes          4 objects, escaped   0.00%  [newclass] _Dmain
+top store sites by promoted objects:
+           1 promoted objects in        1 promotions (557043 bytes)  _Dmain
+CENSUS runtime_s=0.257 threads=5 allocs=152201 alloc_bytes=1342125399 objs=152201 esc_objs=4 esc_obj_pct=0.003 bytes=1342125399 esc_bytes=1118291 esc_byte_pct=0.083 promotions=1 promoted_objs=1 max_graph=1 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=3 stores=5

@@ -1,0 +1,41 @@
+
+==== census report ====
+runtime 0.13 s, 3 threads, 150739 allocations (3986317 bytes), 4 untagged
+objects: 150739 total, 30664 escaped (20.34%); bytes: 3986317 total, 783586 escaped (19.66%)
+died thread-local: 120068, died escaped: 30003, survivors: 668
+stores observed: 162938, copies observed: 389572 (0 truncated)
+promotions: 20276, objects promoted via graphs: 30661, bytes 783434, mean graph 1.5 objects, max 4 objects / 385 bytes
+promotion graph sizes (objects): [1..2)=10247 [2..4)=10026 [4..8)=3
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 3
+coverage audit: 10 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 3 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  newarray                1 objects             32 bytes, escaped 100.00% of objects, 100.00% of bytes
+  newclass            10016 objects         401685 bytes, escaped 99.94% of objects, 99.81% of bytes
+  allocmemory             4 objects             96 bytes, escaped 0.00% of objects, 0.00% of bytes
+  aa                      2 objects            112 bytes, escaped 0.00% of objects, 0.00% of bytes
+  gc                  40652 objects         702592 bytes, escaped 50.80% of objects, 54.45% of bytes
+  setlength          100060 objects        2881440 bytes, escaped 0.00% of objects, 0.00% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 4 objects, escaped 25.00% (bytes 13.33%), 0 promotions moving 0 objects
+  _Dmain                              30002 objects, escaped 33.33% (bytes 55.54%), 0 promotions moving 0 objects
+  std.concurrency                       671 objects, escaped 98.66% (bytes 98.79%), 652 promotions moving 1381 objects
+  core.internal                      120060 objects, escaped 16.66% (bytes 10.00%), 19350 promotions moving 29005 objects
+  mt_share.consumer                       2 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  std.variant                             0 objects, escaped 0.00% (bytes 0.00%), 274 promotions moving 275 objects
+top allocation sites by bytes:
+       2561440 bytes      80060 objects, escaped   0.00%  [setlength] pure nothrow @trusted immutable(char)[] core.internal.array.concatenation._d_arraycatnTX!(immutable(
+        400169 bytes      10001 objects, escaped  99.99%  [newclass] _Dmain
+        320000 bytes      20000 objects, escaped   0.00%  [gc] pure nothrow @trusted char[] core.internal.array.construction._d_newarrayU!(char)._d_newarrayU(ulong
+        320000 bytes      20000 objects, escaped   0.00%  [setlength] _Dmain
+        320000 bytes      20000 objects, escaped 100.00%  [gc] pure nothrow @trusted immutable(char)[] core.internal.array.construction._d_newarrayU!(immutable(cha
+         62592 bytes        652 objects, escaped 100.00%  [gc] std.concurrency.List!(std.concurrency.Message).List.Node* std.concurrency.List!(std.concurrency.Mess
+           724 bytes          4 objects, escaped  50.00%  [newclass] std.concurrency.Tid std.concurrency._spawn!(void function(std.concurrency.Tid)*, std.concurrency.Tid
+           648 bytes          9 objects, escaped  66.67%  [newclass] nothrow @trusted std.concurrency.MessageBox std.concurrency.MessageBox.__ctor()
+top store sites by promoted objects:
+       29005 promoted objects in    19350 promotions (696298 bytes)  ref core.internal.lifetime.emplaceRef!(std.concurrency.List!(std.concurrency.Message).List.Node, std.concurren
+        1090 promoted objects in      370 promotions (55440 bytes)  void std.concurrency.MessageBox.put(ref std.concurrency.Message)
+         290 promoted objects in      281 promotions (27200 bytes)  bool std.concurrency.MessageBox.get!(void delegate(immutable(char)[]) pure nothrow @nogc @safe, void delegate(
+         273 promoted objects in      273 promotions (4368 bytes)  bool std.variant.VariantN!(32uL).VariantN.handler!(immutable(char)[]).handler(std.variant.VariantN!(32uL).Vari
+           2 promoted objects in        1 promotions (56 bytes)  bool std.variant.VariantN!(32uL).VariantN.handler!(immutable(mt_share.Msg)).handler(std.variant.VariantN!(32uL
+           1 promoted objects in        1 promotions (72 bytes)  @property core.sync.mutex.Mutex std.concurrency.registryLock()
+CENSUS runtime_s=0.125 threads=3 allocs=150739 alloc_bytes=3986317 objs=150739 esc_objs=30664 esc_obj_pct=20.342 bytes=3986317 esc_bytes=783586 esc_byte_pct=19.657 promotions=20276 promoted_objs=30661 max_graph=4 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=3 stores=162938

@@ -1,0 +1,27 @@
+
+==== census report ====
+runtime 1.78 s, 1 threads, 15 allocations (259178451 bytes), 1 untagged
+objects: 15 total, 2 escaped (13.33%); bytes: 394563539 total, 163508272 escaped (41.44%)
+died thread-local: 11, died escaped: 0, survivors: 4
+stores observed: 19539552, copies observed: 16 (11 truncated)
+promotions: 0, objects promoted via graphs: 0, bytes 0, mean graph 0.0 objects, max 0 objects / 0 bytes
+promotion graph sizes (objects):
+stack-address escapes: 0 (0.0 per second), 0 into thread-local heap objects, threads with a visible stack: 0 of 1
+coverage audit: 2 live local objects scanned, 0 hold a reference to another thread's object that no store explained; 2 static-data references to objects not marked escaped; 0 cross-thread references found while promoting
+by allocation kind:
+  array                   1 objects         557043 bytes, escaped 0.00% of objects, 0.00% of bytes
+  append                  4 objects      112492560 bytes, escaped 0.00% of objects, 0.00% of bytes
+  gc                      9 objects      281513888 bytes, escaped 11.11% of objects, 58.08% of bytes
+by module (allocation site; promotions by the module whose store triggered them):
+  unknown                                 1 objects, escaped 100.00% (bytes 100.00%), 0 promotions moving 0 objects
+  std.internal                            1 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  _Dmain                                  4 objects, escaped 0.00% (bytes 0.00%), 0 promotions moving 0 objects
+  std.array                               9 objects, escaped 11.11% (bytes 58.08%), 0 promotions moving 0 objects
+top allocation sites by bytes:
+     281513856 bytes          8 objects, escaped  12.50%  [gc] pure nothrow @safe void std.array.Appender!(immutable(char)[][]).Appender.ensureAddable(ulong)
+     112492560 bytes          4 objects, escaped   0.00%  [append] _Dmain
+        557043 bytes          1 objects, escaped   0.00%  [array] pure nothrow @nogc @safe std.internal.cstring.TempCStringBuffer!(char).TempCStringBuffer std.interna
+            48 bytes          1 objects, escaped 100.00%  [] unknown
+            32 bytes          1 objects, escaped   0.00%  [gc] pure @safe immutable(char)[][] std.array.split!(immutable(char)[]).split(immutable(char)[])
+top store sites by promoted objects:
+CENSUS runtime_s=1.777 threads=1 allocs=15 alloc_bytes=259178451 objs=15 esc_objs=2 esc_obj_pct=13.333 bytes=394563539 esc_bytes=163508272 esc_byte_pct=41.440 promotions=0 promoted_objs=0 max_graph=0 stack_escapes=0 stack_escapes_per_s=0.0 stack_visible_threads=0 unobserved_cross=0 unobserved_global=2 stores=19539552
