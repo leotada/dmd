@@ -1,0 +1,126 @@
+From 17ed2c06830701c648c1d370d1b0f9a1915190f6 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 12:17:01 -0300
+Subject: [PATCH 1/2] Optional GC phase tracing (version Symgc_phase_trace)
+
+Prints one line per collection with stop-the-world, mark, sweep and sweep-part times.
+Used to find where the pause goes (stop-the-world mark vs. sweep after restart).
+---
+ source/d/gc/collector.d | 20 ++++++++++++++++++++
+ source/d/gc/page.d      | 13 ++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 0ff5bb1..80dc72e 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -71,6 +71,7 @@ private:
+ 		import d.gc.thread;
+ 		auto pauseStartTime = getMonotonicTime();
+ 		stopTheWorld();
++		auto tStopped = getMonotonicTime();
+ 
+ 		import d.gc.region;
+ 		auto dataRange = gDataRegionAllocator.computeAddressRange();
+@@ -80,9 +81,11 @@ private:
+ 		auto managedAddressSpace = dataRange.merge(ptrRange);
+ 
+ 		prepareGCCycle();
++		auto tPrepared = getMonotonicTime();
+ 
+ 		// Go on and on until all worklists are empty.
+ 		markGC(gcCycle, managedAddressSpace);
++		auto tMarked = getMonotonicTime();
+ 
+ 		version(Symgc_druntime_hooks) {
+ 			import core.thread.symthread;
+@@ -104,7 +107,24 @@ private:
+ 		 */
+ 		threadCache.flush();
+ 
++		auto tFlushed = getMonotonicTime();
+ 		auto pageCollectStats = collect(gcCycle);
++		version(Symgc_phase_trace) {
++			import core.stdc.stdio : fprintf, stderr;
++			auto tSwept = getMonotonicTime();
++			enum us = 10.0; // time unit is 100 ns
++			fprintf(stderr, "gcphase threads=%zu start_threads=%.0f stop=%.0f prepare=%.0f mark=%.0f restart=%.0f sweep=%.0f total=%.0f us\n",
++				cast(size_t) threadCount,
++				(pauseStartTime - info.start) / us, (tStopped - pauseStartTime) / us,
++				(tPrepared - tStopped) / us, (tMarked - tPrepared) / us,
++				(pauseStartTime + info.pauseTime - tMarked) / us,
++				(tSwept - tFlushed) / us, (tSwept - info.start) / us);
++			import d.gc.page : gSweepT;
++			fprintf(stderr, "sweepparts dense: scan=%.0f deadfree=%.0f outlined=%.0f minimize=%.0f | sparse: scan=%.0f deadfree=%.0f minimize=%.0f us\n",
++				gSweepT[0] / us, gSweepT[1] / us, gSweepT[2] / us, gSweepT[3] / us,
++				gSweepT[4] / us, gSweepT[5] / us, gSweepT[6] / us);
++			gSweepT[] = 0;
++		}
+ 		info.usedPages = pageCollectStats.pagesCommitted;
+ 		info.freeBytes += pageCollectStats.pagesCommitted * PageSize - pageCollectStats.bytesAllocated;
+ 		assert(pageCollectStats.pagesCommitted == Arena.computeUsedPageCount());
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 8bcbf26..20bb9eb 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -11,6 +11,9 @@ import d.gc.util;
+ 
+ import symgc.intrinsics;
+ 
++import d.gc.time;
++__gshared ulong[8] gSweepT;
++
+ struct PageFiller {
+ private:
+ 	@property package
+@@ -887,6 +890,7 @@ private:
+ 		assert(mutex.isHeld(), "Mutex not held!");
+ 
+ 		PriorityExtentHeap deadExtents;
++		auto tD0 = getMonotonicTime();
+ 
+ 		for (auto r = denseBlocks.range; !r.empty; r.popFront()) {
+ 			auto block = r.front;
+@@ -961,12 +965,16 @@ private:
+ 			}
+ 		}
+ 
++		auto tD1 = getMonotonicTime();
+ 		while (!deadExtents.empty) {
+ 			freeExtentLocked(emap, deadExtents.pop());
+ 		}
++		auto tD2 = getMonotonicTime();
+ 
+ 		collectOutlinedBitmaps();
++		auto tD3 = getMonotonicTime();
+ 		minimizeDense();
++		gSweepT[0] += tD1 - tD0; gSweepT[1] += tD2 - tD1; gSweepT[2] += tD3 - tD2; gSweepT[3] += getMonotonicTime() - tD3;
+ 	}
+ 
+ 	uint minimizeDense() {
+@@ -988,6 +996,7 @@ private:
+ 		assert(mutex.isHeld(), "Mutex not held!");
+ 
+ 		PriorityExtentHeap deadExtents;
++		auto tS0 = getMonotonicTime();
+ 
+ 		for (auto r = sparseBlocks.range; !r.empty; r.popFront()) {
+ 			auto block = r.front;
+@@ -1071,11 +1080,13 @@ private:
+ 			}
+ 		}
+ 
++		auto tS1 = getMonotonicTime();
+ 		while (!deadExtents.empty) {
+ 			freeExtentLocked(emap, deadExtents.pop());
+ 		}
+-
++		auto tS2 = getMonotonicTime();
+ 		minimizeSparse();
++		gSweepT[4] += tS1 - tS0; gSweepT[5] += tS2 - tS1; gSweepT[6] += getMonotonicTime() - tS2;
+ 	}
+ 
+ 	uint minimizeSparse() {
+-- 
+2.51.0
+
