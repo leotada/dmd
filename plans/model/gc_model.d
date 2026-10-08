@@ -63,6 +63,7 @@ __gshared int NT = 2, NO = 4, NS = 2, NF = 1, NG = 1, NFB = 0, NC = 1;
 __gshared bool trackB = true;
 __gshared int slabK;           // --slabs=K: objects are grouped K per slab with bin membership and a per-slab sweep
 __gshared bool freeOn;         // --free: mutators may explicitly free an object they alone reference
+__gshared bool rootRm;         // --rootrm: mutators may remove a global root (GC.removeRoot / removeRange)
 __gshared bool race;           // two-step stores
 __gshared bool fixXchg;        // with race: the write step also logs the value it really overwrites
 __gshared string bug = "";
@@ -732,6 +733,19 @@ void successors(in S s0, scope Emit emit)
                 }
         }
 
+        // removeRoot / removeRange: a global root slot is dropped without a store
+        if (rootRm)
+            foreach (g; 0 .. NG)
+            {
+                immutable v = s0.b[oGlb + g];
+                if (!v) continue;
+                S c = s0;
+                if (c.b[oPhase] == MARKING && !isBug("noremoveroot"))
+                    bufAdd(c, t, v);   // the removed root has to be shaded: it may not have been scanned yet
+                c.b[oGlb + g] = 0;
+                emit(c, format("T%s: removeRoot(G%s = %s)", t, g, refStr(v)));
+            }
+
         // explicit free of an object only this slot references (GC.free / delete)
         if (freeOn)
             foreach (i; 0 .. NS)
@@ -1341,10 +1355,11 @@ int main(string[] args)
         "race", "stores are two steps (barrier, then write) so threads can race on a slot", &race,
         "fix", "with --race: 'xchg' also logs the value the write really overwrites", &fixXchgName,
         "slabs", "group objects K per slab: bin membership, per-slab sweep, allocation only from swept slabs (use with --track=A)", &slabK,
+        "rootrm", "mutators may remove a global root without a store", &rootRm,
         "free", "mutators may explicitly free an object only they reference", &freeOn,
         "track", "A (SATB only) or B (local domains), default B", &track,
         "bug", "plant a bug: nodelete nohybrid nopublish noglobalize nolocaltrace "
-               ~ "nopromotegrey noskip sweepnoprotect noescapescan nostw1scan nofiberscan allocunswept freeunswept missedinsert nofreebarrier", &bug,
+               ~ "nopromotegrey noskip sweepnoprotect noescapescan nostw1scan nofiberscan allocunswept freeunswept missedinsert nofreebarrier noremoveroot", &bug,
         "swarm", "random walks instead of exhaustive search: number of walks", &swarmWalks,
         "len", "steps per random walk (default 100000)", &walkLen,
         "seed", "random seed (default 1)", &seed,

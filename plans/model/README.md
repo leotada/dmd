@@ -89,3 +89,10 @@ without logging them, O1 is never marked and the sweep frees it while the stack 
 `delete` and anything that releases a block containing pointers must log (or shade) its pointer fields while
 `marking` is set, exactly like an overwritten field. With the fix the runs above pass; the old behaviour is the planted
 bug `nofreebarrier`. For a no-scan block there is nothing to log.
+
+### Root removal (`--rootrm`)
+
+A mutator may drop a global root without a store (`GC.removeRoot`/`removeRange`). Without shading the removed root
+during marking the model fails in 10 steps (planted bug `noremoveroot`: load the child to the stack after the stack
+was scanned, remove the root before it is scanned, the child is swept); with shading, Track A 2 threads / 3 objects /
+1 slot passes exhaustively (2.85M states). See `../audit/druntime_edge_deletions.md`.

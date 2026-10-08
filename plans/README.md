@@ -29,6 +29,7 @@ to build instead if not. The answer is in the RFC sections "Phase 0 verdict" and
 | `spikes/census/` | escape census by IR instrumentation and a wrapping GC | 0.4 |
 | `spikes/immix/` | out-of-tree Immix and segregated-fit allocators under one collector | 0.6 |
 | `model/` | explicit-state model checker of the protocol | 0.5 |
+| `audit/` | druntime/symgc paths that delete pointer edges without a store (needed before P3) | P3 prep |
 | `../druntime/benchmark/gcbench/` | the benchmark programs themselves | 0.1 |
 | `../druntime/src/core/gc/config.d`, `.../conservative/gc.d` | `--DRT-gcopt=trace:FILE` per-collection CSV | 0.2 |
 

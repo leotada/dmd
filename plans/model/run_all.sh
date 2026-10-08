@@ -51,6 +51,8 @@ bug nofiberscan --track=A --threads=1 --objects=3 --stack=1 --fibers=1
 # freed object's fields (nofreebarrier is found even without slabs).
 clean A_free_2t_3o --track=A --threads=2 --objects=3 --stack=2 --free
 bug nofreebarrier --track=A --threads=1 --objects=3 --stack=2 --free
+clean A_rootrm_2t_3o_1s --track=A --threads=2 --objects=3 --stack=1 --rootrm
+bug noremoveroot --track=A --threads=2 --objects=3 --stack=1 --rootrm
 clean A_slabs_free_1t_3o --track=A --threads=1 --objects=3 --stack=2 --slabs=2 --free
 for b in allocunswept freeunswept missedinsert nofreebarrier; do
     bug $b --track=A --threads=1 --objects=3 --stack=2 --slabs=2 --free
