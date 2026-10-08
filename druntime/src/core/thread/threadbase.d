@@ -1152,10 +1152,12 @@ private void scanAllTypeImpl(scope ScanAllThreadsTypeFn scan, void* curStackTop)
     ThreadBase  thisThread  = null;
     void*   oldStackTop = null;
 
+    // The caller may not be a druntime thread: a collector that does its work
+    // on a thread of its own stops the world from there.
     if (ThreadBase.sm_tbeg)
     {
         thisThread  = ThreadBase.getThis();
-        if (!thisThread.m_lock)
+        if (thisThread !is null && !thisThread.m_lock)
         {
             oldStackTop = thisThread.m_curr.tstack;
             thisThread.m_curr.tstack = curStackTop;
@@ -1166,7 +1168,7 @@ private void scanAllTypeImpl(scope ScanAllThreadsTypeFn scan, void* curStackTop)
     {
         if (ThreadBase.sm_tbeg)
         {
-            if (!thisThread.m_lock)
+            if (thisThread !is null && !thisThread.m_lock)
             {
                 thisThread.m_curr.tstack = oldStackTop;
             }
