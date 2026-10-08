@@ -1,0 +1,18 @@
+# governor=powersave reps=3 date=2026-10-08 symgc=71ad421
+alloc-1t mops 14.7920
+alloc-1t seconds 0.5746
+alloc-8t mops 42.2280
+alloc-8t seconds 0.8052
+frag mops 0.3480
+frag seconds 8.6183
+frag steady_rss_kib 651422.0000
+frames512 mops 0.0000
+frames512 seconds 10.0784
+frames512 frame_max_us 28920.0000
+frames512 frame_p99_us 1909.0000
+frames512 over1ms 89.0000
+frames2048 mops 0.0000
+frames2048 seconds 10.1322
+frames2048 frame_max_us 76265.0000
+frames2048 frame_p99_us 1570.0000
+frames2048 over1ms 71.0000
