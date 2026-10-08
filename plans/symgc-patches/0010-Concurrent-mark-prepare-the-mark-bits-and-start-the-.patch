@@ -1,0 +1,523 @@
+From a9d622500023531e9d04b856f1b2a64c37ac88a6 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 20:09:34 -0300
+Subject: [PATCH 10/10] Concurrent mark: prepare the mark bits and start the
+ epoch without a pause
+
+The start pause only lists the roots, stacks and thread locals now (about 40
+us at 2 GiB, was 1 to 3 ms). The mark bits are prepared with the program
+running, in short steps like the sweep, after the epoch has started so that
+whatever the program creates meanwhile is born and needs none.
+
+Four races this change opened, each found by a test (mark_race, alloc with 8
+threads under the verifier, the Phobos stress):
+
+- the tracker is armed before the epoch starts, or a born object written in
+  between is never reported (mark_race: hundreds of damaged nodes);
+- the epoch starts and the bins are emptied as one step with every bin locked,
+  because in either order a slab slips in between and the heap is corrupted;
+- a slab made before the epoch that reaches a bin after it is tagged born;
+- the set of arenas to lock is taken once: an arena initialized meanwhile made
+  us unlock a mutex we had not locked (a rare hang or Lock not held).
+
+Gate with SYMGC_CONCURRENT_MARK=1: worst frame 512 MiB 10.7 -> 1.7 ms, 2 GiB
+31.0 -> 1.75 ms.
+---
+ source/d/gc/arena.d     |  33 ++++++++
+ source/d/gc/bin.d       |  19 ++++-
+ source/d/gc/collector.d | 123 +++++++++++++++++++++------
+ source/d/gc/page.d      | 181 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 328 insertions(+), 28 deletions(-)
+
+diff --git a/source/d/gc/arena.d b/source/d/gc/arena.d
+index e90c5ca..2c70f1c 100644
+--- a/source/d/gc/arena.d
++++ b/source/d/gc/arena.d
+@@ -247,6 +247,10 @@ package:
+ 		filler.prepareGCCycle(emap);
+ 	}
+ 
++	void prepareConcurrent(ref CachedExtentMap emap, ubyte gcCycle) shared {
++		filler.prepareConcurrent(emap, gcCycle);
++	}
++
+ 	void collect(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) shared {
+ 		return filler.collect(emap, gcCycle, stats);
+ 	}
+@@ -261,6 +265,35 @@ package:
+ 		}
+ 	}
+ 
++	/**
++	 * Take the lock of every bin, in order. A collection that starts while
++	 * the program runs does so with all of them held: it starts the epoch and
++	 * empties the bins as one step, so no free or allocation can fall between
++	 * the two (a slab that enters a bin after the epoch started and before the
++	 * bins were emptied would be dropped from the heap while it still links
++	 * to it). Nobody holds two bin locks at a time, so this cannot deadlock.
++	 */
++	void lockBins() shared {
++		foreach (i; 0 .. BinCount) {
++			bins[i].mutex.lock();
++		}
++	}
++
++	void unlockBins() shared {
++		foreach_reverse (i; 0 .. BinCount) {
++			bins[i].mutex.unlock();
++		}
++	}
++
++	/**
++	 * `clearBinsForCollection` when `lockBins` is held.
++	 */
++	void clearLockedBins() shared {
++		foreach (i; 0 .. BinCount) {
++			bins[i].clearLocked();
++		}
++	}
++
+ 	void combineBinsAfterCollection(
+ 		ref PriorityExtentHeap[BinCount] collectedSlabs
+ 	) shared {
+diff --git a/source/d/gc/bin.d b/source/d/gc/bin.d
+index 162c30e..c332207 100644
+--- a/source/d/gc/bin.d
++++ b/source/d/gc/bin.d
+@@ -73,7 +73,18 @@ struct Bin {
+ 				auto e = slabs.top;
+ 				if (unlikely(e is null)) {
+ 					if (freshSlab !is null) {
+-						// We have a fresh slab, use it!
++						/**
++						 * We have a fresh slab, use it! It may have been made
++						 * before a collection started its epoch and reach the
++						 * bin after the bins were emptied. It is new and empty:
++						 * born in the epoch, so nothing marks it or sweeps it.
++						 */
++						import d.gc.extent : gSweepCycle;
++						auto epoch = gSweepCycle.load();
++						if (unlikely(epoch != 0 && freshSlab.sweepTag != epoch)) {
++							freshSlab.sweepTag = epoch;
++						}
++
+ 						slabs.insert(freshSlab);
+ 						freshSlab = null;
+ 						continue;
+@@ -221,6 +232,12 @@ package:
+ 		(cast(PriorityExtentHeap*) &slabs).clear();
+ 	}
+ 
++	void clearLocked() shared {
++		assert(mutex.isHeld(), "Mutex not held!");
++
++		(cast(PriorityExtentHeap*) &slabs).clear();
++	}
++
+ 	void combineAfterCollection(ref PriorityExtentHeap cSlabs) shared {
+ 		mutex.lock();
+ 		scope(exit) mutex.unlock();
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 58f7bbe..61ed480 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -41,6 +41,7 @@ struct CycleContext {
+ 	ulong pauseStartTime, tStopped, tPrepared, tMarked, tFlushed;
+ 	ulong startPause, remarkPause, concurrentMark;
+ 	ulong[4] remarkParts; // stop, dirty pages, mark, restart
++	ulong[3] preamble;    // arm, epoch and bins, prepare
+ 	ulong scanBytesBeforeRemark, scanBytesRemark;
+ 	uint rounds;
+ 	size_t lastRoundPages, remarkPages;
+@@ -368,21 +369,50 @@ private:
+ 		ctx.threadCount = threadCount;
+ 		startGCThreads(threadCount - 1);
+ 
+-		// 1. Arm, with the program running.
++		/**
++		 * 1. Arm the tracker, with the program running. This comes before
++		 *    anything else: the mark skips the extents born from the epoch
++		 *    on, relying on their pages being reported when written, and a
++		 *    write that happened before the arm is not reported afterwards.
++		 */
++		auto tPre0 = getMonotonicTime();
+ 		dirtyArm();
++		auto tPre1 = getMonotonicTime();
+ 
+-		// 2. The start pause.
+-		ctx.pauseStartTime = getMonotonicTime();
+-		stopTheWorld();
+-		ctx.tStopped = getMonotonicTime();
++		/**
++		 * 2. Start the epoch. From now on the extents and blocks the program
++		 *    creates are born, need no marks and are skipped, so preparing
++		 *    the marks of the others can take its time. The regions that
++		 *    exist now hold everything that is not born.
++		 */
++		// Start the epoch and empty the bins as one step, with the lock of
++		// every bin held: in either order as two steps, a slab can slip in
++		// between (an old one into a bin, or a born one that is then dropped).
++		startEpochAndClearBins();
++		setSweepLimits();
++		gMarkActive.store(1);
++		auto tPre2 = getMonotonicTime();
+ 
+ 		auto dataRange = gDataRegionAllocator.computeAddressRange();
+ 		auto ptrRange = gPointerRegionAllocator.computeAddressRange();
+ 		auto space = dataRange.merge(ptrRange);
+ 
+-		cycleStart(space, gcCycle, false);
+-		gMarkActive.store(1);
++		// 3. Prepare the mark bits, still without a pause.
++		foreach (i; 0 .. ArenaCount) {
++			import d.gc.arena;
++			auto a = Arena.getIfInitialized(i);
++			if (a !is null) {
++				a.prepareConcurrent(emap, gcCycle);
++			}
++		}
++
+ 		ctx.tPrepared = getMonotonicTime();
++		ctx.preamble = [tPre1 - tPre0, tPre2 - tPre1, ctx.tPrepared - tPre2];
++
++		// 4. The start pause: only to list the stacks.
++		ctx.pauseStartTime = getMonotonicTime();
++		stopTheWorld();
++		ctx.tStopped = getMonotonicTime();
+ 
+ 		/**
+ 		 * Put the roots, the stacks and the thread local storage on the work
+@@ -489,8 +519,8 @@ private:
+ 			 * the program got from the bins meanwhile are unswept for the
+ 			 * new epoch, so the bins must be empty again.
+ 			 */
+-			clearBins();
+ 			startEpoch();
++			clearBins();
+ 
+ 			prepareGCCycle();
+ 			markRoundGC(gcCycle, space, (shared(Scanner)* s) {
+@@ -563,6 +593,9 @@ private:
+ 				fprintf(stderr, "gcconc startpause=%.0f remarkpause=%.0f concurrent_mark=%.0f rounds=%u last_round_pages=%zu remark_pages=%zu us\n",
+ 					ctx.startPause / us, ctx.remarkPause / us, ctx.concurrentMark / us,
+ 					ctx.rounds, ctx.lastRoundPages, ctx.remarkPages);
++				fprintf(stderr, "gcpre arm=%.0f epoch_and_bins=%.0f prepare=%.0f us\n",
++					ctx.preamble[0] / us, ctx.preamble[1] / us, ctx.preamble[2] / us);
++
+ 				if (ctx.fellBack) {
+ 					fprintf(stderr, "gcfallback: dirty tracking failed, the remark marked everything again\n");
+ 				}
+@@ -608,18 +641,28 @@ private:
+ 
+ 		prepareGCCycle();
+ 
+-		clearBins();
+ 		startEpoch();
++		clearBins();
++		setSweepLimits();
+ 
+-		/**
+-		 * The sweeper is paced unless the heap grows past 1/8 over the
+-		 * collection target, and the threads that allocate help when it
+-		 * grows past 1/4. The limits are relative to the target, which
+-		 * comes from what survived, and not to the heap size now: that
+-		 * one includes whatever the heap grew by during the last sweep, so
+-		 * limits based on it would grow from one cycle to the next.
+-		 */
+-		import d.gc.page : gSweepGrowthLimit, gSweepHardLimit;
++		// The SATB log is for a mark that stops the world; the concurrent
++		// mark tracks the pages the program writes instead.
++		if (satb) {
++			auto lo = managedAddressSpace.ptr;
++			satbBegin(lo, lo + managedAddressSpace.size);
++		}
++	}
++
++	/**
++	 * The sweeper is paced unless the heap grows past 1/8 over the
++	 * collection target, and the threads that allocate help when it
++	 * grows past 1/4. The limits are relative to the target, which
++	 * comes from what survived, and not to the heap size now: that
++	 * one includes whatever the heap grew by during the last sweep, so
++	 * limits based on it would grow from one cycle to the next.
++	 */
++	void setSweepLimits() {
++		import d.gc.page : gSweepGrowthLimit, gSweepHardLimit, gSweepRetainPages;
+ 		auto usedPages = Arena.computeUsedPageCount();
+ 		auto target = (cast(CollectorState*) &gCollectorState).nextTarget;
+ 		version(Symgc_phase_trace) {
+@@ -629,16 +672,7 @@ private:
+ 
+ 		gSweepGrowthLimit = target + target / 8;
+ 		gSweepHardLimit = target + target / 4;
+-
+-		import d.gc.page : gSweepRetainPages;
+ 		gSweepRetainPages = target;
+-
+-		// The SATB log is for a mark that stops the world; the concurrent
+-		// mark tracks the pages the program writes instead.
+-		if (satb) {
+-			auto lo = managedAddressSpace.ptr;
+-			satbBegin(lo, lo + managedAddressSpace.size);
+-		}
+ 	}
+ 
+ 	/**
+@@ -656,6 +690,41 @@ private:
+ 		}
+ 	}
+ 
++	/**
++	 * Start the epoch and empty the bins as one step, with every bin locked,
++	 * for a collection that starts with the program running (see
++	 * `Arena.lockBins`).
++	 */
++	void startEpochAndClearBins() {
++		import d.gc.arena;
++
++		/**
++		 * The set of arenas is taken once: an arena can be initialized by
++		 * another thread at any time, and unlocking one we did not lock would
++		 * release a lock somebody else holds.
++		 */
++		shared(Arena)*[ArenaCount] locked;
++		uint count = 0;
++
++		foreach (i; 0 .. ArenaCount) {
++			auto a = Arena.getIfInitialized(i);
++			if (a !is null) {
++				a.lockBins();
++				locked[count++] = a;
++			}
++		}
++
++		startEpoch();
++
++		foreach (a; locked[0 .. count]) {
++			a.clearLockedBins();
++		}
++
++		foreach_reverse (a; locked[0 .. count]) {
++			a.unlockBins();
++		}
++	}
++
+ 	/**
+ 	 * Extents created from now on are born after the mark. Each collection
+ 	 * has an epoch of its own, which never repeats and is never 0.
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index c391943..a0dfef7 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -138,6 +138,15 @@ private:
+ 	// A step is running. See `sweepStep`.
+ 	bool sweepStepping;
+ 
++	// The concurrent prepare of the mark bits: where it is, like the sweep.
++	bool preparing;
++	uint prepareEpoch;
++	ushort prepareSerial;
++	BlockDescriptor* prepareNext;
++	BlockDescriptor* prepareCurrent;
++	uint preparePage;
++	ulong[] prepareBitmaps;
++
+ 	// How many more free pages this sweep may keep instead of returning them
+ 	// to the OS, see `minimizeBlock`.
+ 	size_t sweepRetain;
+@@ -385,6 +394,43 @@ public:
+ 		(cast(PageFiller*) &this).prepareGCCycleImpl(emap);
+ 	}
+ 
++	/**
++	 * Prepare the mark bits with the program running (a concurrent mark),
++	 * one step at a time with the mutex released in between, like the sweep.
++	 * The epoch of the collection must have started: extents and blocks
++	 * created from then on are born, need no marks, and are skipped.
++	 */
++	void prepareConcurrent(ref CachedExtentMap emap, ubyte gcCycle) shared {
++		auto self = cast(PageFiller*) &this;
++
++		{
++			mutex.lock();
++			scope(exit) mutex.unlock();
++
++			self.beginPrepareImpl(gcCycle);
++		}
++
++		while (true) {
++			bool more;
++
++			{
++				mutex.lock();
++				scope(exit) mutex.unlockFairly();
++
++				more = self.prepareStepImpl(emap);
++			}
++
++			if (!more) {
++				break;
++			}
++
++			import symgc.thread : sched_yield;
++			for (uint i = 0; mutex.hasContenders && i < 64; i++) {
++				sched_yield();
++			}
++		}
++	}
++
+ 	/**
+ 	 * Sweep this filler. The work is done one block at a time, and the mutex
+ 	 * is released between blocks.
+@@ -960,6 +1006,133 @@ private:
+ 		return ob.bitmaps;
+ 	}
+ 
++	void beginPrepareImpl(ubyte gcCycle) {
++		assert(mutex.isHeld(), "Mutex not held!");
++		assert(!preparing, "A prepare is already running!");
++
++		prepareEpoch = gSweepCycle.load();
++		// Distinct from the serials of the sweep (up to 767) and of the cycle before.
++		prepareSerial = cast(ushort) (768 + gcCycle);
++		assert(prepareEpoch != 0, "No collection is running!");
++
++		preparing = true;
++		prepareNext = denseBlocks.first;
++		prepareCurrent = null;
++		prepareBitmaps = [];
++	}
++
++	/**
++	 * Same walk as `nextSweepBlock`, with a cursor of its own, and its own
++	 * serial (a prepare is a pass over the blocks like those of the sweep).
++	 */
++	BlockDescriptor* nextPrepareBlock() {
++		assert(mutex.isHeld(), "Mutex not held!");
++
++
++		while (true) {
++			auto b = prepareNext;
++			if (b is null || b.sweepSerial == prepareSerial) {
++				prepareNext = null;
++				return null;
++			}
++
++			b.sweepSerial = prepareSerial;
++			prepareNext = b.allNext;
++
++			if (b.bornEpoch == prepareEpoch) {
++				continue;
++			}
++
++			return b;
++		}
++	}
++
++	bool prepareStepImpl(ref CachedExtentMap emap) {
++		assert(mutex.isHeld(), "Mutex not held!");
++
++		if (prepareCurrent is null) {
++			prepareCurrent = nextPrepareBlock();
++			preparePage = 0;
++
++			if (prepareCurrent is null) {
++				// The bitmap pages we did not use stay on the list, and are
++				// freed with the others by the sweep.
++				preparing = false;
++				prepareBitmaps = [];
++				return false;
++			}
++		}
++
++		if (prepareDenseBlock(emap, prepareCurrent, preparePage, SweepStepBudget)) {
++			prepareCurrent = null;
++		}
++
++		return true;
++	}
++
++	/**
++	 * `prepareGCCycleImpl` for one dense block, in a step of bounded length,
++	 * with the program running. Returns true when the block is done.
++	 */
++	bool prepareDenseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
++	                       ref uint i, ulong budget) {
++		assert(mutex.isHeld(), "Mutex not held!");
++
++		auto deadline = getMonotonicTime() + budget;
++		auto bem = emap.blockLookup(block.address);
++
++		while (i < PagesInBlock) {
++			if (getMonotonicTime() >= deadline) {
++				return false;
++			}
++
++			i = block.nextAllocatedPage(i);
++			if (i >= PagesInBlock) {
++				break;
++			}
++
++			auto pd = bem.lookup(i);
++			auto e = pd.extent;
++
++			// An allocation in flight: born after the epoch started.
++			if (e is null) {
++				i++;
++				continue;
++			}
++
++			auto ec = pd.extentClass;
++			auto sc = ec.sizeClass;
++
++			import d.gc.slab;
++			i += binInfos[sc].npages;
++
++			if (e.sweepTag == prepareEpoch) {
++				continue;
++			}
++
++			if (ec.supportsInlineMarking) {
++				import d.gc.bitmap;
++				auto bmp = cast(Bitmap!128*) &e.slabMetadataMarks();
++				bmp.clear();
++				continue;
++			}
++
++			auto nslots = binInfos[sc].nslots;
++			auto nimble = alignUp(nslots, 64) / 64;
++			if (prepareBitmaps.length < nimble) {
++				prepareBitmaps = allocGCBitmap();
++			}
++
++			assert(prepareBitmaps.length >= nimble,
++			       "Failed to allocate GC bitmaps.");
++
++			e.outlineMarksBuffer = prepareBitmaps.ptr;
++			prepareBitmaps = prepareBitmaps[nimble .. prepareBitmaps.length];
++		}
++
++		return true;
++	}
++
+ 	void prepareGCCycleImpl(ref CachedExtentMap emap) {
+ 		assert(mutex.isHeld(), "Mutex not held!");
+ 
+@@ -1181,6 +1354,14 @@ private:
+ 			sweepNext = block.allNext;
+ 		}
+ 
++		if (prepareNext is block) {
++			prepareNext = block.allNext;
++		}
++
++		if (prepareCurrent is block) {
++			prepareCurrent = null;
++		}
++
+ 		// A block that leaves the ring is empty, or about to be reused for a
+ 		// single huge allocation: nothing is left to sweep in it.
+ 		if (sweepCurrent is block) {
+-- 
+2.51.0
+

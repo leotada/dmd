@@ -147,3 +147,27 @@ Cost: `alloc` 8 threads 40.7 to 41.5 Mops/s before, 38.3 to 43.6 after (noise); 
 
 The marking flag is never set by the stop-the-world collector, so behaviour is unchanged until the concurrent mark
 phase sets it with `satbBegin` and drains with `satbDrain`.
+
+### 0010: prepare the mark bits and start the epoch without a pause
+
+The start pause only lists roots, stacks and thread locals (about 40 us at
+2 GiB, was 1 to 3 ms). Mark bits are prepared with the program running, in
+short steps like the sweep, after the epoch starts, so what the program
+creates meanwhile is born and needs none. Remark pause: 0.1 to 0.4 ms.
+
+Four races this opened, each found by a test:
+
+- the dirty tracker is armed before the epoch starts (mark_race: hundreds of
+  damaged nodes otherwise);
+- the epoch starts and the bins are emptied as one step with every bin locked
+  (`Arena.lockBins`), because in either order a slab slips in between
+  (double free under the verifier, `alloc 8`);
+- a slab made before the epoch that reaches a bin after it is tagged born;
+- the set of arenas to lock is taken once: an arena initialized meanwhile made
+  us unlock a mutex we did not hold (rare hang / `Lock not held!`, 4 in 150
+  Phobos stress runs; 0 in 200 after the fix).
+
+Gate with `SYMGC_CONCURRENT_MARK=1`: worst frame 512 MiB 10.7 -> 1.7 ms,
+2 GiB 31.0 -> 1.75 ms; p99 at 2 GiB 1.26 -> 1.45 ms; alloc -4% to -8%.
+Battery: verify workloads, alloc 8 x30, mark_race x8, Phobos stress x30 (and
+x200), finalizer_order x5, unit tests with and without the verifier: all clean.

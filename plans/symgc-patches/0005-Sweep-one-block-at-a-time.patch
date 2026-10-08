@@ -1,7 +1,7 @@
 From 79a0a6aa5ab8ccda09d05d026ff29145a25f15da Mon Sep 17 00:00:00 2001
 From: Leonardo Tada Antunes <leonardotada@gmail.com>
 Date: Thu, 8 Oct 2026 15:01:01 -0300
-Subject: [PATCH 5/9] Sweep one block at a time
+Subject: [PATCH 05/10] Sweep one block at a time
 
 The sweep used to hold the page filler mutex for the whole heap. It now visits
 one block per lock acquisition (scan, free dead extents, then a separate
