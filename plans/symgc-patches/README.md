@@ -171,3 +171,13 @@ Gate with `SYMGC_CONCURRENT_MARK=1`: worst frame 512 MiB 10.7 -> 1.7 ms,
 2 GiB 31.0 -> 1.75 ms; p99 at 2 GiB 1.26 -> 1.45 ms; alloc -4% to -8%.
 Battery: verify workloads, alloc 8 x30, mark_race x8, Phobos stress x30 (and
 x200), finalizer_order x5, unit tests with and without the verifier: all clean.
+
+### 8 GiB live (concurrent mark, patch 0010)
+
+`frames 8192 6000 5000`, 16 cycles over 100 s: start pause 34-41 us, remark
+pause 84-251 us, concurrent mark 8-16 s of background work. Frames: p50 783 us,
+p99 1.42 ms, max 1.82 ms, none over 2 ms. RSS 10.3 GB. The frame's own work is
+~0.8 ms p50, so the excess from the collector is about 1 ms at the worst
+frame; the under-1 ms target on the worst frame is not met yet. Open: mark
+threads competing with the game thread for memory bandwidth/cache (p99 rises
+~15%), and the reference being a game's real frame, not this synthetic loop.
