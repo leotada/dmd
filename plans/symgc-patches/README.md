@@ -203,3 +203,14 @@ Next: attribute it with GcbLockStats and the sweep-assist counters.
   the background threads is the remaining suspect).
 - Sweep duty 10/25/50/100: p99 1.06-1.18 / 1.10-1.33 / 1.16-1.36 / 1.38-1.43 ms,
   max 1.3-1.5 / 1.5-2.0 / 1.6 / 1.8-2.2 ms. Lower duty is slightly better, within noise.
+
+### CPU placement and the malloc floor
+
+Pinning (256 MiB live): all 16 CPUs p99 1.20-1.25 / max 1.5 ms; 8 even CPUs
+(no SMT siblings) 1.39-1.43 / 1.7; CPUs 0-3 1.07-1.30 / 1.5-1.7; 2 CPUs
+4.2-4.6 ms at p99.9 (too few). Placement is not the lever.
+`mallocfloor.d` (same 5000 allocation sizes with malloc/free, no collector):
+p50 67 us, p99 110 us, max 130 us per frame. The GC frame is 690 us p50 /
+1.2 ms p99: ~140 ns per allocation against ~14 ns, and p99/p50 1.8 against 1.6.
+So the gap to close is the allocation path itself (tcache refill, slab
+locks, zeroing, `world[]` random stores), not the collector's pauses.
