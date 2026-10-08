@@ -302,6 +302,10 @@ final class Ent { Ent link; ubyte[] data; size_t id; }
 __gshared Ent[] world;
 void* frameSink;
 
+// With -version=GcbLockStats (and a symgc built with -version=Symgc_phase_trace): per slow frame, how many
+// times this thread took a lock the slow way and for how long.
+version (GcbLockStats) extern(C) void symgc_lockstats(ulong* count, ulong* time);
+
 void runFrames(size_t liveMiB, size_t frames, size_t allocsPerFrame)
 {
     enum entrySize = 512;
@@ -319,6 +323,7 @@ void runFrames(size_t liveMiB, size_t frames, size_t allocsPerFrame)
     immutable t0 = now();
     foreach (f; 0 .. frames)
     {
+        version (GcbLockStats) { ulong lc0, lt0; symgc_lockstats(&lc0, &lt0); }
         immutable a = MonoTime.currTime;
         foreach (k; 0 .. allocsPerFrame)
         {
@@ -333,6 +338,13 @@ void runFrames(size_t liveMiB, size_t frames, size_t allocsPerFrame)
             }
         }
         ft[f] = (MonoTime.currTime - a).total!"usecs";
+        version (GcbLockStats)
+        {
+            ulong lc1, lt1;
+            symgc_lockstats(&lc1, &lt1);
+            if (ft[f] > 2000)
+                fprintf(stderr, "frame %zu %lld us: slow lock entries %llu, waited %.0f us\n", f, ft[f], lc1 - lc0, (lt1 - lt0) / 10.0);
+        }
         // pace to 60 fps so the collector has idle time, as in a real game
         immutable target = cast(long) 16_666;
         long spent = ft[f];

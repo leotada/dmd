@@ -897,6 +897,30 @@ Findings about symgc: it is stop-the-world with parallel mark threads and per-th
 
 **Implementation log.** The fork exists locally as `symgc/` (branch `latency-p3`, patches in `plans/symgc-patches/`). Done: the unit-test baseline builds and passes with the repo's dmd; phase tracing; the SATB foundation (`d.gc.satb`, release barrier in `free`/`destroy`/moving and shrinking `realloc`/`removeRoots`, buffer flush at thread exit), each hook covered by a unit test that fails when the hook is disabled, no measurable cost on `alloc` or `frag`. Then the cycle was split into a start pause, the mark and a remark pause (patch 0003), still all stop-the-world, with the marking flag on during the mark and the remark asserting that nothing was logged; `alloc`, `frag` and `frames` run clean with assertions on. Not done: the restart between start pause and mark (the collector is still stop-the-world, so the hooks above see no concurrent mutator); the compiler-side store barrier and the bulk pre-barrier; the lazy sweep; the thread-registration rules (they need handshakes, which come with concurrent mark).
 
+#### Progress against the reviewed work order (2026-10-08, same day)
+
+Work started after the owner's `/goal` command. Status per step; numbers are in `plans/symgc-patches/README.md`.
+
+| Step | State |
+|---|---|
+| 0 Gates | Done. `plans/bench/core_bench/gate.sh` (save, check, selftest); `over1ms` is informational because the same code gave 89 and 40. Baseline re-saved at `92da0a9`. |
+| 1 Unblock | Phobos: done. The tag `v2.113.0-beta.1` does not compile with this repository's dmd, master of 2026-09-16 does (cloned beside the repo, `libphobos2.a` built). A threads, fibers, `std.parallelism` and finalizer stress passes 30 of 30 under symgc with the verifier. **Open:** Phobos' own unit tests under symgc (the build links after leaving out `std.net.curl`'s libcurl and including `sha_SSSE3`; not run to the end), druntime and compiler suites, the LLVM package (needs root; not installed), the game workload. |
+| 2a Verifier | Done (`-version=Symgc_verify`, patch 0004), plus a coverage assertion at the end of each sweep. |
+| 2b Finalizers | **Open, decided in principle.** Rule: no dead slot is released before every finalizer of the cycle ran. Not implemented; today a finalizer can see slots of other dead objects, in slabs swept earlier, already reused. Needs the finalize-then-release split (a pass over the metadata flags first) and a test with a destructor that reads another dead object under allocation pressure. |
+| 2c Lazy sweep | Done as a background, paced, concurrent sweep with mutator assist (patch 0006). The model's slab rules hold in the code. Not done: a model of the new pacing and assist rules; running the model's sweep-time actions against the C code. |
+| 3 Decommit | Done as a retention policy: free pages are kept warm up to the collection target. |
+| 4 Dirty-page spike | Not started. |
+| 5 to 8 | Not started. |
+
+Result so far: the worst frame is now the stop-the-world mark. 512 MiB live: 28.9 to 11.6 ms. 2 GiB live: 76 to 34 ms. p99 and `alloc` improved, `frag` is 2.4x faster, and `frag`'s steady RSS is 47% higher (still at the conservative GC's level). The 1 ms target needs step 5.
+
+What the work found, for the plan:
+
+1. A sweep that runs at full speed beside the mutators made the allocating thread's frames 10x slower (0.8 to 8 ms for the frames after a collection). Pacing hid it; the cause was a wait for the page filler lock of 250 us per acquisition, because a mutator arriving mid-step waits for the rest of the step and steps were long. 10 us steps remove it, and the pacing is then a memory/CPU trade, not a latency fix.
+2. Pacing without a bound on the heap is unsafe: an allocation-heavy loop outran the paced sweep and the heap grew 10x. The bound has to be relative to the collection target, and threads that allocate must help (assist).
+3. Decommit on every cycle cost 30% of `alloc-1t`.
+4. Every one of the bugs listed in the patch README was invisible to the unit tests; the gate (RSS) and the stress with many threads found them. The model does not cover them; extending it with the sweep driver (several drivers, resumable steps, new blocks during a sweep) is worth doing before step 5.
+
 #### Reviewed work order (2026-10-08)
 
 This replaces the earlier "Next steps" list. Phase 0 is finished: its gates are decided (above) and its tools (model, benchmarks, phase trace, audit) stay in use. All work from here is P1 to P4 on the symgc fork.

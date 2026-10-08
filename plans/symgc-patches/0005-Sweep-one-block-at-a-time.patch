@@ -1,0 +1,402 @@
+From 79a0a6aa5ab8ccda09d05d026ff29145a25f15da Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 15:01:01 -0300
+Subject: [PATCH 5/6] Sweep one block at a time
+
+The sweep used to hold the page filler mutex for the whole heap. It now visits
+one block per lock acquisition (scan, free dead extents, then a separate
+minimize pass), inserts the swept slabs into the bins as it goes, and keeps a
+cursor over the ring of blocks that is fixed up when a block leaves it. The
+world is still stopped by probation, so behaviour is unchanged: unit tests,
+the Phobos stress and the benchmark gate pass, also with the verifier.
+---
+ source/d/gc/block.d  |  26 ++++++
+ source/d/gc/page.d   | 207 +++++++++++++++++++++++++++++++++----------
+ source/d/gc/ring.d   |   6 ++
+ source/d/gc/tcache.d |   3 +
+ 4 files changed, 196 insertions(+), 46 deletions(-)
+
+diff --git a/source/d/gc/block.d b/source/d/gc/block.d
+index 1f1f9c4..ca26fd7 100644
+--- a/source/d/gc/block.d
++++ b/source/d/gc/block.d
+@@ -90,6 +90,12 @@ private:
+ 
+ 	AllBlockRingNode allrnode;
+ 
++	/**
++	 * The GC cycle whose sweep has visited this block, or in which the block
++	 * was created. Zero for a block no sweep has seen.
++	 */
++	ubyte _sweepSerial;
++
+ 	uint usedCount;
+ 	uint dirtyCount;
+ 	ubyte generation;
+@@ -154,6 +160,26 @@ public:
+ 		return (bits >> FreeRangeClassIndex) & FreeRangeClassMask;
+ 	}
+ 
++	/**
++	 * The block after this one in the ring of all blocks of its kind, or null
++	 * if this is the only one.
++	 */
++	@property
++	BlockDescriptor* allNext() {
++		auto n = allrnode.nextNode;
++		return n is &this ? null : n;
++	}
++
++	@property
++	ubyte sweepSerial() const {
++		return _sweepSerial;
++	}
++
++	@property
++	void sweepSerial(ubyte s) {
++		_sweepSerial = s;
++	}
++
+ 	@property
+ 	bool dense() const {
+ 		return (bits & 0x01) != 0;
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 36592ab..00eb0ab 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -6,6 +6,7 @@ import d.gc.block;
+ import d.gc.emap;
+ import d.gc.extent;
+ import d.gc.size;
++import d.gc.sizeclass : BinCount;
+ import d.gc.spec;
+ import d.gc.util;
+ 
+@@ -65,6 +66,22 @@ private:
+ 
+ 	OutlinedBitmap* outlinedBitmaps;
+ 
++	/**
++	 * The sweep runs one block at a time, releasing the mutex in between.
++	 * `sweepNext` is the next block to visit in the ring of all blocks of the
++	 * current phase; it is fixed up when a block leaves the ring.
++	 */
++	enum SweepPhase : ubyte {
++		Idle,
++		DenseScan,
++		DenseMinimize,
++		SparseScan,
++		SparseMinimize,
++	}
++
++	SweepPhase sweepPhase;
++	BlockDescriptor* sweepNext;
++
+ 	import d.gc.base;
+ 	shared Base base;
+ 
+@@ -305,11 +322,28 @@ public:
+ 		(cast(PageFiller*) &this).prepareGCCycleImpl(emap);
+ 	}
+ 
++	/**
++	 * Sweep this filler. The work is done one block at a time, and the mutex
++	 * is released between blocks.
++	 */
+ 	void collect(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) shared {
+-		mutex.lock();
+-		scope(exit) mutex.unlock();
++		auto self = cast(PageFiller*) &this;
+ 
+-		(cast(PageFiller*) &this).collectImpl(emap, gcCycle, stats);
++		{
++			mutex.lock();
++			scope(exit) mutex.unlock();
++
++			self.beginSweepImpl(gcCycle);
++		}
++
++		while (true) {
++			mutex.lock();
++			scope(exit) mutex.unlock();
++
++			if (!self.sweepStepImpl(emap, gcCycle, stats)) {
++				break;
++			}
++		}
+ 	}
+ 
+ 	/**
+@@ -479,9 +513,12 @@ private:
+ 		}
+ 
+ 		unregisterBlock(block);
++		sweepForgetBlock(block);
+ 		sparseBlocks.remove(block);
+ 
++		auto sweepSerial = block.sweepSerial;
+ 		block.at(address + extraBlocks * BlockSize, false);
++		block.sweepSerial = sweepSerial;
+ 		sparseBlocks.insert(block);
+ 
+ 		bool dirty;
+@@ -679,6 +716,7 @@ private:
+ 		assert(e.block is block, "Invalid Block!");
+ 
+ 		// We do not manage this block anymore.
++		sweepForgetBlock(block);
+ 		getAllBlocks(block.dense).remove(block);
+ 		unusedBlockDescriptors.insert(block);
+ 
+@@ -819,19 +857,122 @@ private:
+ 		}
+ 	}
+ 
+-	void collectImpl(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) {
++	void beginSweepImpl(ubyte gcCycle) {
+ 		assert(mutex.isHeld(), "Mutex not held!");
++		assert(sweepPhase == SweepPhase.Idle, "A sweep is already running!");
+ 
+ 		auto sharedThis = cast(shared(PageFiller)*) &this;
+ 		sharedThis.arena.clearBinsForCollection();
+ 
++		sweepPhase = SweepPhase.DenseScan;
++		sweepNext = denseBlocks.first;
++	}
++
++	/**
++	 * The ring of all blocks is circular, and new blocks are inserted at its
++	 * head, so a pass walks forward from the block that was first when it
++	 * started and ends when it meets a block it already visited.
++	 */
++	BlockDescriptor* nextSweepBlock(ubyte serial) {
++		assert(mutex.isHeld(), "Mutex not held!");
++
++		auto b = sweepNext;
++		if (b is null || b.sweepSerial == serial) {
++			sweepNext = null;
++			return null;
++		}
++
++		b.sweepSerial = serial;
++		sweepNext = b.allNext;
++		return b;
++	}
++
++	/**
++	 * A block is about to leave the ring of all blocks, or to be reinitialized.
++	 */
++	void sweepForgetBlock(BlockDescriptor* block) {
++		assert(mutex.isHeld(), "Mutex not held!");
++
++		if (sweepNext is block) {
++			sweepNext = block.allNext;
++		}
++	}
++
++	/**
++	 * Do one block's worth of sweeping. Returns false when the sweep is over.
++	 */
++	bool sweepStepImpl(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) {
++		assert(mutex.isHeld(), "Mutex not held!");
++
+ 		import d.gc.sizeclass;
+-		PriorityExtentHeap[BinCount] collectedSlabs;
+-		auto slabs = collectedSlabs[0 .. BinCount];
++		ubyte minimizeSerial = (gcCycle + 1) & 0xff;
++
++		while (true) {
++			final switch (sweepPhase) with(SweepPhase) {
++				case Idle:
++					return false;
++
++				case DenseScan:
++					auto b = nextSweepBlock(gcCycle);
++					if (b is null) {
++						auto tO0 = getMonotonicTime();
++						collectOutlinedBitmaps();
++						gSweepT[2] += getMonotonicTime() - tO0;
++
++						sweepPhase = DenseMinimize;
++						sweepNext = denseBlocks.first;
++						continue;
++					}
++
++					PriorityExtentHeap[BinCount] collectedSlabs;
++					collectDenseBlock(emap, b, collectedSlabs[0 .. BinCount], stats);
++					combineSweptSlabs(collectedSlabs);
++					return true;
++
++				case DenseMinimize:
++					auto b = nextSweepBlock(minimizeSerial);
++					if (b is null) {
++						sweepPhase = SparseScan;
++						sweepNext = sparseBlocks.first;
++						continue;
++					}
++
++					auto tM0 = getMonotonicTime();
++					b.minimize();
++					gSweepT[3] += getMonotonicTime() - tM0;
++					return true;
+ 
+-		collectDenseAllocations(emap, slabs, stats);
+-		collectSparseAllocations(emap, slabs, gcCycle, stats);
++				case SparseScan:
++					auto b = nextSweepBlock(gcCycle);
++					if (b is null) {
++						sweepPhase = SparseMinimize;
++						sweepNext = sparseBlocks.first;
++						continue;
++					}
+ 
++					PriorityExtentHeap[BinCount] collectedSlabs;
++					collectSparseBlock(emap, b, collectedSlabs[0 .. BinCount], gcCycle, stats);
++					combineSweptSlabs(collectedSlabs);
++					return true;
++
++				case SparseMinimize:
++					auto b = nextSweepBlock(minimizeSerial);
++					if (b is null) {
++						sweepPhase = Idle;
++						sweepNext = null;
++						return false;
++					}
++
++					auto tM0 = getMonotonicTime();
++					b.minimize();
++					gSweepT[6] += getMonotonicTime() - tM0;
++					return true;
++			}
++		}
++	}
++
++	void combineSweptSlabs(ref PriorityExtentHeap[BinCount] collectedSlabs) {
++		auto sharedThis = cast(shared(PageFiller)*) &this;
+ 		sharedThis.arena.combineBinsAfterCollection(collectedSlabs);
+ 	}
+ 
+@@ -911,16 +1052,14 @@ private:
+ 		e.slabMetadataFlags.rawContent[nimbleIndex] = metadataFlags;
+ 	}
+ 
+-	void collectDenseAllocations(ref CachedExtentMap emap,
+-	                             PriorityExtentHeap[] slabs,
+-								 ref CollectStats stats) {
++	void collectDenseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
++	                       PriorityExtentHeap[] slabs, ref CollectStats stats) {
+ 		assert(mutex.isHeld(), "Mutex not held!");
+ 
+ 		PriorityExtentHeap deadExtents;
+ 		auto tD0 = getMonotonicTime();
+ 
+-		for (auto r = denseBlocks.range; !r.empty; r.popFront()) {
+-			auto block = r.front;
++		{
+ 			auto bem = emap.blockLookup(block.address);
+ 
+ 			uint i = 0;
+@@ -998,40 +1137,28 @@ private:
+ 		}
+ 
+ 		auto tD1 = getMonotonicTime();
++
++		// Freeing the last extent of the block releases the block itself,
++		// so nothing may touch it after this point.
+ 		while (!deadExtents.empty) {
+ 			freeExtentLocked(emap, deadExtents.pop());
+ 		}
+-		auto tD2 = getMonotonicTime();
+ 
+-		collectOutlinedBitmaps();
+-		auto tD3 = getMonotonicTime();
+-		minimizeDense();
+-		gSweepT[0] += tD1 - tD0; gSweepT[1] += tD2 - tD1; gSweepT[2] += tD3 - tD2; gSweepT[3] += getMonotonicTime() - tD3;
+-	}
+-
+-	uint minimizeDense() {
+-		uint n = 0;
+-		for (auto r = denseBlocks.range; !r.empty; r.popFront()) {
+-			auto block = r.front;
+-			n += block.minimize();
+-		}
+-
+-		return n;
++		gSweepT[0] += tD1 - tD0; gSweepT[1] += getMonotonicTime() - tD1;
+ 	}
+ 
+ 	/**
+ 	 * Sparse collection.
+ 	 */
+-	void collectSparseAllocations(ref CachedExtentMap emap,
+-	                              PriorityExtentHeap[] slabs, ubyte gcCycle,
+-								  ref CollectStats stats) {
++	void collectSparseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
++	                        PriorityExtentHeap[] slabs, ubyte gcCycle,
++	                        ref CollectStats stats) {
+ 		assert(mutex.isHeld(), "Mutex not held!");
+ 
+ 		PriorityExtentHeap deadExtents;
+ 		auto tS0 = getMonotonicTime();
+ 
+-		for (auto r = sparseBlocks.range; !r.empty; r.popFront()) {
+-			auto block = r.front;
++		{
+ 			auto bem = emap.blockLookup(block.address);
+ 
+ 			uint i = 0;
+@@ -1123,19 +1250,7 @@ private:
+ 		while (!deadExtents.empty) {
+ 			freeExtentLocked(emap, deadExtents.pop());
+ 		}
+-		auto tS2 = getMonotonicTime();
+-		minimizeSparse();
+-		gSweepT[4] += tS1 - tS0; gSweepT[5] += tS2 - tS1; gSweepT[6] += getMonotonicTime() - tS2;
+-	}
+-
+-	uint minimizeSparse() {
+-		uint n = 0;
+-		for (auto r = sparseBlocks.range; !r.empty; r.popFront()) {
+-			auto block = r.front;
+-			n += block.minimize();
+-		}
+-
+-		return n;
++		gSweepT[4] += tS1 - tS0; gSweepT[5] += getMonotonicTime() - tS1;
+ 	}
+ 
+ 	void freeExtentLocked(ref CachedExtentMap emap, Extent* e) {
+diff --git a/source/d/gc/ring.d b/source/d/gc/ring.d
+index 84cb72a..a2804ca 100644
+--- a/source/d/gc/ring.d
++++ b/source/d/gc/ring.d
+@@ -6,6 +6,12 @@ private:
+ 
+ 	Link prev;
+ 	Link next;
++
++public:
++	@property
++	N* nextNode() {
++		return next.node;
++	}
+ }
+ 
+ struct Ring(N, string NodeName = "rnode") {
+diff --git a/source/d/gc/tcache.d b/source/d/gc/tcache.d
+index e8092ef..816675e 100644
+--- a/source/d/gc/tcache.d
++++ b/source/d/gc/tcache.d
+@@ -1077,6 +1077,9 @@ private:
+ 	}
+ }
+ 
++// The verifier poisons freed slots, which is the opposite of what this test
++// looks for (dirty memory coming back after a free).
++version(Symgc_verify) {} else
+ @"zero" unittest {
+ 	enum LargeSize = 5 * PageSize;
+ 	enum SmallSize = 8;
+-- 
+2.51.0
+

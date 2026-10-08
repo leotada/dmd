@@ -1,0 +1,199 @@
+From b13739804f40716f73642658ac41609e60affbad Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 14:20:44 -0300
+Subject: [PATCH 4/6] Verifier mode (-version=Symgc_verify): poison freed
+ slots, check them on allocation
+
+The sweep and explicit free fill freed slots with 0xDB. A slot handed out
+again must hold only zeros or only poison, otherwise someone wrote through a
+dangling pointer and the check aborts with the slot and offset. New slabs
+are zeroed first so recycled pages cannot trigger false reports. Large
+extents are not poisoned yet.
+---
+ source/d/gc/page.d   | 39 ++++++++++++++++++++++++++
+ source/d/gc/tcache.d | 10 +++++++
+ source/d/gc/verify.d | 66 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 115 insertions(+)
+ create mode 100644 source/d/gc/verify.d
+
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 20bb9eb..36592ab 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -87,6 +87,13 @@ public:
+ 		}
+ 
+ 		if (likely(emap.remap(e, ec))) {
++			// Pages may be recycled and hold anything. The verifier expects a
++			// slot to be either zero or poison, so start from zero.
++			version(Symgc_verify) {
++				import core.stdc.string : memset;
++				memset(e.address, 0, neededPages * PageSize);
++			}
++
+ 			return e;
+ 		}
+ 
+@@ -848,6 +855,26 @@ private:
+ 		}
+ 	}
+ 
++	/**
++	 * Verifier mode (`-version=Symgc_verify`): fill every slot the sweep frees
++	 * with the poison byte, so a mutator that still reads a lost object sees
++	 * an impossible pointer, and `d.gc.verify.checkSlotOnAlloc` can tell
++	 * a write through a dangling pointer when the slot is handed out again.
++	 */
++	version(Symgc_verify) static
++	void poisonEvictedSlots(ulong evicted, int sizeClass, Extent* e, size_t nimbleIndex) {
++		import d.gc.slab;
++		import d.gc.verify;
++		auto slotSize = binInfos[sizeClass].slotSize;
++		void* nimbleBase = e.address + (nimbleIndex * 64 * slotSize);
++
++		while (evicted != 0) {
++			auto index = countTrailingZeros(evicted);
++			poisonSlot(nimbleBase + index * slotSize, slotSize);
++			evicted &= (evicted - 1);
++		}
++	}
++
+ 	static
+ 	void finalizeSlabNimble(ulong evicted, ulong metadataFlags, int sizeClass,
+ 	                        Extent* e, size_t nimbleIndex) {
+@@ -935,6 +962,11 @@ private:
+ 					auto evicted = oldOccupancy ^ newOccupancy;
+ 					count += popCount(evicted);
+ 
++					// Declared first, so it runs after the occupancy update below.
++					version(Symgc_verify) {
++						scope(success) poisonEvictedSlots(evicted, sc, e, j);
++					}
++
+ 					scope(success) e.slabData.rawContent[j] = newOccupancy;
+ 
+ 					if (!ec.supportsMetadata) {
+@@ -1046,6 +1078,10 @@ private:
+ 				// If completely empty and no metadata exists,
+ 				// we can short circuit here.
+ 				if (markBits == 0 && metadataFlags == 0) {
++					version(Symgc_verify) {
++						poisonEvictedSlots(e.slabData.rawContent[0], ec.sizeClass, e, 0);
++					}
++
+ 					deadExtents.insert(e);
+ 					continue;
+ 				}
+@@ -1057,6 +1093,9 @@ private:
+ 
+ 				// Call any finalizers on dying slots.
+ 				finalizeSlabNimble(evicted, metadataFlags, sc, e, 0);
++				version(Symgc_verify) {
++					poisonEvictedSlots(evicted, sc, e, 0);
++				}
+ 
+ 				auto count = popCount(evicted);
+ 				stats.bytesCollected += count * binInfos[sc].slotSize;
+diff --git a/source/d/gc/tcache.d b/source/d/gc/tcache.d
+index e1a8027..e8092ef 100644
+--- a/source/d/gc/tcache.d
++++ b/source/d/gc/tcache.d
+@@ -508,6 +508,11 @@ private:
+ 			return null;
+ 		}
+ 
++		version(Symgc_verify) {
++			import d.gc.verify;
++			checkSlotOnAlloc(ptr, size, slotSize);
++		}
++
+ 		import core.stdc.string : memset;
+ 		if (unlikely(zero)) {
+ 			memset(ptr, 0, slotSize);
+@@ -583,6 +588,11 @@ private:
+ 			memset(ptr, 0, slotSize);
+ 		}
+ 
++		version(Symgc_verify) {
++			import d.gc.verify;
++			poisonSlot(ptr, slotSize);
++		}
++
+ 		/**
+ 		 * If the allocation has metadata, we need to clear that flag.
+ 		 * Note: we do this on free and not alloc because explicit
+diff --git a/source/d/gc/verify.d b/source/d/gc/verify.d
+new file mode 100644
+index 0000000..e7981e5
+--- /dev/null
++++ b/source/d/gc/verify.d
+@@ -0,0 +1,66 @@
++module d.gc.verify;
++
++/**
++ * Verifier mode, enabled with `-version=Symgc_verify`. It is for tests and
++ * CI, not for production: it touches every freed slot.
++ *
++ * The collector (and explicit `free`) fill a freed slot with `PoisonByte`.
++ * That has two effects:
++ *
++ *  - A mutator that still uses an object the collector lost reads
++ *    `0xDBDBDBDBDBDBDBDB`, which is not a valid pointer in a 47-bit address
++ *    space, and crashes at once instead of silently reading reused memory.
++ *  - When a slot is handed out again it must hold either only zeros (fresh
++ *    from the OS) or only poison. Anything else means someone wrote through
++ *    a dangling pointer, and the check reports the slot and aborts.
++ *
++ * The same switch is what the concurrent mark and the lazy sweep are
++ * validated with (plans, "Reviewed work order", step 2a).
++ */
++
++version(Symgc_verify):
++
++enum ubyte PoisonByte = 0xDB;
++
++void poisonSlot(void* ptr, size_t slotSize) {
++	import core.stdc.string : memset;
++	memset(ptr, PoisonByte, slotSize);
++}
++
++/**
++ * Called before a slot is returned by the small allocator. `size` is the
++ * requested size and `slotSize` the size class; both are used only to report.
++ */
++void checkSlotOnAlloc(const(void)* ptr, size_t size, size_t slotSize) {
++	auto p = cast(const(ubyte)*) ptr;
++
++	bool allZero = true;
++	bool allPoison = true;
++	size_t firstBad = size_t.max;
++	foreach (i; 0 .. slotSize) {
++		if (p[i] != 0) {
++			allZero = false;
++		}
++
++		if (p[i] != PoisonByte) {
++			allPoison = false;
++			if (firstBad == size_t.max && p[i] != 0) {
++				firstBad = i;
++			}
++		}
++
++		if (!allZero && !allPoison) {
++			break;
++		}
++	}
++
++	if (allZero || allPoison) {
++		return;
++	}
++
++	import core.stdc.stdio : fprintf, stderr;
++	import core.stdc.stdlib : abort;
++	fprintf(stderr, "symgc verify: write after free: slot %p (size class %zu, request %zu) holds mixed data, first foreign byte at offset %zu\n",
++	        ptr, slotSize, size, firstBad);
++	abort();
++}
+-- 
+2.51.0
+
