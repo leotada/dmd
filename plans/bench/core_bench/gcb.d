@@ -342,7 +342,7 @@ void runFrames(size_t liveMiB, size_t frames, size_t allocsPerFrame)
         {
             ulong lc1, lt1;
             symgc_lockstats(&lc1, &lt1);
-            if (ft[f] > 2000)
+            if (ft[f] > 1100)
                 fprintf(stderr, "frame %zu %lld us: slow lock entries %llu, waited %.0f us\n", f, ft[f], lc1 - lc0, (lt1 - lt0) / 10.0);
         }
         // pace to 60 fps so the collector has idle time, as in a real game

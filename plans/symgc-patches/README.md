@@ -193,3 +193,13 @@ more threads is slightly better because the cycle ends sooner). So the
 remaining ~0.5-0.9 ms over the 0.7 ms p50 of a 5000-allocation frame is
 allocation-path jitter (refills, sweep assist, lock waits), not the mark.
 Next: attribute it with GcbLockStats and the sweep-assist counters.
+
+### Where the jitter is not (256 MiB live, 1200 frames of 5000 allocations)
+
+- Page faults: ~20 per frame (~20 us), not the cause.
+- Lock waits (`GcbLockStats`, slow-frame threshold now 1.1 ms): 15 of 1200
+  frames are over 1.1 ms; five show 50-260 us of lock wait, the other ten show
+  none, so ~0.5 ms is unexplained there (scheduler/SMT/cache interference with
+  the background threads is the remaining suspect).
+- Sweep duty 10/25/50/100: p99 1.06-1.18 / 1.10-1.33 / 1.16-1.36 / 1.38-1.43 ms,
+  max 1.3-1.5 / 1.5-2.0 / 1.6 / 1.8-2.2 ms. Lower duty is slightly better, within noise.
