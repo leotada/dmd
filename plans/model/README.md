@@ -60,3 +60,32 @@ created during a cycle, I2/I3 (hold by construction), finalizers, interior point
 The random mode cannot prove absence of bugs, and missed `noescapescan` (a 10-step interleaving found only
 exhaustively). A depth-limited search from random states would close that gap. 3 threads with 5 objects is not
 reachable exhaustively.
+
+## Slabs, explicit free and allocation during the sweep (`--slabs=K --free`, P2 lazy-sweep design)
+
+Added to check the design in RFC "Lazy-sweep prototype: analysis" before any code is written. With `--slabs=K`
+objects are grouped K per slab; each slab is in or out of its bin heap; the sweep empties every bin at its start
+(`clearForCollection`), then sweeps one slab at a time and puts it back when it has a free slot; allocation takes a
+free slot only from a slab that is in its bin (so, during a sweep, only from swept slabs, and without marking: the
+slot is never visited by this sweep); a slab that becomes full leaves the bin. `--free` lets a mutator free an object
+only its own slot references (`GC.free`/`delete`); a swept slab re-enters its bin on the first free slot, an unswept
+slab does not (the sweep rebuilds it). Invariants added: an unswept slab is never in a bin, a full slab is never in a
+bin, and a swept slab with a free slot is always in its bin. Object renaming is off in this mode (objects are no longer
+interchangeable), so exhaustive runs use 3 to 4 objects.
+
+| Check | Result |
+|---|---|
+| Track A, 1 thread, 3 objects, 2 slots, `--slabs=2 --free`, exhaustive | pass, 10.0M states |
+| Track A, 2 threads, 3 objects, 1 slot, `--slabs=2 --free`, exhaustive | pass, 14.6M states |
+| Track A, 1 thread, 4 objects, 1 slot, `--slabs=2 --free`, exhaustive | pass, 2.4M states |
+| Track A, `--free` without slabs, 1 thread, 3 objects, 2 slots, exhaustive | pass, 1.96M states |
+| random walks, 2 threads / 4 objects / `--slabs=2 --free`, 300 walks x 100k steps | pass, 1.5M cycles |
+| planted `allocunswept`, `freeunswept`, `missedinsert` | detected (use-after-free; double insert; leak) |
+
+**Finding 6: explicit free during marking needs the deletion barrier on the freed object's fields.** The first clean
+run failed (11-step trace, also without slabs): the collector greys O0 but has not traced it; a mutator loads O1 from
+`O0.f0` into its stack (loads are unbarriered); the mutator then frees O0. Freeing deletes every pointer field of O0
+without logging them, O1 is never marked and the sweep frees it while the stack still holds it. Fix: `GC.free`,
+`delete` and anything that releases a block containing pointers must log (or shade) its pointer fields while
+`marking` is set, exactly like an overwritten field. With the fix the runs above pass; the old behaviour is the planted
+bug `nofreebarrier`. For a no-scan block there is nothing to log.

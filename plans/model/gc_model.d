@@ -61,6 +61,8 @@ import std.stdio;
 
 __gshared int NT = 2, NO = 4, NS = 2, NF = 1, NG = 1, NFB = 0, NC = 1;
 __gshared bool trackB = true;
+__gshared int slabK;           // --slabs=K: objects are grouped K per slab with bin membership and a per-slab sweep
+__gshared bool freeOn;         // --free: mutators may explicitly free an object they alone reference
 __gshared bool race;           // two-step stores
 __gshared bool fixXchg;        // with race: the write step also logs the value it really overwrites
 __gshared string bug = "";
@@ -71,7 +73,7 @@ __gshared ulong seed = 1;
 
 // byte offsets inside the packed state
 __gshared int oOwn, oFld, oStk, oGlb, oMark, oSkip, oEsc, oPhase, oGidx, oHs,
-    oGrey, oCur, oIdx, oSwept, oBuf, oCtx, oScn, oPendL, oPendV, USED;
+    oGrey, oCur, oIdx, oSwept, oBuf, oCtx, oScn, oPendL, oPendV, oNoBin, oSlSw, USED;
 
 enum MAXB = 112;
 struct S { ubyte[MAXB] b; }
@@ -96,6 +98,8 @@ void layout()
     oScn = take(NT * NC);
     oPendL = take(NT);
     oPendV = take(NT);
+    oNoBin = take(1);   // slabs NOT in their bin's heap (bit set = absent); zero = every slab present
+    oSlSw = take(1);    // slabs swept (or rebuilt) in the current sweep
     USED = p;
     assert(USED <= MAXB, "state too large; raise MAXB");
     assert(NO <= 8 && NT <= 6);
@@ -173,6 +177,44 @@ void freeObj(ref S s, int o)
         s.b[fi(o, f)] = 0;
     immutable m = cast(ubyte) ~(1 << o);
     s.b[oMark] &= m; s.b[oSkip] &= m; s.b[oGrey] &= m; s.b[oSwept] &= m;
+}
+
+// ------------------------------------------------------------ slabs (--slabs)
+
+int slabOf(int o) { return o / slabK; }
+int nSlabs() { return (NO + slabK - 1) / slabK; }
+bool inBin(in S s, int sl) { return !bit(s.b[oNoBin], sl); }
+void setBin(ref S s, int sl, bool present)
+{
+    if (present) s.b[oNoBin] &= cast(ubyte) ~(1 << sl); else s.b[oNoBin] |= 1 << sl;
+}
+bool hasFree(in S s, int sl)
+{
+    foreach (o; 0 .. NO)
+        if (slabOf(o) == sl && own(s, o) == FREE) return true;
+    return false;
+}
+/// Slab is swept for this purpose when no sweep is running or the sweep has been through it.
+bool slabSwept(in S s, int sl) { return phase(s) != SWEEPING || bit(s.b[oSlSw], sl); }
+
+/// Number of places that hold a reference to object o (stack slots, globals, fields of non-free objects, pending stores).
+int refCount(in S s, int o)
+{
+    int n;
+    immutable r = cast(ubyte)(o + 1);
+    foreach (u; 0 .. NT)
+    {
+        foreach (k; 0 .. NC * NS)
+            n += s.b[sflat(u, k)] == r;
+        n += s.b[oPendV + u] == r;
+    }
+    foreach (g; 0 .. NG)
+        n += s.b[oGlb + g] == r;
+    foreach (p; 0 .. NO)
+        if (own(s, p) != FREE)
+            foreach (f; 0 .. NF)
+                n += s.b[fi(p, f)] == r;
+    return n;
 }
 
 // ------------------------------------------------------------ collector ops
@@ -273,6 +315,7 @@ void endCycle(ref S s)
     s.b[oMark] = s.b[oSkip] = s.b[oGrey] = s.b[oSwept] = 0;
     s.b[oCur] = s.b[oIdx] = s.b[oGidx] = s.b[oHs] = 0;
     s.b[oScn .. oScn + NT * NC] = 0;
+    s.b[oSlSw] = 0;
     s.b[oPhase] = IDLE;
 }
 
@@ -303,6 +346,11 @@ void remark(ref S s)
     }
     s.b[oPhase] = SWEEPING;
     s.b[oSwept] = 0;
+    if (slabK)
+    {
+        s.b[oSlSw] = 0;
+        s.b[oNoBin] = cast(ubyte)((1 << nSlabs) - 1); // the sweep empties every bin heap first (clearForCollection)
+    }
 }
 
 // ------------------------------------------------------------ mutator ops
@@ -320,8 +368,8 @@ void protectNew(ref S s, int o, bool promoted)
         else
             s.b[oMark] |= 1 << o; // allocated black
     }
-    else if (s.b[oPhase] == SWEEPING && !isBug("sweepnoprotect"))
-        s.b[oMark] |= 1 << o;
+    else if (s.b[oPhase] == SWEEPING && !isBug("sweepnoprotect") && !slabK)
+        s.b[oMark] |= 1 << o;  // with slabs, allocation during the sweep comes only from swept slabs and needs no mark
 }
 
 /// publishSlow: promote the local subgraph reachable from `root` in place.
@@ -587,6 +635,30 @@ void successors(in S s0, scope Emit emit)
             emit(c, "GC: remark (STW-2), start sweep");
         }
     }
+    else if (slabK) // SWEEPING, one slab at a time
+    {
+        foreach (sl; 0 .. nSlabs)
+            if (!bit(s0.b[oSlSw], sl))
+            {
+                S c = s0;
+                foreach (o; 0 .. NO)
+                    if (slabOf(o) == sl)
+                    {
+                        c.b[oSwept] |= 1 << o;
+                        if (own(c, o) == GLOBAL && !bit(c.b[oMark], o) && !bit(c.b[oSkip], o))
+                            freeObj(c, o);
+                    }
+                c.b[oSlSw] |= 1 << sl;
+                setBin(c, sl, hasFree(c, sl)); // rebuilt as the sweep goes
+                emit(c, format("GC: sweep slab %s", sl));
+            }
+        if (s0.b[oSlSw] == cast(ubyte)((1 << nSlabs) - 1))
+        {
+            S c = s0;
+            endCycle(c);
+            emit(c, "GC: end of cycle");
+        }
+    }
     else // SWEEPING
     {
         foreach (o; 0 .. NO)
@@ -623,19 +695,65 @@ void successors(in S s0, scope Emit emit)
         }
 
         // allocate into slot i
-        int free = -1;
-        foreach (o; 0 .. NO)
-            if (own(s0, o) == FREE) { free = o; break; }
-        if (free >= 0)
+        // (with slabs: one candidate per slab, taken from a slab that is in its bin)
+        {
+            int[8] cand;
+            int ncand;
+            bool[8] slabDone;
+            foreach (o; 0 .. NO)
+            {
+                if (own(s0, o) != FREE) continue;
+                if (slabK)
+                {
+                    immutable sl = slabOf(o);
+                    if (slabDone[sl]) continue;
+                    slabDone[sl] = true;
+                    if (!inBin(s0, sl) && !isBug("allocunswept")) continue;
+                    cand[ncand++] = o;
+                }
+                else
+                {
+                    cand[ncand++] = o;
+                    break;
+                }
+            }
+            foreach (free; cand[0 .. ncand])
+                foreach (i; 0 .. NS)
+                {
+                    S c = s0;
+                    immutable local = trackB && !bit(c.b[oEsc], t);
+                    c.b[oOwn + free] = local ? me : GLOBAL;
+                    if (!local)
+                        protectNew(c, free, false);
+                    c.b[cs(c, t, i)] = cast(ubyte)(free + 1);
+                    if (slabK && !hasFree(c, slabOf(free)))
+                        setBin(c, slabOf(free), false); // slab became full: removed from the bin heap
+                    emit(c, format("T%s: s%s = new O%s (%s)", t, i, free, local ? "local" : "global"));
+                }
+        }
+
+        // explicit free of an object only this slot references (GC.free / delete)
+        if (freeOn)
             foreach (i; 0 .. NS)
             {
+                immutable v = s0.b[cs(s0, t, i)];
+                if (!v || own(s0, v - 1) != GLOBAL || refCount(s0, v - 1) != 1) continue;
                 S c = s0;
-                immutable local = trackB && !bit(c.b[oEsc], t);
-                c.b[oOwn + free] = local ? me : GLOBAL;
-                if (!local)
-                    protectNew(c, free, false);
-                c.b[cs(c, t, i)] = cast(ubyte)(free + 1);
-                emit(c, format("T%s: s%s = new O%s (%s)", t, i, free, local ? "local" : "global"));
+                immutable o = v - 1;
+                c.b[cs(c, t, i)] = 0;
+                // Freeing deletes every pointer field of the object: the deletion barrier applies to each of them.
+                if (c.b[oPhase] == MARKING && !isBug("nofreebarrier"))
+                    foreach (f; 0 .. NF)
+                        bufAdd(c, t, c.b[fi(o, f)]);
+                freeObj(c, o);
+                if (slabK)
+                {
+                    immutable sl = slabOf(o);
+                    // a swept slab regains membership when it gets a free slot; an unswept one is rebuilt by the sweep
+                    if (isBug("freeunswept") || (slabSwept(c, sl) && !isBug("missedinsert")))
+                        setBin(c, sl, true);
+                }
+                emit(c, format("T%s: free(s%s = O%s)", t, i, o));
             }
 
         foreach (i; 0 .. NS)
@@ -800,6 +918,19 @@ string check(in S s)
                 if (own(s, o) == 2 + t)
                     return format("I6: stack of T%s escaped but O%s is still local", t, o);
 
+    // Bin membership: present exactly when the slab has a free slot, and during a sweep only once the slab is swept.
+    if (slabK)
+        foreach (sl; 0 .. nSlabs)
+        {
+            immutable present = inBin(s, sl), freeSlot = hasFree(s, sl);
+            if (present && !slabSwept(s, sl))
+                return format("bin: unswept slab %s is in its bin heap (a second insert is coming from the sweep)", sl);
+            if (present && !freeSlot)
+                return format("bin: full slab %s is in its bin heap", sl);
+            if (!present && freeSlot && slabSwept(s, sl))
+                return format("bin: slab %s has a free slot but is not in its bin heap (leak until the next cycle)", sl);
+        }
+
     // Freed objects hold nothing; collector bookkeeping never names a freed object.
     foreach (o; 0 .. NO)
         if (own(s, o) == FREE)
@@ -820,6 +951,7 @@ string check(in S s)
 /// names, so isomorphic states collapse to one.
 S canonObjects(in S s)
 {
+    if (slabK) return s; // objects are not interchangeable once they belong to slabs
     int[8] perm = -1;
     int[8] queue;
     int nq, head, next;
@@ -1208,9 +1340,11 @@ int main(string[] args)
         "fibers", "extra (suspended) fiber contexts per thread (default 0)", &NFB,
         "race", "stores are two steps (barrier, then write) so threads can race on a slot", &race,
         "fix", "with --race: 'xchg' also logs the value the write really overwrites", &fixXchgName,
+        "slabs", "group objects K per slab: bin membership, per-slab sweep, allocation only from swept slabs (use with --track=A)", &slabK,
+        "free", "mutators may explicitly free an object only they reference", &freeOn,
         "track", "A (SATB only) or B (local domains), default B", &track,
         "bug", "plant a bug: nodelete nohybrid nopublish noglobalize nolocaltrace "
-               ~ "nopromotegrey noskip sweepnoprotect noescapescan nostw1scan nofiberscan", &bug,
+               ~ "nopromotegrey noskip sweepnoprotect noescapescan nostw1scan nofiberscan allocunswept freeunswept missedinsert nofreebarrier", &bug,
         "swarm", "random walks instead of exhaustive search: number of walks", &swarmWalks,
         "len", "steps per random walk (default 100000)", &walkLen,
         "seed", "random seed (default 1)", &seed,

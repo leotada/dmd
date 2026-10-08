@@ -45,6 +45,17 @@ bug nolocaltrace --track=B --threads=1 --objects=3 --stack=2
 clean A_fibers_1t_3o_1s --track=A --threads=1 --objects=3 --stack=1 --fibers=1
 bug nofiberscan --track=A --threads=1 --objects=3 --stack=1 --fibers=1
 
+# Slab layer and explicit free (P2 lazy sweep design): objects grouped in slabs with bin membership,
+# a per-slab sweep, allocation only from swept slabs, and mutator free(). Object renaming is off, so
+# these runs use few objects. Explicit free during marking must apply the deletion barrier to the
+# freed object's fields (nofreebarrier is found even without slabs).
+clean A_free_2t_3o --track=A --threads=2 --objects=3 --stack=2 --free
+bug nofreebarrier --track=A --threads=1 --objects=3 --stack=2 --free
+clean A_slabs_free_1t_3o --track=A --threads=1 --objects=3 --stack=2 --slabs=2 --free
+for b in allocunswept freeunswept missedinsert nofreebarrier; do
+    bug $b --track=A --threads=1 --objects=3 --stack=2 --slabs=2 --free
+done
+
 # Racing writers (two-step stores). The barrier as written in RFC 4.4 (test the marking flag,
 # then store) is NOT safe if a cycle can start between the two: this must produce a violation.
 # Exchange-then-test is safe. The second case enumerates about 50M states (about 7 minutes).
