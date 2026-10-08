@@ -63,7 +63,8 @@ __gshared int NT = 2, NO = 4, NS = 2, NF = 1, NG = 1, NFB = 0, NC = 1;
 __gshared bool trackB = true;
 __gshared int slabK;           // --slabs=K: objects are grouped K per slab with bin membership and a per-slab sweep
 __gshared bool freeOn;         // --free: mutators may explicitly free an object they alone reference
-__gshared bool rootRm;         // --rootrm: mutators may remove a global root (GC.removeRoot / removeRange)
+__gshared bool threadLife;     // --threadlife: threads can exit and be started again with an argument (Track A only)
+__gshared bool rootRm;        // --rootrm: mutators may remove a global root (GC.removeRoot / removeRange)
 __gshared bool race;           // two-step stores
 __gshared bool fixXchg;        // with race: the write step also logs the value it really overwrites
 __gshared string bug = "";
@@ -74,7 +75,7 @@ __gshared ulong seed = 1;
 
 // byte offsets inside the packed state
 __gshared int oOwn, oFld, oStk, oGlb, oMark, oSkip, oEsc, oPhase, oGidx, oHs,
-    oGrey, oCur, oIdx, oSwept, oBuf, oCtx, oScn, oPendL, oPendV, oNoBin, oSlSw, USED;
+    oGrey, oCur, oIdx, oSwept, oBuf, oCtx, oScn, oPendL, oPendV, oNoBin, oSlSw, oDead, USED;
 
 enum MAXB = 112;
 struct S { ubyte[MAXB] b; }
@@ -101,6 +102,7 @@ void layout()
     oPendV = take(NT);
     oNoBin = take(1);   // slabs NOT in their bin's heap (bit set = absent); zero = every slab present
     oSlSw = take(1);    // slabs swept (or rebuilt) in the current sweep
+    oDead = take(1);    // threads that have exited (--threadlife); zero = every thread is alive
     USED = p;
     assert(USED <= MAXB, "state too large; raise MAXB");
     assert(NO <= 8 && NT <= 6);
@@ -323,7 +325,7 @@ void endCycle(ref S s)
 bool allContextsScanned(in S s)
 {
     foreach (i; 0 .. NT * NC)
-        if (s.b[oScn + i] != 2)
+        if (s.b[oScn + i] != 2 && !bit(s.b[oDead], i / NC))
             return false;
     return true;
 }
@@ -574,6 +576,7 @@ void successors(in S s0, scope Emit emit)
         }
         foreach (t; 0 .. NT)
         {
+            if (bit(s0.b[oDead], t)) continue;
             if (!bit(s0.b[oHs], t))
             {
                 S c = s0;
@@ -629,7 +632,7 @@ void successors(in S s0, scope Emit emit)
                 c.b[oCur] = c.b[oIdx] = 0;
             emit(c, format("GC: trace O%s.f%s -> %s", o, s0.b[oIdx], refStr(v)));
         }
-        if (s0.b[oGidx] == NG && s0.b[oHs] == allHs && allContextsScanned(s0))
+        if (s0.b[oGidx] == NG && (s0.b[oHs] | s0.b[oDead]) == allHs && allContextsScanned(s0))
         {
             S c = s0;
             remark(c);
@@ -684,6 +687,61 @@ void successors(in S s0, scope Emit emit)
     foreach (t; 0 .. NT)
     {
         immutable ubyte me = cast(ubyte)(2 + t);
+
+        if (bit(s0.b[oDead], t))
+            continue;
+
+        if (threadLife)
+        {
+            // exit: the stack and registers vanish. Its SATB buffer is flushed first (Thread exit hook).
+            if (!bit(s0.b[oEsc], t) && !s0.b[oPendL + t])
+            {
+                S c = s0;
+                if (c.b[oPhase] == MARKING && !isBug("exitnoflush"))
+                    flush(c, t);
+                foreach (k; 0 .. NC * NS)
+                    c.b[sflat(t, k)] = 0;
+                c.b[oBuf + t] = 0;
+                c.b[oDead] |= 1 << t;
+                if (c.b[oPhase] == MARKING)
+                    c.b[oHs] |= 1 << t;
+                emit(c, format("T%s: thread exits", t));
+            }
+            // start a dead thread u, passing it the value of one of our slots as its argument (the closure)
+            foreach (u; 0 .. NT)
+                if (bit(s0.b[oDead], u))
+                    foreach (i; 0 .. NS)
+                    {
+                        S c = s0;
+                        immutable arg = s0.b[cs(s0, t, i)];
+                        c.b[oDead] &= cast(ubyte) ~(1 << u);
+                        foreach (k; 0 .. NC * NS)
+                            c.b[sflat(u, k)] = 0;
+                        c.b[sflat(u, 0)] = arg;
+                        c.b[oCtx + u] = 0;
+                        c.b[oHs] &= cast(ubyte) ~(1 << u);
+                        foreach (k; 0 .. NC)
+                            c.b[oScn + u * NC + k] = 0;
+                        if (c.b[oPhase] == MARKING)
+                        {
+                            if (isBug("startnoscan"))
+                            {
+                                // registered as already scanned, argument not shaded
+                                c.b[oHs] |= 1 << u;
+                                foreach (k; 0 .. NC)
+                                    c.b[oScn + u * NC + k] = 2;
+                            }
+                            else
+                            {
+                                // registered as not yet handshaken: the collector scans it like any other thread
+                                c.b[oHs] &= cast(ubyte) ~(1 << u);
+                                foreach (k; 0 .. NC)
+                                    c.b[oScn + u * NC + k] = 0;
+                            }
+                        }
+                        emit(c, format("T%s: starts T%s with argument s%s (%s)", t, u, i, refStr(arg)));
+                    }
+        }
 
         // A store whose barrier ran but whose write has not happened: only that can happen next.
         if (s0.b[oPendL + t])
@@ -1048,10 +1106,11 @@ S permuteThreads(in S s, in int[] P)
     ubyte mapOwner(ubyte ow) { return ow >= 2 ? cast(ubyte)(2 + P[ow - 2]) : ow; }
     foreach (o; 0 .. NO)
         c.b[oOwn + o] = mapOwner(s.b[oOwn + o]);
-    c.b[oHs] = c.b[oEsc] = 0;
+    c.b[oHs] = c.b[oEsc] = c.b[oDead] = 0;
     foreach (t; 0 .. NT)
     {
         immutable n = P[t];
+        if (bit(s.b[oDead], t)) c.b[oDead] |= 1 << n;
         foreach (k; 0 .. NC * NS)
             c.b[sflat(n, k)] = s.b[sflat(t, k)];
         c.b[oBuf + n] = s.b[oBuf + t];
@@ -1355,11 +1414,12 @@ int main(string[] args)
         "race", "stores are two steps (barrier, then write) so threads can race on a slot", &race,
         "fix", "with --race: 'xchg' also logs the value the write really overwrites", &fixXchgName,
         "slabs", "group objects K per slab: bin membership, per-slab sweep, allocation only from swept slabs (use with --track=A)", &slabK,
-        "rootrm", "mutators may remove a global root without a store", &rootRm,
+        "threadlife", "threads can exit and be started again with an argument (use with --track=A)", &threadLife,
+        "rootrm","mutators may remove a global root without a store", &rootRm,
         "free", "mutators may explicitly free an object only they reference", &freeOn,
         "track", "A (SATB only) or B (local domains), default B", &track,
         "bug", "plant a bug: nodelete nohybrid nopublish noglobalize nolocaltrace "
-               ~ "nopromotegrey noskip sweepnoprotect noescapescan nostw1scan nofiberscan allocunswept freeunswept missedinsert nofreebarrier noremoveroot", &bug,
+               ~ "nopromotegrey noskip sweepnoprotect noescapescan nostw1scan nofiberscan allocunswept freeunswept missedinsert nofreebarrier noremoveroot exitnoflush startnoscan", &bug,
         "swarm", "random walks instead of exhaustive search: number of walks", &swarmWalks,
         "len", "steps per random walk (default 100000)", &walkLen,
         "seed", "random seed (default 1)", &seed,

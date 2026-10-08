@@ -20,7 +20,7 @@ compiled code remove or overwrite pointer-containing memory, checked against the
 | 7 | Append / `length` growth into spare capacity | `core/internal/array/appending.d:56-155`, `capacity.d:123-375` | overwrites slack past the used length | safe: slack is not reachable by the program (aliasing slices past `assumeSafeAppend` are already a documented stomping error); symgc scans the whole block (`scanner.d:670` has `usedCapacity` commented out), so nothing is hidden |
 | 8 | Array growth that reallocates (`capacity.d:169`, `appending.d:97`) | copies old to a fresh block | no deletion (old block stays valid until its pointer is overwritten by a barriered store) | safe |
 | 9 | `setAttr` / `clrAttr` | symgc `gcobj.d:179,188` are no-ops | n/a | safe in symgc. (The conservative GC supports `clrAttr(NO_SCAN)`, which would make a black, unscanned block scannable: not relevant to the fork.) |
-| 10 | Thread exit during marking | `cleanupThread`, `destroyThread` | the thread's stack and TLS vanish | safe by the hybrid barrier (values copied out before the thread's handshake are shaded), **not modelled**: add thread creation/exit to the model |
+| 10 | Thread exit during marking | `cleanupThread`, `destroyThread` | the thread's stack and TLS vanish | safe by the hybrid barrier (values copied out before the thread's handshake are shaded), provided the exiting thread flushes its SATB buffer (`exitnoflush`) and a thread started during marking is registered as unscanned (`startnoscan`); both modelled with `--threadlife` |
 | 11 | Finalizers during a lazy sweep | `finalizeSlabNimble`, `collectSparseAllocations` | resurrection of an object the sweep already decided to free | contract unchanged: destructors must not resurrect or touch other GC objects. With a lazy sweep the order and thread of finalization changes; document it |
 | 12 | Thread-cache flush | `Bin.batchFree` | frees cached, never-handed-out slots (no user data) | safe |
 
@@ -34,7 +34,9 @@ compiled code remove or overwrite pointer-containing memory, checked against the
    get a guarded call `if (marking) _d_bulk_pre(dst, n)`; druntime's array assignment functions call it for the
    destination. Measure this in the real LDC build (step 4 of the plan): it is the one item that can add cost to code
    that never allocates.
-4. Re-run `plans/model/run_all.sh` with thread creation and exit added (item 10) before the SATB barrier lands.
+4. Thread creation and exit are modelled (item 10). Implementation rules: flush the SATB buffer in the thread-exit
+   hook; register a new thread as unscanned under the thread-list lock; reset every per-thread cycle field at
+   registration.
 5. Unit tests to write with the fixes, each failing without the fix: free the parent of a grey, untraced object;
    realloc-move a pointer array during marking; `removeRange` after loading a child to the stack; `arr[] = other` over
    a pointer array during marking.

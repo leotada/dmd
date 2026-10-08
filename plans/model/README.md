@@ -96,3 +96,22 @@ A mutator may drop a global root without a store (`GC.removeRoot`/`removeRange`)
 during marking the model fails in 10 steps (planted bug `noremoveroot`: load the child to the stack after the stack
 was scanned, remove the root before it is scanned, the child is swept); with shading, Track A 2 threads / 3 objects /
 1 slot passes exhaustively (2.85M states). See `../audit/druntime_edge_deletions.md`.
+
+### Threads that exit and start during a cycle (`--threadlife`, Track A)
+
+A thread can exit (stack and registers vanish; it must flush its SATB buffer first) and a dead thread can be started
+by a live one with one of the creator's slots as its argument (the closure). Registration is assumed atomic with
+respect to the collector (the thread-list lock). Rules checked:
+
+- A thread started during marking is registered as **not yet handshaken** and its context as unscanned, so the
+  collector scans it like any other thread and the hybrid barrier applies to its stores. Registering it as already
+  scanned without shading the argument (`startnoscan`) loses the argument: the creator drops its reference after its
+  own scan, the new thread holds the only one, nobody scans it (8-step trace).
+- An exiting thread must flush its SATB buffer (`exitnoflush`, 8-step trace). Nothing else is needed: a stack that
+  vanishes before its handshake is safe because everything copied out of it was shaded by the hybrid barrier.
+- Clean: 2 threads / 3 objects / 1 slot exhaustive, 2.83M states; 3 threads / 4 objects / 2 slots / 2 fields with
+  `--free --rootrm`, 300,000 short random walks (1.05M completed cycles). Both planted bugs are found by short walks
+  (`--swarm=100000 --len=60`) but not by 400 long walks of 60,000 steps: long walks dilute shallow interleavings.
+- A first version of the model failed because an exit during IDLE left a stale "handshaken" bit that survived into
+  the next cycle. That was a model bug, but it names a real implementation rule: **per-thread cycle state must be
+  reset at registration, not assumed clear**.

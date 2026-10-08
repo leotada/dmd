@@ -58,6 +58,23 @@ for b in allocunswept freeunswept missedinsert nofreebarrier; do
     bug $b --track=A --threads=1 --objects=3 --stack=2 --slabs=2 --free
 done
 
+# Threads that exit and start during a cycle (--threadlife). A started thread must be registered as not yet
+# scanned (or its argument shaded), and an exiting thread must flush its SATB buffer.
+clean A_threadlife_2t_3o_1s --track=A --threads=2 --objects=3 --stack=1 --threadlife
+for b in startnoscan exitnoflush; do
+    bug $b --track=A --threads=2 --objects=3 --stack=1 --threadlife
+done
+# Many short walks find these shallow interleavings; long walks dilute them.
+swarm_clean_short() { # name args...
+    name=$1; shift
+    if ./gc_model "$@" > "out_$name.log" 2>&1 && grep -q '^OK' "out_$name.log"; then
+        echo "PASS  random $name: $(grep '^OK' "out_$name.log" | cut -c1-110)"
+    else
+        echo "FAIL  random $name"; status=1
+    fi
+}
+swarm_clean_short A_threadlife_3t_4o --track=A --threads=3 --objects=4 --stack=2 --fields=2 --threadlife --free --rootrm --swarm=100000 --len=80
+
 # Racing writers (two-step stores). The barrier as written in RFC 4.4 (test the marking flag,
 # then store) is NOT safe if a cycle can start between the two: this must produce a violation.
 # Exchange-then-test is safe. The second case enumerates about 50M states (about 7 minutes).
