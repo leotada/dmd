@@ -886,6 +886,16 @@ Findings about symgc: it is stop-the-world with parallel mark threads and per-th
 
 **Still to measure before P3 starts:** fibers and `std.*`-heavy programs under symgc (needs a Phobos matching the repo druntime), symgc under the druntime and compiler test suites, a real LDC build for barrier cost, and an actual game-like workload from the project owner.
 
+**Next steps, in order (first actions of P1 to P3)**
+1. **Fork symgc and set up the project** (1 to 2 days). Put it in its own repository (it is Symmetry Investments' MIT code; this tree only holds a local copy at `symgc/`, uncommitted). Make it build against this repository's druntime in CI. Turn `frames`, `alloc` and `frag` from `plans/bench/core_bench/` into pass/fail gates so every later change is measured. Decide at the start whether to keep the fork mergeable with upstream; that is far cheaper than reconciling later.
+2. **Run symgc under the real test suites** (druntime tests, compiler tests, fiber-based code). Nothing has been measured there, and a failure is a blocker found cheaply. Fibers and Phobos-heavy code need a Phobos checkout that matches this repository's druntime. **Needs from the project owner:** that checkout, or approval to download it.
+3. **Fix allocation jitter and the decommit policy** (P2, 3 to 5 pw). Largest gain for games: symgc delays 1027 of 1200 ordinary frames by more than 1 ms at 2 GiB with no collection involved. Move `madvise`/`mmap` off the allocation path into a background thread with a retained pool; batch thread-cache refills; bound the work in every slow path. Also fixes `frag` (3.6× slower than the conservative collector, 174k `madvise` calls per 2M steps). Exit test: `frames`, fewer than 0.1% of frames above 1 ms.
+4. **One real LDC build to confirm the barrier cost** before the compiler work in P3. **Needs from the project owner:** approval to install the LLVM development package.
+5. **Concurrent marking** (P3, 15 to 25 pw): the SATB barrier in LDC and dmd with the restartable-sequence rule from the model, then the concurrent mark phase. Re-run `plans/model/run_all.sh` with the final sequence first.
+6. **In parallel, from the project owner:** a real game-shaped workload (or a description of one: live heap size, allocation per frame, thread count, whether audio and render threads allocate). The synthetic `frames` loop is a proxy; the 1 ms target should be tuned against something real.
+
+**Decisions recorded:** build on symgc, fork allowed; Immix rejected; Track B shelved; the metric is the worst frame, not p99.
+
 ### Phase 1 — `gc:immix` core: STW, parallel marking, TLABs `[Track A]`
 **Goal.** A complete and correct implementation of `core.gc.gcinterface.GC` on an Immix heap that passes every test suite. No compiler changes.
 **Depends on.** G0c.
