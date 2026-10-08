@@ -909,8 +909,9 @@ Work started after the owner's `/goal` command. Status per step; numbers are in 
 | 2b Finalizers | **Done** (patch 0007). No dead slot is released before every finalizer of the cycle ran. `plans/bench/core_bench/finalizer_order.d` fails on the code before (2,000 to 285,000 damaged partners per run) and passes after. Cost about 12% on `alloc` with 8 threads; a list of slabs with finalizers would avoid the walk. Finalizer resurrection is still not modelled. |
 | 2c Lazy sweep | Done as a background, paced, concurrent sweep with mutator assist (patch 0006). The model's slab rules hold in the code. Not done: a model of the new pacing and assist rules; running the model's sweep-time actions against the C code. |
 | 3 Decommit | Done as a retention policy: free pages are kept warm up to the collection target. |
-| 4 Dirty-page spike | Not started. |
-| 5 to 8 | Not started. |
+| 4 Dirty-page spike | **Done, positive** (`plans/spikes/dirty`). The kernel (Linux 6.7+, `userfaultfd` WP_ASYNC + `PAGEMAP_SCAN`) reports the pages written since the last look: arming 2 GiB 13 ms (0.2 ms with huge pages), scan 1 to 10 ms for up to 400,000 dirty pages, writers pay under 1 us once per page, kernel writes are tracked too. |
+| 5 Concurrent mark | **Done through the dirty-page route, opt-in** (`SYMGC_CONCURRENT_MARK=1`, patches 0008 and 0009), no compiler change. Worst frame at 2 GiB 31 to 3.5 ms (76 ms at the start of the day). Open: the start pause (1 to 3 ms at 2 GiB), mark-thread interference, other kernels (the fallback is the stop-the-world mark), and the SATB route for compilers that want a hard bound. |
+| 6 to 8 | Not started. SATB/LDC (step 6) is now the way to bound the remark pause instead of measuring it; it is no longer needed to get under 4 ms. |
 
 Result so far: the worst frame is now the stop-the-world mark. 512 MiB live: 28.9 to 11.6 ms. 2 GiB live: 76 to 34 ms. p99 and `alloc` improved, `frag` is 2.4x faster, and `frag`'s steady RSS is 47% higher (still at the conservative GC's level). The 1 ms target needs step 5.
 

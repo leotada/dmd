@@ -74,6 +74,60 @@ blocks.
 Also fixed in 0007: the sweep serials were 8 bits and `gcCycle + 1` wrapped to 0 at cycle 255, the value of a block
 that no sweep has seen. They are 16 bits now.
 
+### 0008 and 0009: a mostly-concurrent mark (step 4 and most of step 5)
+
+`SYMGC_CONCURRENT_MARK=1`, Linux 6.7 or later, default off for now. A GC thread runs the whole cycle and the thread that
+triggered it carries on. The program stops twice, briefly, and the rest runs beside it. The design is Boehm, Demers and
+Shenker's (PLDI 1991), with the kernel doing what a write barrier would: `plans/spikes/dirty` measures it.
+
+1. Arm the tracker (the kernel write-protects the pointer-holding heap, asynchronously: the first write to a page costs
+   under 1 us and no signal). The program runs.
+2. **Start pause** (0.2 to 3 ms at 2 GiB): prepare the mark bits, empty the bins, start an epoch, and list the roots,
+   stacks and thread local storage as work. Only the listing needs the stop: the ranges are read, and traced, after the
+   world restarts.
+3. Mark with the program running, on 2 to 6 cores (a quarter of the machine, `SYMGC_MARK_THREADS`). Then, in rounds,
+   scan again what the program wrote meanwhile (`PAGEMAP_SCAN` reports it and re-arms it in one call).
+4. **Remark pause** (0.1 to 0.6 ms at 2 GiB): scan the roots, stacks and thread locals again, and the pages written
+   since the last round. Everything reachable at this instant is marked: marks only get added, a pointer stored into an
+   already scanned object dirties its page, and the stacks are scanned last, while no pointer can move.
+5. The sweep, as in 0006.
+
+Rules it needs, each found by a failing test:
+
+- Extents and blocks created since the mark started are live, have no marks, and the mark skips them (their pages are
+  scanned like any other when written). The tag is a 32 bit epoch counter, not the 8 bit cycle of the mark bits: a
+  stale tag that matched would make the mark skip a live object, and free what hangs off it.
+- Large extents are not freed or resized in place while the mark runs (a marker may hold the `Extent`), and slabs belong
+  to the sweep until it visits them.
+- The scan of a dirty page lists the slots on it that are allocated and marked, or born. Adjacent slots are one work
+  item: one item per slot took 1.4 s for 28 MiB of dirty pages, under the lock of the work list.
+- Allocating threads wait when the heap passes the hard limit during the mark. Without it four threads allocating
+  garbage flat out made one remark pause scan 5.7 GiB and last 5.4 s; with it the worst is 13 ms.
+- The GC thread's own thread cache is flushed before the sweep (it is not scanned, so the sweep would free what it holds).
+- If the kernel stops tracking (a mapping it cannot register, an error), the remark marks everything again with the world
+  stopped: a new epoch so the born extents are ordinary ones, empty bins, new mark bits, a new cycle number. The first
+  version of this fallback leaked live objects; `mark_race.d` with `SYMGC_DIRTY_FAIL=1` found it.
+- `thread_scanAllType` in druntime tolerates a caller that is not a druntime thread (the GC thread). `libphobos2.a` embeds
+  its own copy of druntime, so Phobos has to be rebuilt after a druntime change or the old code is linked.
+
+Results (`gate.sh check` with `SYMGC_CONCURRENT_MARK=1`, against the stop-the-world mark of 0007):
+
+| | stop-the-world mark | concurrent mark |
+|---|---|---|
+| `frames` 512 MiB: worst frame | 10.7 ms | 1.8 ms |
+| `frames` 2 GiB: worst frame | 31.0 ms | 3.5 ms |
+| `frames` 2 GiB: p99 | 1.26 ms | 1.84 ms |
+| `alloc` 1 thread / 8 threads | 18.3 / 38.2 Mops/s | 16.9 / 34.2 Mops/s |
+| `frag` | 3.43 s | 3.57 s |
+
+The remaining frame time over 1 ms: the start pause (1 to 3 ms at 2 GiB, almost all of it preparing the mark bits, which
+can move out of the pause), and the mark threads competing with the program for memory bandwidth.
+
+Tests: `mark_race.d` (a graph whose pointers are moved through locals while collections run; checks every node) passes
+on 8 of 8 runs of 20 s with the verifier, 0 damaged in 1.1M to 7.6M moves per run, and reports 3,202 with the dirty
+rescan disabled (`SYMGC_DIRTY_SKIP=1`, verify builds only). The Phobos, fiber and `std.parallelism` stress passes 30 of
+30, `alloc` with 8 threads 30 of 30, `finalizer_order.d` 5 of 5.
+
 Build and test with the repo's dmd and druntime (symgc needs `ThreadBase.tlsGCData`; there is no Phobos):
 
 ```

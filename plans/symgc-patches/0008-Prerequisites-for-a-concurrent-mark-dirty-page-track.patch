@@ -1,0 +1,1010 @@
+From 917695a0120fc27a1243db538f98d491de8f96dc Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 17:36:22 -0300
+Subject: [PATCH 8/9] Prerequisites for a concurrent mark: dirty-page tracker,
+ scanner rounds, epochs
+
+- d.gc.dirty: which pages of the scannable heap were written since we last
+  looked, from the kernel (userfaultfd WP_ASYNC + PAGEMAP_SCAN, Linux 6.7+),
+  with a unit test. plans/spikes/dirty measures it. Not used yet.
+- Scanner.markRound and addDirtyRange: one round of marking run by a GC thread
+  that is not a mutator, and the expansion of a written page into the slots
+  that need rescanning (allocated and marked, or born after the mark started).
+- The mark skips extents born since it started. They have no marks and count as
+  live. The tag is now an epoch that never repeats, not the 8 bit cycle: a
+  stale tag that matched would make the mark skip a live object. Blocks born
+  during a collection are skipped by the sweep passes (bornEpoch).
+- scanWorldPausedData tolerates a caller that is not a druntime thread.
+---
+ source/core/thread/symthread.d |   8 +-
+ source/d/gc/block.d            |  26 ++-
+ source/d/gc/collector.d        |  13 +-
+ source/d/gc/dirty.d            | 405 +++++++++++++++++++++++++++++++++
+ source/d/gc/extent.d           |  31 ++-
+ source/d/gc/page.d             |  83 ++++---
+ source/d/gc/scanner.d          | 126 ++++++++++
+ 7 files changed, 629 insertions(+), 63 deletions(-)
+ create mode 100644 source/d/gc/dirty.d
+
+diff --git a/source/core/thread/symthread.d b/source/core/thread/symthread.d
+index 5894f58..6720858 100644
+--- a/source/core/thread/symthread.d
++++ b/source/core/thread/symthread.d
+@@ -149,12 +149,14 @@ bool suspendDruntimeThreads(bool alwaysSignal, ref uint suspended) {
+ }
+ 
+ void scanWorldPausedData(ScanDg scan) {
+-	// scan all data that is NOT part of our thread's current stack.
+-	auto myStackBottom = Thread.getThis().m_curr.bstack;
++	// scan all data that is NOT part of our thread's current stack. A GC
++	// thread that is not a druntime thread has none.
++	auto self = Thread.getThis();
++	auto myStackBottom = self is null ? null : self.m_curr.bstack;
+ 	void scanItem(ScanType type, void* pbot, void* ptop) nothrow {
+ 		import d.gc.range;
+ 		auto r = makeRange(pbot, ptop);
+-		if (type == ScanType.stack && myStackBottom >= r.ptr &&
++		if (type == ScanType.stack && myStackBottom !is null && myStackBottom >= r.ptr &&
+ 				myStackBottom <= r.ptr + r.length)
+ 			// my stack range, no need to scan right now, this will be scanned later
+ 			return;
+diff --git a/source/d/gc/block.d b/source/d/gc/block.d
+index f88f739..a57faa5 100644
+--- a/source/d/gc/block.d
++++ b/source/d/gc/block.d
+@@ -90,15 +90,25 @@ private:
+ 
+ 	AllBlockRingNode allrnode;
+ 
++	// These small fields are together on purpose: the descriptor has to fit
++	// in 192 bytes for 21 of them to fit a page.
++
+ 	/**
+-	 * The GC cycle whose sweep has visited this block, or in which the block
+-	 * was created. Zero for a block no sweep has seen.
++	 * Which pass of the sweep visited this block last. Zero for a block no
++	 * sweep has seen.
+ 	 */
+ 	ushort _sweepSerial;
++	ubyte generation;
++
++	/**
++	 * The epoch of the collection in which the block was created, or 0. A
++	 * block created while a collection runs has nothing for the sweep to do,
++	 * and may not be in the extent map yet.
++	 */
++	uint _bornEpoch;
+ 
+ 	uint usedCount;
+ 	uint dirtyCount;
+-	ubyte generation;
+ 
+ 	import d.gc.bitmap;
+ 	Bitmap!PagesInBlock allocatedPages;
+@@ -170,6 +180,16 @@ public:
+ 		return n is &this ? null : n;
+ 	}
+ 
++	@property
++	uint bornEpoch() const {
++		return _bornEpoch;
++	}
++
++	@property
++	void bornEpoch(uint e) {
++		_bornEpoch = e;
++	}
++
+ 	@property
+ 	ushort sweepSerial() const {
+ 		return _sweepSerial;
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 0d81846..a39a3d9 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -17,6 +17,9 @@ struct CollectionInfo {
+ 	size_t stop;
+ }
+ 
++// Only the thread that runs a cycle touches it, under the collector lock.
++__gshared uint gEpochCounter;
++
+ /**
+  * What the second half of a cycle (the sweep) needs from the first half.
+  */
+@@ -279,9 +282,15 @@ private:
+ 			}
+ 		}
+ 
+-		// Extents created from now on are born after the mark.
++		// Extents created from now on are born after the mark. Each collection
++		// has an epoch of its own, which never repeats and is never 0.
+ 		import d.gc.extent;
+-		gSweepCycle.store(gcCycle);
++		gEpochCounter++;
++		if (gEpochCounter == 0) {
++			gEpochCounter = 1;
++		}
++
++		gSweepCycle.store(gEpochCounter);
+ 
+ 		/**
+ 		 * The sweeper is paced unless the heap grows past 1/8 over the
+diff --git a/source/d/gc/dirty.d b/source/d/gc/dirty.d
+new file mode 100644
+index 0000000..4ea237d
+--- /dev/null
++++ b/source/d/gc/dirty.d
+@@ -0,0 +1,405 @@
++module d.gc.dirty;
++
++/**
++ * Which pages of the scannable heap were written since we last looked.
++ *
++ * A concurrent mark scans objects while the program changes them. A pointer
++ * stored into an object the marker already scanned is lost unless something
++ * tells the collector to look again. The compiler could say so (a write
++ * barrier), but that excludes every other compiler, C, and the kernel writing
++ * into a buffer. The kernel can say so instead, for any write: Linux 6.7 and
++ * later write-protect pages on request and report the written ones through
++ * `PAGEMAP_SCAN`, with `userfaultfd` in asynchronous mode so that the first
++ * write to a protected page is handled in the kernel, without a signal or a
++ * handler. plans/spikes/dirty measures it: arming 2 GiB takes 13 ms (0.2 ms
++ * with huge pages), scanning takes 1 to 10 ms for up to 400,000 dirty pages,
++ * and a writer pays under 1 us once per page.
++ *
++ * A mark that uses this must treat every page reported here as a root range
++ * (the "dirty rescan" of a mostly-concurrent collector), and rescan roots and
++ * stacks while the world is stopped. Where the kernel cannot do this,
++ * `dirtyAvailable` is false and the collector must stop the world for the whole
++ * mark.
++ *
++ * Only memory that holds pointers is registered: the data region is not
++ * scanned, so there is nothing to track.
++ */
++
++import d.sync.mutex;
++
++version(linux) version(X86_64) {
++	version = DirtyTracking;
++}
++
++alias DirtyRangeDg = void delegate(const(void)* start, size_t size);
++
++/**
++ * Is tracking available? Decided once, on the first call.
++ */
++bool dirtyAvailable() {
++	version(DirtyTracking) {
++		return gDirty.ensureInit();
++	} else {
++		return false;
++	}
++}
++
++/**
++ * Track the writes to a mapping that holds pointers. Called when the mapping
++ * is created, with the world running. If the mapping cannot be tracked,
++ * tracking is turned off for good: a mark that missed a range would be unsound.
++ */
++void dirtyRegister(void* start, size_t size) {
++	version(DirtyTracking) {
++		gDirty.register(start, size);
++	}
++}
++
++/**
++ * Mark every tracked page as unwritten. Pages that nobody armed yet are
++ * reported as written by the next `dirtyCollect`, which only makes the set
++ * larger, so arming is an optimization and never needed for correctness.
++ */
++void dirtyArm() {
++	version(DirtyTracking) {
++		gDirty.collect(null);
++	}
++}
++
++/**
++ * Call `dg` with every range written since the last `dirtyArm` or
++ * `dirtyCollect`, and mark those pages as unwritten again. Returns the number
++ * of pages reported.
++ */
++size_t dirtyCollect(scope DirtyRangeDg dg) {
++	version(DirtyTracking) {
++		return gDirty.collect(dg);
++	} else {
++		return 0;
++	}
++}
++
++version(DirtyTracking):
++
++private:
++
++// The numbers of <linux/userfaultfd.h> and <linux/fs.h>, x86-64.
++enum SYS_userfaultfd = 323;
++enum UFFD_USER_MODE_ONLY = 1;
++enum O_CLOEXEC = 0x80000;
++enum O_NONBLOCK = 0x800;
++enum UFFD_API = 0xAA;
++enum UFFD_FEATURE_WP_UNPOPULATED = 1UL << 13;
++enum UFFD_FEATURE_WP_ASYNC = 1UL << 15;
++enum UFFDIO_REGISTER_MODE_WP = 1UL << 1;
++enum UFFDIO_API = 0xc018aa3fUL;
++enum UFFDIO_REGISTER = 0xc020aa00UL;
++enum PAGEMAP_SCAN = 0xc0606610UL;
++enum PM_SCAN_WP_MATCHING = 1UL << 0;
++enum PM_SCAN_CHECK_WPASYNC = 1UL << 1;
++enum PAGE_IS_WRITTEN = 1UL << 1;
++
++struct uffdio_api {
++	ulong api;
++	ulong features;
++	ulong ioctls;
++}
++
++struct uffdio_range {
++	ulong start;
++	ulong len;
++}
++
++struct uffdio_register {
++	uffdio_range range;
++	ulong mode;
++	ulong ioctls;
++}
++
++struct page_region {
++	ulong start;
++	ulong end;
++	ulong categories;
++}
++
++struct pm_scan_arg {
++	ulong size;
++	ulong flags;
++	ulong start;
++	ulong end;
++	ulong walk_end;
++	ulong vec;
++	ulong vec_len;
++	ulong max_pages;
++	ulong category_inverted;
++	ulong category_mask;
++	ulong category_anyof_mask;
++	ulong return_mask;
++}
++
++static assert(uffdio_api.sizeof == 24 && uffdio_register.sizeof == 32);
++static assert(pm_scan_arg.sizeof == 96 && page_region.sizeof == 24);
++
++extern(C) nothrow @nogc {
++	long syscall(long number, ...);
++	int ioctl(int fd, ulong request, ...);
++	int open(const(char)* path, int flags, ...);
++}
++
++enum MaxRanges = 1024;
++enum PageSize = 4096;
++
++struct Range {
++	size_t start;
++	size_t size;
++}
++
++struct DirtyTracker {
++	Mutex mutex;
++
++	bool tried;
++	bool available;
++
++	int uffd = -1;
++	int pagemap = -1;
++
++	size_t count;
++	Range[MaxRanges] ranges;
++
++shared:
++	bool ensureInit() {
++		mutex.lock();
++		scope(exit) mutex.unlock();
++
++		return (cast(DirtyTracker*) &this).initImpl();
++	}
++
++	void register(void* start, size_t size) {
++		mutex.lock();
++		scope(exit) mutex.unlock();
++
++		(cast(DirtyTracker*) &this).registerImpl(start, size);
++	}
++
++	size_t collect(scope DirtyRangeDg dg) {
++		mutex.lock();
++		scope(exit) mutex.unlock();
++
++		return (cast(DirtyTracker*) &this).collectImpl(dg);
++	}
++}
++
++shared DirtyTracker gDirty;
++
++private:
++
++// Everything below runs with the tracker's mutex held.
++
++bool initImpl(ref DirtyTracker t) {
++	return t.initImpl();
++}
++
++bool initImpl(DirtyTracker* t) {
++	assert(t.mutex.isHeld(), "Mutex not held!");
++
++	if (t.tried) {
++		return t.available;
++	}
++
++	t.tried = true;
++
++	// The environment can turn it off: SYMGC_DIRTY=0.
++	import core.stdc.stdlib : getenv;
++	auto env = getenv("SYMGC_DIRTY");
++	if (env !is null && env[0] == '0') {
++		return false;
++	}
++
++	auto uffd = cast(int) syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
++	if (uffd < 0) {
++		return false;
++	}
++
++	uffdio_api api;
++	api.api = UFFD_API;
++	api.features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED;
++	if (ioctl(uffd, UFFDIO_API, &api) < 0) {
++		closeFd(uffd);
++		return false;
++	}
++
++	auto pagemap = open("/proc/self/pagemap", 0 /* O_RDONLY */);
++	if (pagemap < 0) {
++		closeFd(uffd);
++		return false;
++	}
++
++	// Probe PAGEMAP_SCAN itself on a page of our own.
++	{
++		import core.sys.posix.sys.mman;
++		auto p = mmap(null, PageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++		if (p is MAP_FAILED) {
++			closeFd(uffd);
++			closeFd(pagemap);
++			return false;
++		}
++
++		scope(exit) munmap(p, PageSize);
++
++		*cast(ubyte*) p = 1;
++
++		uffdio_register reg;
++		reg.range.start = cast(size_t) p;
++		reg.range.len = PageSize;
++		reg.mode = UFFDIO_REGISTER_MODE_WP;
++		bool ok = ioctl(uffd, UFFDIO_REGISTER, &reg) == 0;
++
++		page_region[1] vec;
++		pm_scan_arg arg;
++		arg.size = pm_scan_arg.sizeof;
++		arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
++		arg.start = cast(size_t) p;
++		arg.end = cast(size_t) p + PageSize;
++		arg.vec = cast(size_t) vec.ptr;
++		arg.vec_len = 1;
++		arg.category_mask = PAGE_IS_WRITTEN;
++		arg.return_mask = PAGE_IS_WRITTEN;
++		ok = ok && ioctl(pagemap, PAGEMAP_SCAN, &arg) >= 0;
++
++		if (!ok) {
++			closeFd(uffd);
++			closeFd(pagemap);
++			return false;
++		}
++	}
++
++	t.uffd = uffd;
++	t.pagemap = pagemap;
++	t.available = true;
++	return true;
++}
++
++void closeFd(int fd) {
++	import core.sys.posix.unistd : close;
++	close(fd);
++}
++
++void registerImpl(DirtyTracker* t, void* start, size_t size) {
++	assert(t.mutex.isHeld(), "Mutex not held!");
++
++	if (!t.initImpl()) {
++		return;
++	}
++
++	uffdio_register reg;
++	reg.range.start = cast(size_t) start;
++	reg.range.len = size;
++	reg.mode = UFFDIO_REGISTER_MODE_WP;
++
++	if (t.count == MaxRanges || ioctl(t.uffd, UFFDIO_REGISTER, &reg) < 0) {
++		// A mark that does not see a range is unsound: no tracking at all.
++		t.available = false;
++		return;
++	}
++
++	t.ranges[t.count++] = Range(cast(size_t) start, size);
++}
++
++size_t collectImpl(DirtyTracker* t, scope DirtyRangeDg dg) {
++	assert(t.mutex.isHeld(), "Mutex not held!");
++
++	if (!t.available) {
++		return 0;
++	}
++
++	enum Cap = 2048;
++	page_region[Cap] vec;
++	size_t pages = 0;
++
++	foreach (r; t.ranges[0 .. t.count]) {
++		auto cursor = r.start;
++		auto end = r.start + r.size;
++
++		while (cursor < end) {
++			pm_scan_arg arg;
++			arg.size = pm_scan_arg.sizeof;
++			arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
++			arg.start = cursor;
++			arg.end = end;
++			arg.vec = cast(size_t) vec.ptr;
++			arg.vec_len = Cap;
++			arg.category_mask = PAGE_IS_WRITTEN;
++			arg.return_mask = PAGE_IS_WRITTEN;
++
++			auto n = ioctl(t.pagemap, PAGEMAP_SCAN, &arg);
++			if (n < 0) {
++				// The mapping went away under us, or the kernel refuses.
++				// Neither can be told from a missed write: turn tracking off.
++				t.available = false;
++				return pages;
++			}
++
++			foreach (ref pr; vec[0 .. n]) {
++				pages += (pr.end - pr.start) / PageSize;
++				if (dg !is null) {
++					dg(cast(const(void)*) pr.start, pr.end - pr.start);
++				}
++			}
++
++			// The scan stops early when the vector is full, and `walk_end`
++			// is where to go on. Pages it reported were re-armed, so a
++			// repeated look cannot report them twice.
++			if (arg.walk_end <= cursor) {
++				break;
++			}
++
++			cursor = arg.walk_end;
++		}
++	}
++
++	return pages;
++}
++
++@"dirty tracking" unittest {
++	import core.sys.posix.sys.mman;
++
++	if (!dirtyAvailable()) {
++		// An old kernel, or a restricted container: nothing to test here.
++		return;
++	}
++
++	enum Size = 8 * 1024 * 1024;
++	auto p = cast(ubyte*) mmap(null, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++	assert(p !is cast(ubyte*) MAP_FAILED);
++	scope(exit) munmap(p, Size);
++
++	foreach (i; 0 .. Size / PageSize) {
++		p[i * PageSize] = 1;
++	}
++
++	dirtyRegister(p, Size);
++	assert(dirtyAvailable());
++
++	// Not armed yet: everything populated is reported. Arm, and nothing is.
++	dirtyArm();
++	assert(dirtyCollect(null) == 0);
++
++	p[3 * PageSize] = 2;
++	p[1000 * PageSize + 17] = 2;
++	p[1001 * PageSize] = 2;
++
++	size_t[3] starts;
++	size_t seen;
++	auto pages = dirtyCollect((const(void)* s, size_t size) {
++		assert(seen < starts.length);
++		starts[seen++] = (cast(size_t) s - cast(size_t) p) / PageSize;
++		assert(size % PageSize == 0);
++	});
++
++	// Pages 1000 and 1001 are adjacent: one range.
++	assert(pages == 3);
++	assert(seen == 2 && starts[0] == 3 && starts[1] == 1000);
++
++	// Reported, so re-armed: not reported twice.
++	assert(dirtyCollect(null) == 0);
++}
+diff --git a/source/d/gc/extent.d b/source/d/gc/extent.d
+index 198a020..047c4fb 100644
+--- a/source/d/gc/extent.d
++++ b/source/d/gc/extent.d
+@@ -95,10 +95,11 @@ struct ExtentClass {
+ }
+ 
+ /**
+- * The GC cycle whose sweep is running, or 0 when no sweep is running.
++ * The epoch of the collection that is running (from the start of its mark to
++ * the end of its sweep), or 0 when none is. Each collection gets a new one.
+  * Set while the world is stopped, cleared when every arena is swept.
+  */
+-shared Atomic!ubyte gSweepCycle;
++shared Atomic!uint gSweepCycle;
+ 
+ /**
+  * Set once anything with a finalizer was allocated. While it is clear, the
+@@ -161,10 +162,18 @@ private:
+ 	GCMetadata _gcMetadata;
+ 
+ 	/**
+-	 * The GC cycle whose sweep has dealt with this extent, or during which the
+-	 * extent was created. While a sweep is running (`gSweepCycle` is not 0)
+-	 * an extent with another tag has not been swept yet: nothing may be
+-	 * allocated from it, and a free into it only clears the slot.
++	 * Low 32 bits: the epoch of the collection that has dealt with this extent
++	 * or in which the extent was created (see `gSweepCycle`). While a
++	 * collection is running, an extent with another tag has not been swept
++	 * yet: nothing may be allocated from it, a free into it only clears the
++	 * slot, and it has marks. An extent with the tag of the epoch was created
++	 * since the mark started, has no marks, and counts as live.
++	 *
++	 * The epoch is a counter that never repeats, not the 8 bit cycle of the
++	 * mark bits: a stale tag that matched would make the mark skip a live
++	 * object and free what is only reachable through it.
++	 *
++	 * Bit 40: a slot of this slab ever had a finalizer.
+ 	 */
+ 	size_t _sweepTag;
+ 
+@@ -254,8 +263,8 @@ private:
+ 
+ public:
+ 	@property
+-	ubyte sweepTag() const {
+-		return cast(ubyte) _sweepTag;
++	uint sweepTag() const {
++		return cast(uint) _sweepTag;
+ 	}
+ 
+ 	/**
+@@ -264,8 +273,8 @@ public:
+ 	 * not visited yet, which nothing allocates from.
+ 	 */
+ 	@property
+-	void sweepTag(ubyte tag) {
+-		_sweepTag = (_sweepTag & ~size_t(0xff)) | tag;
++	void sweepTag(uint tag) {
++		_sweepTag = (_sweepTag & ~size_t(uint.max)) | tag;
+ 	}
+ 
+ 	/**
+@@ -288,7 +297,7 @@ public:
+ 		}
+ 	}
+ 
+-	private enum HasFinalizersBit = size_t(1) << 8;
++	private enum HasFinalizersBit = size_t(1) << 40;
+ 
+ 	/**
+ 	 * True while a sweep is running and has not visited this extent yet.
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index b6d88da..c391943 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -130,8 +130,9 @@ private:
+ 	BlockDescriptor* sweepCurrent;
+ 	uint sweepPage;
+ 
+-	// The cycle being swept, and what the sweep found so far.
++	// The cycle being swept, its epoch, and what the sweep found so far.
+ 	ubyte sweepGcCycle;
++	uint sweepEpoch;
+ 	CollectStats sweepStats;
+ 
+ 	// A step is running. See `sweepStep`.
+@@ -665,8 +666,10 @@ private:
+ 		sparseBlocks.remove(block);
+ 
+ 		auto sweepSerial = block.sweepSerial;
++		auto bornEpoch = block.bornEpoch;
+ 		block.at(address + extraBlocks * BlockSize, false);
+ 		block.sweepSerial = sweepSerial;
++		block.bornEpoch = bornEpoch;
+ 		sparseBlocks.insert(block);
+ 
+ 		bool dirty;
+@@ -855,9 +858,9 @@ private:
+ 
+ 		block.at(address, Dense);
+ 
+-		// Created while a sweep runs: there is nothing in it to sweep, and
+-		// it may not be in the extent map yet.
+-		block.sweepSerial = gSweepCycle.load();
++		// Created while a collection runs: there is nothing in it to sweep,
++		// and it may not be in the extent map yet.
++		block.bornEpoch = gSweepCycle.load();
+ 
+ 		getAllBlocks(Dense).insert(block);
+ 		return block;
+@@ -1097,6 +1100,8 @@ private:
+ 		assert(sweepPhase == SweepPhase.Idle, "A sweep is already running!");
+ 
+ 		sweepGcCycle = gcCycle;
++		sweepEpoch = gSweepCycle.load();
++		assert(sweepEpoch != 0, "No collection is running!");
+ 		sweepStats = CollectStats();
+ 
+ 		// The heap grows back to the collection target before the next
+@@ -1111,12 +1116,12 @@ private:
+ 		import d.gc.extent : gAnyFinalizers;
+ 		if (gAnyFinalizers.load() == 0) {
+ 			sweepPhase = SweepPhase.DenseScan;
+-			sweepNext = firstUnvisited(denseBlocks, gcCycle);
++			sweepNext = denseBlocks.first;
+ 			return;
+ 		}
+ 
+ 		sweepPhase = SweepPhase.DenseFinalize;
+-		sweepNext = firstUnvisited(denseBlocks, finalizeSerialOf(gcCycle));
++		sweepNext = denseBlocks.first;
+ 	}
+ 
+ 	/**
+@@ -1141,40 +1146,29 @@ private:
+ 	 * head, so a pass walks forward from the block that was first when it
+ 	 * started and ends when it meets a block it already visited.
+ 	 *
+-	 * It starts at the first block that it has not visited: the first block that it has not visited. Blocks
+-	 * created since the pass before are at the head of the ring, and are
+-	 * tagged as visited, so they must be skipped, or the pass would end
+-	 * before it started.
++	 * Blocks created since the collection started are skipped, and marked as
++	 * visited so that the walk still ends where it began: they have nothing to
++	 * sweep, and may not be in the extent map yet.
+ 	 */
+-	BlockDescriptor* firstUnvisited(ref AllBlockRing ring, ushort serial) {
+-		auto start = ring.first;
+-		auto b = start;
+-		while (b !is null) {
+-			if (b.sweepSerial != serial) {
+-				return b;
+-			}
++	BlockDescriptor* nextSweepBlock(ushort serial) {
++		assert(mutex.isHeld(), "Mutex not held!");
+ 
+-			b = b.allNext;
+-			if (b is start) {
+-				break;
++		while (true) {
++			auto b = sweepNext;
++			if (b is null || b.sweepSerial == serial) {
++				sweepNext = null;
++				return null;
+ 			}
+-		}
+ 
+-		return null;
+-	}
++			b.sweepSerial = serial;
++			sweepNext = b.allNext;
+ 
+-	BlockDescriptor* nextSweepBlock(ushort serial) {
+-		assert(mutex.isHeld(), "Mutex not held!");
++			if (b.bornEpoch == sweepEpoch) {
++				continue;
++			}
+ 
+-		auto b = sweepNext;
+-		if (b is null || b.sweepSerial == serial) {
+-			sweepNext = null;
+-			return null;
++			return b;
+ 		}
+-
+-		b.sweepSerial = serial;
+-		sweepNext = b.allNext;
+-		return b;
+ 	}
+ 
+ 	/**
+@@ -1217,7 +1211,7 @@ private:
+ 
+ 					if (sweepCurrent is null) {
+ 						sweepPhase = SparseFinalize;
+-						sweepNext = firstUnvisited(sparseBlocks, finalizeSerial);
++						sweepNext = sparseBlocks.first;
+ 						continue;
+ 					}
+ 
+@@ -1235,7 +1229,7 @@ private:
+ 
+ 					if (sweepCurrent is null) {
+ 						sweepPhase = DenseScan;
+-						sweepNext = firstUnvisited(denseBlocks, gcCycle);
++						sweepNext = denseBlocks.first;
+ 						continue;
+ 					}
+ 
+@@ -1257,7 +1251,7 @@ private:
+ 						gSweepT[2] += getMonotonicTime() - tO0;
+ 
+ 						sweepPhase = DenseMinimize;
+-						sweepNext = firstUnvisited(denseBlocks, minimizeSerial);
++						sweepNext = denseBlocks.first;
+ 						continue;
+ 					}
+ 
+@@ -1272,7 +1266,7 @@ private:
+ 					auto b = nextSweepBlock(minimizeSerial);
+ 					if (b is null) {
+ 						sweepPhase = SparseScan;
+-						sweepNext = firstUnvisited(sparseBlocks, gcCycle);
++						sweepNext = sparseBlocks.first;
+ 						continue;
+ 					}
+ 
+@@ -1289,7 +1283,7 @@ private:
+ 
+ 					if (sweepCurrent is null) {
+ 						sweepPhase = SparseMinimize;
+-						sweepNext = firstUnvisited(sparseBlocks, minimizeSerial);
++						sweepNext = sparseBlocks.first;
+ 						continue;
+ 					}
+ 
+@@ -1311,7 +1305,8 @@ private:
+ 							foreach (ring; [&denseBlocks, &sparseBlocks]) {
+ 								for (auto r = ring.range; !r.empty; r.popFront()) {
+ 									auto s = r.front.sweepSerial;
+-									assert(s == gcCycle || s == minimizeSerial,
++									assert(s == gcCycle || s == minimizeSerial
++										       || r.front.bornEpoch == sweepEpoch,
+ 									       "A block was not swept!");
+ 								}
+ 							}
+@@ -1476,7 +1471,7 @@ private:
+ 
+ 		stats.bytesCollected += count * slotSize;
+ 		e.bits += count * Extent.FreeSlotsUnit;
+-		e.sweepTag = gcCycle;
++		e.sweepTag = sweepEpoch;
+ 
+ 		// The slab is empty.
+ 		if (occupancy == 0) {
+@@ -1533,7 +1528,7 @@ private:
+ 			i += e.npages;
+ 
+ 			// Created after the mark, or no slot ever had a finalizer.
+-			if (e.sweepTag == gcCycle || !ec.supportsMetadata || !e.hasFinalizers) {
++			if (e.sweepTag == sweepEpoch || !ec.supportsMetadata || !e.hasFinalizers) {
+ 				continue;
+ 			}
+ 
+@@ -1584,7 +1579,7 @@ private:
+ 
+ 			scope(success) i += npages;
+ 
+-			if (e.sweepTag == gcCycle) {
++			if (e.sweepTag == sweepEpoch) {
+ 				continue;
+ 			}
+ 
+@@ -1676,7 +1671,7 @@ private:
+ 				// Created after the mark: nothing to sweep. It is not counted
+ 				// in the stats either: they estimate what survived, which
+ 				// sets the next collection target.
+-				if (e.sweepTag == gcCycle) {
++				if (e.sweepTag == sweepEpoch) {
+ 					continue;
+ 				}
+ 
+@@ -1743,7 +1738,7 @@ private:
+ 				auto ec = pd.extentClass;
+ 
+ 				// Created after the mark: nothing to sweep, nor to count.
+-				if (e.sweepTag == gcCycle) {
++				if (e.sweepTag == sweepEpoch) {
+ 					continue;
+ 				}
+ 
+diff --git a/source/d/gc/scanner.d b/source/d/gc/scanner.d
+index 9896ffe..94cd53d 100644
+--- a/source/d/gc/scanner.d
++++ b/source/d/gc/scanner.d
+@@ -428,6 +428,107 @@ public:
+ 		work.cleanup();
+ 	}
+ 
++	/**
++	 * One round of a concurrent mark, run by the GC thread while the program
++	 * runs: `seed` puts the roots of the round on the work list, and the
++	 * scanning threads and this one drain it. The caller is not a mutator and
++	 * has no stack to scan.
++	 */
++	void markRound(ubyte gcCycle, AddressRange managedSpace,
++	               scope void delegate(shared(Scanner)*) seed) shared {
++		this._managedAddressSpace = managedSpace;
++		this._gcCycle = gcCycle;
++
++		work.startGCScan();
++		seed(&this);
++		runMarkFromGCThread();
++		work.cleanup();
++	}
++
++	/**
++	 * The pages of a range of the scannable heap that the program wrote since
++	 * we last looked. We scan what a write can have changed: the part of each
++	 * slot on the page, if the slot is allocated and the mark found it live (or
++	 * it was born after the mark started, which has no mark and may point to
++	 * anything). Everything else is garbage, or not a pointer holder, and
++	 * scanning it only keeps its referents alive for one more cycle.
++	 */
++	void addDirtyRange(const(void)* start, size_t size) shared {
++		import d.gc.tcache;
++		auto emap = threadCache.emap;
++		auto cycle = _gcCycle;
++
++		import d.gc.extent : gSweepCycle;
++		auto epoch = gSweepCycle.load();
++
++		size_t end = cast(size_t) start + size;
++		for (size_t p = cast(size_t) start & ~(PageSize - 1); p < end; p += PageSize) {
++			auto pd = emap.lookup(cast(void*) p);
++			auto e = pd.extent;
++			if (e is null || !pd.containsPointers) {
++				continue;
++			}
++
++			auto born = e.sweepTag == epoch;
++			auto ec = pd.extentClass;
++
++			if (ec.isLarge()) {
++				if (!born && !e.isMarkedLarge(cycle)) {
++					continue;
++				}
++
++				size_t eaddr = cast(size_t) e.address;
++				auto lo = max(p, eaddr);
++				auto hi = min(p + PageSize, eaddr + e.size);
++				if (lo < hi) {
++					addToWorkList(makeRange(cast(void*) lo, cast(void*) hi));
++				}
++
++				continue;
++			}
++
++			// A slab, dense or sparse: find the slots that overlap the page.
++			auto bi = binInfos[ec.sizeClass];
++			size_t slabBase = p - pd.index * PageSize;
++			size_t slotSize = bi.slotSize;
++
++			auto first = (p - slabBase) / slotSize;
++			auto last = min((p + PageSize - 1 - slabBase) / slotSize, bi.nslots - 1);
++
++			ulong sparseMarks = 0;
++			const(ulong)* denseMarks = null;
++			if (!born) {
++				if (ec.dense) {
++					denseMarks = e.getMarksDense();
++				} else {
++					sparseMarks = e.getMarksSparse(cycle);
++				}
++			}
++
++			foreach (index; first .. last + 1) {
++				if (!e.slabData.valueAt(cast(uint) index)) {
++					continue;
++				}
++
++				if (!born) {
++					auto marked = ec.dense
++						? ((denseMarks[index / 64] >> (index % 64)) & 1) != 0
++						: ((sparseMarks >> index) & 1) != 0;
++					if (!marked) {
++						continue;
++					}
++				}
++
++				size_t slot = slabBase + index * slotSize;
++				auto lo = max(p, slot);
++				auto hi = min(p + PageSize, slot + slotSize);
++				if (lo < hi) {
++					addToWorkList(makeRange(cast(void*) lo, cast(void*) hi));
++				}
++			}
++		}
++	}
++
+ 	void addToWorkList(WorkItem item) shared {
+ 		work.addToWorkList((&item)[0 .. 1]);
+ 	}
+@@ -466,6 +567,14 @@ private:
+ 		runMarkImpl!false();
+ 	}
+ 
++	/**
++	 * The GC thread that runs a concurrent cycle works like the main thread,
++	 * but its own stack and TLS are not the program's: it has none to scan.
++	 */
++	void runMarkFromGCThread() shared {
++		runMarkImpl!false();
++	}
++
+ 	void runMarkImpl(bool mainThread)() shared {
+ 		/**
+ 		 * Scan the stack and TLS.
+@@ -543,6 +652,9 @@ private:
+ 	AddressRange managedAddressSpace;
+ 	ubyte gcCycle;
+ 
++	// The epoch of the collection, see `Extent._sweepTag`.
++	uint epoch;
++
+ 	LastDenseSlabCache ldsCache;
+ 
+ public:
+@@ -557,6 +669,9 @@ public:
+ 		// set up the scan parameters for this batch of scanning.
+ 		this.managedAddressSpace = scanner.managedAddressSpace;
+ 		this.gcCycle = scanner.gcCycle;
++
++		import d.gc.extent : gSweepCycle;
++		this.epoch = gSweepCycle.load();
+ 	}
+ 
+ 	void scan(const(void*)[] range) {
+@@ -613,6 +728,12 @@ public:
+ 					assert(pd.extent !is null);
+ 					assert(pd.extent.contains(ptr));
+ 
++					// Created since the mark started (a concurrent mark):
++					// it has no marks, and counts as live.
++					if (pd.extent.sweepTag == epoch) {
++						continue;
++					}
++
+ 					if (!markDense(pd, index)) {
+ 						continue;
+ 					}
+@@ -649,6 +770,11 @@ public:
+ 					continue;
+ 				}
+ 
++				// Created since the mark started: live, nothing to mark.
++				if (e.sweepTag == epoch) {
++					continue;
++				}
++
+ 				auto ec = pd.extentClass;
+ 				if (ec.dense) {
+ 					assert(e !is cache.pageDescriptor.extent);
+-- 
+2.51.0
+
