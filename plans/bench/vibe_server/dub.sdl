@@ -1,0 +1,10 @@
+name "gcbench_vibe"
+description "HTTP server and load generator for GC baselines (RFC Phase 0.1)"
+dependency "vibe-d" version="~>0.10.3"
+# /usr/lib64/libssl.so is LibreSSL here; the bindings need the OpenSSL 3 symbols.
+subConfiguration "vibe-stream:tls" "openssl-3.0"
+lflags "-l:libssl.so.3" "-l:libcrypto.so.3"
+targetType "executable"
+targetName "gcbench_vibe"
+sourcePaths "source"
+mainSourceFile "source/server.d"

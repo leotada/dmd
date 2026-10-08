@@ -1,0 +1,108 @@
+case=alloc-1t gc=conservative rep=1 workload=alloc seconds=0.4177 mops=20.347 rss_kib=4164 peak_kib=4164 gcs=552 gc_ms=31.7 maxpause_ms=0.48 
+case=alloc-1t gc=conservative rep=2 workload=alloc seconds=0.4215 mops=20.167 rss_kib=4256 peak_kib=4320 gcs=552 gc_ms=34.4 maxpause_ms=2.35 
+case=alloc-1t gc=conservative rep=3 workload=alloc seconds=0.4170 mops=20.386 rss_kib=4296 peak_kib=4296 gcs=552 gc_ms=30.8 maxpause_ms=0.47 
+case=alloc-1t gc=parallel rep=1 workload=alloc seconds=0.4069 mops=20.889 rss_kib=4120 peak_kib=4120 gcs=552 gc_ms=21.8 maxpause_ms=0.26 
+case=alloc-1t gc=parallel rep=2 workload=alloc seconds=0.4109 mops=20.688 rss_kib=4224 peak_kib=4224 gcs=552 gc_ms=23.2 maxpause_ms=0.41 
+case=alloc-1t gc=parallel rep=3 workload=alloc seconds=0.4124 mops=20.612 rss_kib=4048 peak_kib=4048 gcs=552 gc_ms=24.2 maxpause_ms=0.36 
+case=alloc-1t gc=fork rep=1 workload=alloc seconds=0.4593 mops=18.505 rss_kib=156408 peak_kib=156408 gcs=8 gc_ms=6.8 maxpause_ms=0.53 
+case=alloc-1t gc=fork rep=2 workload=alloc seconds=0.4364 mops=19.479 rss_kib=156436 peak_kib=156436 gcs=8 gc_ms=6.7 maxpause_ms=0.56 
+case=alloc-1t gc=fork rep=3 workload=alloc seconds=0.4558 mops=18.648 rss_kib=156196 peak_kib=156196 gcs=8 gc_ms=6.9 maxpause_ms=0.57 
+case=alloc-1t gc=symgc rep=1 workload=alloc seconds=0.5587 mops=15.213 rss_kib=33236 peak_kib=73680 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=alloc-1t gc=symgc rep=2 workload=alloc seconds=0.5390 mops=15.770 rss_kib=33344 peak_kib=73592 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=alloc-1t gc=symgc rep=3 workload=alloc seconds=0.5370 mops=15.828 rss_kib=33144 peak_kib=73604 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=alloc-4t gc=conservative rep=1 workload=alloc seconds=1.8737 mops=9.073 rss_kib=4364 peak_kib=4364 gcs=1120 gc_ms=96.1 maxpause_ms=0.86 
+case=alloc-4t gc=conservative rep=2 workload=alloc seconds=2.0218 mops=8.408 rss_kib=4256 peak_kib=4256 gcs=1119 gc_ms=93.2 maxpause_ms=0.90 
+case=alloc-4t gc=conservative rep=3 workload=alloc seconds=2.1017 mops=8.089 rss_kib=4220 peak_kib=4284 gcs=1120 gc_ms=93.8 maxpause_ms=0.94 
+case=alloc-4t gc=parallel rep=1 workload=alloc seconds=1.6245 mops=10.465 rss_kib=4284 peak_kib=4284 gcs=1119 gc_ms=92.5 maxpause_ms=1.05 
+case=alloc-4t gc=parallel rep=2 workload=alloc seconds=1.6804 mops=10.117 rss_kib=4212 peak_kib=4276 gcs=1119 gc_ms=93.5 maxpause_ms=0.32 
+case=alloc-4t gc=parallel rep=3 workload=alloc seconds=1.8918 mops=8.986 rss_kib=4264 peak_kib=4264 gcs=1120 gc_ms=101.0 maxpause_ms=1.63 
+case=alloc-4t gc=fork rep=1 workload=alloc seconds=1.5589 mops=10.905 rss_kib=264132 peak_kib=264132 gcs=11 gc_ms=15.0 maxpause_ms=0.94 
+case=alloc-4t gc=fork rep=2 workload=alloc seconds=1.5707 mops=10.823 rss_kib=264320 peak_kib=264320 gcs=11 gc_ms=15.1 maxpause_ms=0.91 
+case=alloc-4t gc=fork rep=3 workload=alloc seconds=1.5415 mops=11.028 rss_kib=264320 peak_kib=264320 gcs=11 gc_ms=15.3 maxpause_ms=1.10 
+case=alloc-4t gc=symgc rep=1 workload=alloc seconds=0.4697 mops=36.192 rss_kib=31976 peak_kib=75748 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=alloc-4t gc=symgc rep=2 workload=alloc seconds=0.4760 mops=35.713 rss_kib=29180 peak_kib=77896 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=alloc-4t gc=symgc rep=3 workload=alloc seconds=0.4854 mops=35.024 rss_kib=26120 peak_kib=74116 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=alloc-8t gc=conservative rep=1 workload=alloc seconds=8.2296 mops=4.131 rss_kib=4340 peak_kib=4340 gcs=2281 gc_ms=439.2 maxpause_ms=1.18 
+case=alloc-8t gc=conservative rep=2 workload=alloc seconds=8.1664 mops=4.163 rss_kib=4376 peak_kib=4376 gcs=2280 gc_ms=440.5 maxpause_ms=2.41 
+case=alloc-8t gc=conservative rep=3 workload=alloc seconds=8.3601 mops=4.067 rss_kib=4380 peak_kib=4380 gcs=2280 gc_ms=429.7 maxpause_ms=0.89 
+case=alloc-8t gc=parallel rep=1 workload=alloc seconds=8.1696 mops=4.162 rss_kib=4072 peak_kib=4072 gcs=2279 gc_ms=413.0 maxpause_ms=3.29 
+case=alloc-8t gc=parallel rep=2 workload=alloc seconds=8.3016 mops=4.096 rss_kib=4288 peak_kib=4288 gcs=2280 gc_ms=435.3 maxpause_ms=2.04 
+case=alloc-8t gc=parallel rep=3 workload=alloc seconds=8.0226 mops=4.238 rss_kib=4124 peak_kib=4124 gcs=2280 gc_ms=409.2 maxpause_ms=2.13 
+case=alloc-8t gc=fork rep=1 workload=alloc seconds=7.2930 mops=4.662 rss_kib=400772 peak_kib=400772 gcs=14 gc_ms=28.2 maxpause_ms=1.41 
+case=alloc-8t gc=fork rep=2 workload=alloc seconds=7.3977 mops=4.596 rss_kib=400732 peak_kib=400796 gcs=14 gc_ms=27.3 maxpause_ms=1.23 
+case=alloc-8t gc=fork rep=3 workload=alloc seconds=7.2984 mops=4.659 rss_kib=400756 peak_kib=400756 gcs=14 gc_ms=28.0 maxpause_ms=1.32 
+case=alloc-8t gc=symgc rep=1 workload=alloc seconds=0.7470 mops=45.518 rss_kib=43032 peak_kib=78152 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=alloc-8t gc=symgc rep=2 workload=alloc seconds=0.7453 mops=45.618 rss_kib=41888 peak_kib=79888 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=alloc-8t gc=symgc rep=3 workload=alloc seconds=0.8886 mops=38.261 rss_kib=25908 peak_kib=73896 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=frag gc=conservative rep=1 workload=frag seconds=11.7149 mops=1.280 rss_kib=1002456 peak_kib=1002456 gcs=137 gc_ms=514.2 maxpause_ms=4.16 steady_rss_kib=1002454
+case=frag gc=conservative rep=2 workload=frag seconds=11.8906 mops=1.261 rss_kib=1002560 peak_kib=1002560 gcs=137 gc_ms=518.7 maxpause_ms=4.17 steady_rss_kib=1002558
+case=frag gc=conservative rep=3 workload=frag seconds=11.2638 mops=1.332 rss_kib=1002404 peak_kib=1002404 gcs=137 gc_ms=503.5 maxpause_ms=3.51 steady_rss_kib=1002401
+case=frag gc=parallel rep=1 workload=frag seconds=11.1704 mops=1.343 rss_kib=1002396 peak_kib=1002396 gcs=137 gc_ms=513.8 maxpause_ms=3.77 steady_rss_kib=1002394
+case=frag gc=parallel rep=2 workload=frag seconds=11.2606 mops=1.332 rss_kib=1002348 peak_kib=1002348 gcs=137 gc_ms=523.8 maxpause_ms=3.67 steady_rss_kib=1002283
+case=frag gc=parallel rep=3 workload=frag seconds=11.2673 mops=1.331 rss_kib=1002392 peak_kib=1002392 gcs=137 gc_ms=530.6 maxpause_ms=3.65 steady_rss_kib=1002390
+case=frag gc=fork rep=1 workload=frag seconds=19.4501 mops=0.771 rss_kib=4816780 peak_kib=4816780 gcs=38 gc_ms=929.8 maxpause_ms=54.17 steady_rss_kib=4072220
+case=frag gc=fork rep=2 workload=frag seconds=19.3648 mops=0.775 rss_kib=4877528 peak_kib=4877528 gcs=38 gc_ms=1026.6 maxpause_ms=55.09 steady_rss_kib=4063071
+case=frag gc=fork rep=3 workload=frag seconds=19.4184 mops=0.772 rss_kib=4423432 peak_kib=4750244 gcs=39 gc_ms=1130.0 maxpause_ms=59.14 steady_rss_kib=3979892
+case=frag gc=symgc rep=1 workload=frag seconds=42.1763 mops=0.356 rss_kib=520068 peak_kib=802716 gcs=0 gc_ms=0.0 maxpause_ms=0.00 steady_rss_kib=651494
+case=frag gc=symgc rep=2 workload=frag seconds=42.7347 mops=0.351 rss_kib=545740 peak_kib=802024 gcs=0 gc_ms=0.0 maxpause_ms=0.00 steady_rss_kib=649445
+case=frag gc=symgc rep=3 workload=frag seconds=42.4676 mops=0.353 rss_kib=538048 peak_kib=802164 gcs=0 gc_ms=0.0 maxpause_ms=0.00 steady_rss_kib=649537
+case=fragsmall gc=conservative rep=1 workload=frag seconds=8.3692 mops=3.585 rss_kib=1035336 peak_kib=1035336 gcs=29 gc_ms=623.9 maxpause_ms=28.68 steady_rss_kib=1035336
+case=fragsmall gc=conservative rep=2 workload=frag seconds=8.4757 mops=3.540 rss_kib=1035584 peak_kib=1035584 gcs=29 gc_ms=642.2 maxpause_ms=30.13 steady_rss_kib=1035584
+case=fragsmall gc=conservative rep=3 workload=frag seconds=8.6334 mops=3.475 rss_kib=1036684 peak_kib=1036684 gcs=29 gc_ms=651.1 maxpause_ms=38.62 steady_rss_kib=1036684
+case=fragsmall gc=parallel rep=1 workload=frag seconds=8.7016 mops=3.448 rss_kib=1035420 peak_kib=1035420 gcs=29 gc_ms=654.8 maxpause_ms=29.95 steady_rss_kib=1035420
+case=fragsmall gc=parallel rep=2 workload=frag seconds=8.7627 mops=3.424 rss_kib=1036284 peak_kib=1036284 gcs=29 gc_ms=675.9 maxpause_ms=32.70 steady_rss_kib=1036284
+case=fragsmall gc=parallel rep=3 workload=frag seconds=8.6098 mops=3.484 rss_kib=1035432 peak_kib=1035432 gcs=29 gc_ms=631.9 maxpause_ms=30.79 steady_rss_kib=1035432
+case=fragsmall gc=fork rep=1 workload=frag seconds=10.0252 mops=2.992 rss_kib=2254248 peak_kib=2254248 gcs=17 gc_ms=398.8 maxpause_ms=28.05 steady_rss_kib=2003663
+case=fragsmall gc=fork rep=2 workload=frag seconds=9.7591 mops=3.074 rss_kib=2253912 peak_kib=2253912 gcs=17 gc_ms=377.4 maxpause_ms=24.56 steady_rss_kib=1975065
+case=fragsmall gc=fork rep=3 workload=frag seconds=9.9203 mops=3.024 rss_kib=2322612 peak_kib=2322612 gcs=18 gc_ms=416.9 maxpause_ms=26.28 steady_rss_kib=1939784
+case=fragsmall gc=symgc rep=1 workload=frag seconds=13.8322 mops=2.169 rss_kib=703216 peak_kib=977312 gcs=0 gc_ms=0.0 maxpause_ms=0.00 steady_rss_kib=782710
+case=fragsmall gc=symgc rep=2 workload=frag seconds=14.1372 mops=2.122 rss_kib=714320 peak_kib=972504 gcs=0 gc_ms=0.0 maxpause_ms=0.00 steady_rss_kib=780093
+case=fragsmall gc=symgc rep=3 workload=frag seconds=14.2445 mops=2.106 rss_kib=718568 peak_kib=975144 gcs=0 gc_ms=0.0 maxpause_ms=0.00 steady_rss_kib=780502
+case=trav gc=conservative rep=1 workload=trav seconds=0.4104 mops=97.476 rss_kib=352012 peak_kib=352012 gcs=22 gc_ms=831.1 maxpause_ms=132.88 traversal_ms=41.036 misses_per_traversal=372611
+case=trav gc=conservative rep=2 workload=trav seconds=0.3650 mops=109.577 rss_kib=352016 peak_kib=352016 gcs=22 gc_ms=814.7 maxpause_ms=123.38 traversal_ms=36.504 misses_per_traversal=375777
+case=trav gc=conservative rep=3 workload=trav seconds=0.3548 mops=112.739 rss_kib=351972 peak_kib=351972 gcs=22 gc_ms=817.4 maxpause_ms=125.08 traversal_ms=35.480 misses_per_traversal=367597
+case=trav gc=parallel rep=1 workload=trav seconds=0.3904 mops=102.454 rss_kib=352012 peak_kib=352076 gcs=22 gc_ms=825.0 maxpause_ms=130.39 traversal_ms=39.042 misses_per_traversal=371664
+case=trav gc=parallel rep=2 workload=trav seconds=0.3682 mops=108.639 rss_kib=351996 peak_kib=352060 gcs=22 gc_ms=863.8 maxpause_ms=140.60 traversal_ms=36.819 misses_per_traversal=371743
+case=trav gc=parallel rep=3 workload=trav seconds=0.3480 mops=114.928 rss_kib=351924 peak_kib=351924 gcs=22 gc_ms=809.9 maxpause_ms=134.08 traversal_ms=34.804 misses_per_traversal=374867
+case=trav gc=fork rep=1 workload=trav seconds=0.3721 mops=107.484 rss_kib=725612 peak_kib=725612 gcs=6 gc_ms=140.6 maxpause_ms=121.70 traversal_ms=37.215 misses_per_traversal=376507
+case=trav gc=fork rep=2 workload=trav seconds=0.3796 mops=105.361 rss_kib=725588 peak_kib=725588 gcs=6 gc_ms=140.4 maxpause_ms=128.80 traversal_ms=37.965 misses_per_traversal=379733
+case=trav gc=fork rep=3 workload=trav seconds=0.3643 mops=109.791 rss_kib=725560 peak_kib=725560 gcs=6 gc_ms=99.2 maxpause_ms=82.17 traversal_ms=36.433 misses_per_traversal=376925
+case=trav gc=symgc rep=1 workload=trav seconds=0.2483 mops=161.126 rss_kib=214208 peak_kib=296316 gcs=0 gc_ms=0.0 maxpause_ms=0.00 traversal_ms=24.825 misses_per_traversal=160765
+case=trav gc=symgc rep=2 workload=trav seconds=0.2525 mops=158.429 rss_kib=214144 peak_kib=296368 gcs=0 gc_ms=0.0 maxpause_ms=0.00 traversal_ms=25.248 misses_per_traversal=170009
+case=trav gc=symgc rep=3 workload=trav seconds=0.2443 mops=163.764 rss_kib=214196 peak_kib=296116 gcs=0 gc_ms=0.0 maxpause_ms=0.00 traversal_ms=24.425 misses_per_traversal=155444
+case=tree gc=conservative rep=1 workload=tree seconds=9.9817 mops=13.376 rss_kib=305896 peak_kib=305896 gcs=73 gc_ms=3320.6 maxpause_ms=119.30 
+case=tree gc=conservative rep=2 workload=tree seconds=9.8100 mops=13.611 rss_kib=305952 peak_kib=305952 gcs=73 gc_ms=3155.9 maxpause_ms=114.39 
+case=tree gc=conservative rep=3 workload=tree seconds=9.7326 mops=13.719 rss_kib=305824 peak_kib=305824 gcs=73 gc_ms=3177.3 maxpause_ms=109.61 
+case=tree gc=parallel rep=1 workload=tree seconds=10.2827 mops=12.985 rss_kib=305868 peak_kib=305868 gcs=73 gc_ms=3861.0 maxpause_ms=117.01 
+case=tree gc=parallel rep=2 workload=tree seconds=10.3532 mops=12.896 rss_kib=305724 peak_kib=305724 gcs=73 gc_ms=3861.1 maxpause_ms=117.22 
+case=tree gc=parallel rep=3 workload=tree seconds=10.4133 mops=12.822 rss_kib=305768 peak_kib=305768 gcs=73 gc_ms=3863.0 maxpause_ms=117.48 
+case=tree gc=fork rep=1 workload=tree seconds=6.8127 mops=19.599 rss_kib=1163236 peak_kib=1163236 gcs=12 gc_ms=73.2 maxpause_ms=5.33 
+case=tree gc=fork rep=2 workload=tree seconds=6.8193 mops=19.580 rss_kib=1163296 peak_kib=1163360 gcs=12 gc_ms=74.0 maxpause_ms=5.68 
+case=tree gc=fork rep=3 workload=tree seconds=7.0052 mops=19.060 rss_kib=1261424 peak_kib=1261424 gcs=12 gc_ms=81.7 maxpause_ms=7.96 
+case=tree gc=symgc rep=1 workload=tree seconds=10.2748 mops=12.995 rss_kib=191688 peak_kib=226240 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=tree gc=symgc rep=2 workload=tree seconds=10.2629 mops=13.010 rss_kib=214212 peak_kib=228200 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=tree gc=symgc rep=3 workload=tree seconds=10.1293 mops=13.181 rss_kib=212076 peak_kib=226092 gcs=0 gc_ms=0.0 maxpause_ms=0.00 
+case=latency256 gc=conservative rep=1 workload=latency seconds=0.4249 mops=0.471 rss_kib=808176 peak_kib=809140 gcs=7 gc_ms=199.7 maxpause_ms=69.04 p50_us=0 p99_us=3 p999_us=244 max_us=70352
+case=latency256 gc=conservative rep=2 workload=latency seconds=0.4648 mops=0.430 rss_kib=808416 peak_kib=809556 gcs=7 gc_ms=246.0 maxpause_ms=121.49 p50_us=0 p99_us=2 p999_us=240 max_us=122677
+case=latency256 gc=conservative rep=3 workload=latency seconds=0.4698 mops=0.426 rss_kib=808124 peak_kib=809292 gcs=7 gc_ms=244.7 maxpause_ms=121.98 p50_us=0 p99_us=2 p999_us=238 max_us=123234
+case=latency256 gc=parallel rep=1 workload=latency seconds=0.5526 mops=0.362 rss_kib=814012 peak_kib=815252 gcs=7 gc_ms=359.8 maxpause_ms=131.02 p50_us=0 p99_us=3 p999_us=241 max_us=134666
+case=latency256 gc=parallel rep=2 workload=latency seconds=0.5416 mops=0.369 rss_kib=813996 peak_kib=815160 gcs=7 gc_ms=360.2 maxpause_ms=128.69 p50_us=0 p99_us=3 p999_us=239 max_us=132467
+case=latency256 gc=parallel rep=3 workload=latency seconds=0.5512 mops=0.363 rss_kib=813580 peak_kib=814844 gcs=7 gc_ms=359.7 maxpause_ms=132.88 p50_us=0 p99_us=3 p999_us=244 max_us=136670
+case=latency256 gc=fork rep=1 workload=latency seconds=0.3433 mops=0.583 rss_kib=1105728 peak_kib=1106768 gcs=4 gc_ms=12.8 maxpause_ms=7.02 p50_us=0 p99_us=6 p999_us=247 max_us=7705
+case=latency256 gc=fork rep=2 workload=latency seconds=0.3405 mops=0.587 rss_kib=1105724 peak_kib=1106984 gcs=4 gc_ms=12.7 maxpause_ms=6.32 p50_us=0 p99_us=6 p999_us=250 max_us=7126
+case=latency256 gc=fork rep=3 workload=latency seconds=0.3362 mops=0.595 rss_kib=1105728 peak_kib=1106632 gcs=4 gc_ms=12.5 maxpause_ms=6.36 p50_us=0 p99_us=6 p999_us=249 max_us=7177
+case=latency256 gc=symgc rep=1 workload=latency seconds=0.4973 mops=0.402 rss_kib=471968 peak_kib=637484 gcs=0 gc_ms=0.0 maxpause_ms=0.00 p50_us=1 p99_us=5 p999_us=243 max_us=28943
+case=latency256 gc=symgc rep=2 workload=latency seconds=0.4847 mops=0.413 rss_kib=480240 peak_kib=637472 gcs=0 gc_ms=0.0 maxpause_ms=0.00 p50_us=1 p99_us=5 p999_us=244 max_us=27634
+case=latency256 gc=symgc rep=3 workload=latency seconds=0.4626 mops=0.432 rss_kib=461816 peak_kib=643800 gcs=0 gc_ms=0.0 maxpause_ms=0.00 p50_us=1 p99_us=5 p999_us=242 max_us=27879
+case=latency1024 gc=conservative rep=1 workload=latency seconds=0.9188 mops=0.218 rss_kib=1772212 peak_kib=1773280 gcs=8 gc_ms=1052.4 maxpause_ms=489.75 p50_us=1 p99_us=7 p999_us=11 max_us=494049
+case=latency1024 gc=conservative rep=2 workload=latency seconds=0.9868 mops=0.203 rss_kib=1766096 peak_kib=1767072 gcs=8 gc_ms=1054.6 maxpause_ms=501.43 p50_us=2 p99_us=7 p999_us=12 max_us=506241
+case=latency1024 gc=conservative rep=3 workload=latency seconds=0.9623 mops=0.208 rss_kib=1772300 peak_kib=1773388 gcs=8 gc_ms=1001.0 maxpause_ms=504.09 p50_us=1 p99_us=7 p999_us=11 max_us=508934
+case=latency1024 gc=parallel rep=1 workload=latency seconds=0.6906 mops=0.290 rss_kib=1766420 peak_kib=1767424 gcs=8 gc_ms=785.3 maxpause_ms=278.46 p50_us=1 p99_us=7 p999_us=10 max_us=254358
+case=latency1024 gc=parallel rep=2 workload=latency seconds=0.6840 mops=0.292 rss_kib=1768080 peak_kib=1768972 gcs=8 gc_ms=761.5 maxpause_ms=278.58 p50_us=1 p99_us=7 p999_us=11 max_us=243654
+case=latency1024 gc=parallel rep=3 workload=latency seconds=0.6716 mops=0.298 rss_kib=1763940 peak_kib=1764984 gcs=8 gc_ms=780.3 maxpause_ms=293.54 p50_us=1 p99_us=7 p999_us=10 max_us=243470
+case=latency1024 gc=fork rep=1 workload=latency seconds=0.5649 mops=0.354 rss_kib=2093912 peak_kib=2095024 gcs=4 gc_ms=29.1 maxpause_ms=20.50 p50_us=2 p99_us=9 p999_us=34 max_us=21260
+case=latency1024 gc=fork rep=2 workload=latency seconds=0.5362 mops=0.373 rss_kib=2093900 peak_kib=2094840 gcs=4 gc_ms=27.9 maxpause_ms=19.78 p50_us=2 p99_us=8 p999_us=13 max_us=20482
+case=latency1024 gc=fork rep=3 workload=latency seconds=0.5246 mops=0.381 rss_kib=2085896 peak_kib=2086820 gcs=4 gc_ms=9.1 maxpause_ms=4.06 p50_us=2 p99_us=8 p999_us=24 max_us=429
+case=latency1024 gc=symgc rep=1 workload=latency seconds=0.5774 mops=0.346 rss_kib=1788592 peak_kib=1789732 gcs=0 gc_ms=0.0 maxpause_ms=0.00 p50_us=2 p99_us=8 p999_us=31 max_us=46711
+case=latency1024 gc=symgc rep=2 workload=latency seconds=0.7666 mops=0.261 rss_kib=1397760 peak_kib=1776276 gcs=0 gc_ms=0.0 maxpause_ms=0.00 p50_us=2 p99_us=10 p999_us=35 max_us=102298
+case=latency1024 gc=symgc rep=3 workload=latency seconds=0.7048 mops=0.284 rss_kib=1411920 peak_kib=1778624 gcs=0 gc_ms=0.0 maxpause_ms=0.00 p50_us=2 p99_us=9 p999_us=29 max_us=89181
