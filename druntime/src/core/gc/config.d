@@ -34,6 +34,7 @@ struct Config
     uint parallel = 99;      // number of additional threads for marking (limited by cpuid.threadsPerCPU-1)
     float heapSizeFactor = 2.0; // heap size to used memory ratio
     string cleanup = "collect"; // select gc cleanup method none|collect|finalize
+    string trace;            // write one CSV record per collection to this file
 
 @nogc nothrow:
 
@@ -71,6 +72,7 @@ struct Config
     parallel:N     - number of additional threads for marking (%lld)
     heapSizeFactor:N - targeted heap size to used memory ratio (%g)
     cleanup:none|collect|finalize - how to treat live objects when terminating (collect)
+    trace:FILE     - write one CSV record per collection to FILE
 
     Memory-related values can use B, K, M or G suffixes.
 ".ptr,

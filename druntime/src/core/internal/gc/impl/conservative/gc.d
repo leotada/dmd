@@ -49,6 +49,7 @@ import core.internal.gc.blkcache;
 
 import cstdlib = core.stdc.stdlib;
 import core.stdc.string : memcpy, memset, memmove;
+import core.stdc.stdio : FILE;
 import core.bitop;
 import core.thread;
 static import core.memory;
@@ -73,6 +74,56 @@ __gshared Duration maxPauseTime;
 __gshared Duration maxCollectionTime;
 __gshared size_t numCollections;
 __gshared size_t maxPoolMemory;
+
+// Per-collection trace, enabled with `--DRT-gcopt=trace:<file>`. One CSV record
+// per finished collection, plus a `fork-start` record for the stop-the-world
+// part of a forking collection. Written while holding the GC lock.
+private __gshared FILE* traceFile;
+private __gshared bool traceFailed;
+
+private void traceCollection(const(char)* kind, Duration pause, Duration mark,
+                             Duration sweep, size_t liveBytes, size_t committedBytes) nothrow
+{
+    import core.stdc.stdio : fopen, fprintf, fflush;
+
+    if (!config.trace.length || traceFailed)
+        return;
+
+    if (traceFile is null)
+    {
+        char[4096] path = void;
+        if (config.trace.length >= path.length)
+        {
+            traceFailed = true;
+            return;
+        }
+        path[0 .. config.trace.length] = config.trace[];
+        path[config.trace.length] = 0;
+        traceFile = fopen(path.ptr, "w");
+        if (traceFile is null)
+        {
+            traceFailed = true;
+            return;
+        }
+        fprintf(traceFile, "collection,kind,pause_us,mark_us,sweep_us,live_bytes,committed_bytes,threads\n");
+    }
+
+    size_t threads;
+    try
+    {
+        foreach (ThreadBase t; ThreadBase)
+            ++threads;
+    }
+    catch (Throwable)
+    {
+    }
+
+    fprintf(traceFile, "%llu,%s,%lld,%lld,%lld,%llu,%llu,%llu\n",
+            cast(ulong) numCollections, kind,
+            pause.total!"usecs", mark.total!"usecs", sweep.total!"usecs",
+            cast(ulong) liveBytes, cast(ulong) committedBytes, cast(ulong) threads);
+    fflush(traceFile);
+}
 
 __gshared long numMallocs;
 __gshared long numFrees;
@@ -3392,6 +3443,9 @@ Lmark:
                             if (pause > maxPauseTime)
                                 maxPauseTime = pause;
                             pauseTime += pause;
+                            traceCollection("fork-start", pause, stop - start, Duration.zero,
+                                            (usedSmallPages + usedLargePages) * PAGESIZE,
+                                            mappedPages * PAGESIZE);
                             return 0;
                         case ChildStatus.done:
                             break;
@@ -3426,6 +3480,7 @@ Lmark:
         stop = currTime;
         markTime += (stop - start);
         Duration pause = stop - begin;
+        Duration markDuration = stop - start;
         if (pause > maxPauseTime)
             maxPauseTime = pause;
         pauseTime += pause;
@@ -3460,6 +3515,11 @@ Lmark:
             maxCollectionTime = collectionTime;
 
         ++numCollections;
+
+        traceCollection(doFork ? "fork" : doParallel ? "parallel" : "stw",
+                        pause, markDuration, stop - start,
+                        (usedSmallPages + usedLargePages) * PAGESIZE,
+                        mappedPages * PAGESIZE);
 
         updateCollectThresholds();
         if (doFork && isFinal)

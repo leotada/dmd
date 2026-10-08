@@ -54,7 +54,11 @@ void main(string[] args) {
     int maxDepth = (minDepth + 2 > n) ? minDepth + 2 : n;
     int stretchDepth = maxDepth + 1;
 
+    // Accumulate and print the checks: otherwise LDC drops most of the dead trees
+    // and the benchmark stops measuring the collector.
+    long total;
     int check = (TreeNode.bottomUpTree(0,stretchDepth)).itemCheck();
+    total += check;
 
     TreeNode longLivedTree = TreeNode.bottomUpTree(0, maxDepth);
 
@@ -66,5 +70,8 @@ void main(string[] args) {
             check += (TreeNode.bottomUpTree(i, depth)).itemCheck();
             check += (TreeNode.bottomUpTree(-i, depth)).itemCheck();
         }
+        total += check;
     }
+    total += longLivedTree.itemCheck();
+    stderr.writeln("checksum ", total);
 }
