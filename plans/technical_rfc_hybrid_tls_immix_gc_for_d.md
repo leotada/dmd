@@ -866,6 +866,8 @@ Findings about symgc: it is stop-the-world with parallel mark threads and per-th
 
 **Goal set by the project owner:** real-time games with a full GC and imperceptible pauses, and other latency-sensitive programs. Peak performance is the priority, and forking symgc is acceptable. This replaces the throughput-first reading of M3: the metric is the **worst frame**, not the 99th percentile.
 
+**The bar (2026-10-08):** the best GC for real-time programs, good enough that any kind of game can be written without designing around the collector. No object pools to dodge pauses, no "never allocate in the frame loop" rule, no manual `GC.collect` timing. Unity is the reference users know, and the aim is to do better. "Better" is defined by measurable properties, not by claims (see "Reviewed work order", "Beating the reference").
+
 **Target.** At a live heap of 2 GiB or more, on a 60 fps loop: no frame delayed by the collector by more than 1 ms (worst case, not p99), and fewer than 0.1% of frames delayed by more than 0.25 ms. Allocation tail latency is part of this, not only pauses.
 
 **Measured gap (`frames.sh`, 2 GiB live):** conservative 570 ms worst frame; fork marking 40 ms; symgc 112 ms. The first run showed symgc delaying 1027 of 1200 ordinary frames by more than 1 ms and I attributed it to allocation jitter. **That did not reproduce and the attribution was wrong** (follow-up run with `FRAMES_DUMP=1` and `strace -f -T`, same machine): at 2 GiB, 32 frames over 1 ms and p50 0.67 ms; at 512 MiB, 90 over 1 ms. The frames over 2 ms are exactly the collections, evenly spaced (every ~114 frames at 512 MiB, 20 ms growing to 35 ms as the heap grew; four collections at 2 GiB of 56, 73, 78 and 89 ms), run by the allocating thread. The main thread made ~19.8k `madvise(MADV_DONTNEED)` calls in 20 s (mostly 4 to 16 KiB; 8 µs each, 0.8% of the time, longest 0.29 ms), so decommit is a small, steady cost, not a source of multi-millisecond frames. The first run's 1027 was most likely machine noise (the `powersave` governor). **The gap is therefore pauses, not allocation jitter**; the p50 frame time (symgc 0.67 to 1.17 ms against 0.5 to 0.75 ms) is the allocation-speed difference seen in `alloc-1t` (0.77×).
@@ -879,7 +881,7 @@ Findings about symgc: it is stop-the-world with parallel mark threads and per-th
 6. **Game-facing controls** (designed with the first users): a pause budget and a way to ask for a collection step between frames; threads that opt out of the GC entirely (audio and render threads that must never be suspended: no GC allocation, stack not scanned); core pinning and priority for the mark threads; per-cycle statistics for a frame profiler.
 7. **Track B stays shelved**; revisit only if a real LDC build shows the barrier under 15% on `tree2`.
 
-**Order of work** (replaces Phases 1–5 of this document for planning; the old text stays as design background):
+**Order of work** (replaces Phases 1–5 of this document for planning; the old text stays as design background). The phase sizes below still hold, but the sequence and the exit tests are set by **"Reviewed work order (2026-10-08)"** further down, which supersedes this list where they differ:
 - **P1** fork, test parity, build setup in the repo, benchmark gates in CI (`frames`, `alloc`, `frag`): 3–5 pw.
 - **P2** allocation speed and decommit policy: 3–5 pw. Exit: `alloc-1t` at least equal to the conservative collector; `frag` within 1.5× of the conservative collector.
 - **P3** SATB barrier in the compiler (LDC and dmd), model re-run with the new sequence rule, concurrent marking: 15–25 pw. Exit: worst pause under 1 ms at 2 GiB.
@@ -895,13 +897,143 @@ Findings about symgc: it is stop-the-world with parallel mark threads and per-th
 
 **Implementation log.** The fork exists locally as `symgc/` (branch `latency-p3`, patches in `plans/symgc-patches/`). Done: the unit-test baseline builds and passes with the repo's dmd; phase tracing; the SATB foundation (`d.gc.satb`, release barrier in `free`/`destroy`/moving and shrinking `realloc`/`removeRoots`, buffer flush at thread exit), each hook covered by a unit test that fails when the hook is disabled, no measurable cost on `alloc` or `frag`. Then the cycle was split into a start pause, the mark and a remark pause (patch 0003), still all stop-the-world, with the marking flag on during the mark and the remark asserting that nothing was logged; `alloc`, `frag` and `frames` run clean with assertions on. Not done: the restart between start pause and mark (the collector is still stop-the-world, so the hooks above see no concurrent mutator); the compiler-side store barrier and the bulk pre-barrier; the lazy sweep; the thread-registration rules (they need handshakes, which come with concurrent mark).
 
-**Next steps, in order (first actions of P1 to P3)**
-1. **Fork symgc and set up the project** (1 to 2 days). Put it in its own repository (it is Symmetry Investments' MIT code; this tree only holds a local copy at `symgc/`, uncommitted). Make it build against this repository's druntime in CI. Turn `frames`, `alloc` and `frag` from `plans/bench/core_bench/` into pass/fail gates so every later change is measured. Decide at the start whether to keep the fork mergeable with upstream; that is far cheaper than reconciling later.
-2. **Run symgc under the real test suites** (druntime tests, compiler tests, fiber-based code). Nothing has been measured there, and a failure is a blocker found cheaply. Fibers and Phobos-heavy code need a Phobos checkout that matches this repository's druntime. **Needs from the project owner:** that checkout, or approval to download it.
-3. **Fix the decommit policy and the single-thread allocation speed** (P2, 3 to 5 pw; lower priority than step 5 after the `FRAMES_DUMP` finding: the frames over 2 ms are the collections, see "Measured gap"). Move `madvise`/`mmap` off the allocation path into a background thread with a retained pool; batch thread-cache refills; bound the work in every slow path. Also fixes `frag` (3.6× slower than the conservative collector, 174k `madvise` calls per 2M steps). Exit test: `frames`, fewer than 0.1% of frames above 1 ms.
-4. **One real LDC build to confirm the barrier cost** before the compiler work in P3. **Needs from the project owner:** approval to install the LLVM development package.
-5. **Concurrent marking** (P3, 15 to 25 pw): the SATB barrier in LDC and dmd with the restartable-sequence rule from the model, then the concurrent mark phase. Re-run `plans/model/run_all.sh` with the final sequence first.
-6. **In parallel, from the project owner:** a real game-shaped workload (or a description of one: live heap size, allocation per frame, thread count, whether audio and render threads allocate). The synthetic `frames` loop is a proxy; the 1 ms target should be tuned against something real.
+#### Reviewed work order (2026-10-08)
+
+This replaces the earlier "Next steps" list. Phase 0 is finished: its gates are decided (above) and its tools (model, benchmarks, phase trace, audit) stay in use. All work from here is P1 to P4 on the symgc fork.
+
+**Decisions and approvals from the project owner (2026-10-08).** Recorded; work has not started.
+- **Approved downloads, and only these two:**
+  - a Phobos checkout matching this repository's druntime;
+  - the LLVM development package for a real LDC build.
+
+  Anything else that needs downloading or installing is asked for first.
+- **Fork policy:** keep the symgc fork mergeable with upstream for as long as that is possible. It is a preference, not a rule. When mergeability blocks a better design, the design wins, and the divergence is recorded in `plans/symgc-patches/README.md`.
+- **Goal:** the bar stated under "Direction" above.
+
+**What we need (prepared, not started)**
+
+| Need | Exact item | How | For |
+|---|---|---|---|
+| Phobos matching druntime | `dlang/phobos` at tag `v2.113.0-beta.1` (this repository's `VERSION`), cloned beside the repository as `../phobos` (where the dmd build expects it) | `git clone --depth 1 --branch v2.113.0-beta.1 https://github.com/dlang/phobos ../phobos`, then build with the repo's dmd | Step 1: Phobos unit tests, fibers and `std.*`-heavy programs under symgc; the vibe.d-style and `std.parallelism` benchmarks |
+| LLVM development package | `llvm19-devel` from the openSUSE Leap 16.0 `repo-oss` repository. It matches the installed `clang19` 19.1.7 and LDC 1.40.1's LLVM 19.1.7; the local `ldc/` checkout needs LLVM ≥ 18 | `sudo zypper install llvm19-devel`. It needs root, so the project owner runs it, for example as `! sudo zypper install llvm19-devel` in the session | Step 1: one real LDC build with the SATB barrier; step 6 |
+| Game-shaped workload | Live heap size, allocation rate per frame, object size mix, thread count, whether audio and render threads allocate, target frame rate, target hardware (cores free for the GC) | From the project owner, or a description to build a synthetic one | Pacing, mark-core budget, step 7 exit test |
+| Reference behaviour | Unity's documented GC behaviour (incremental mode, time slicing, fallbacks), taken from Unity's own documentation and cited | Read the documentation pages; no installation | "Beating the reference" below |
+
+**Beating the reference.** From memory, to verify against Unity's documentation before it is quoted anywhere: Unity uses the Boehm–Demers–Weiser collector, with an optional incremental mode since 2019. That mode spreads marking over several frames within a per-frame time budget, so it is non-moving and conservative like symgc. The plan beats it if these measured properties hold. Each becomes a gate.
+1. **No pause grows with the heap.** The worst stop-the-world pause is O(threads), under 200 µs at 8 GiB. Time-sliced marking keeps each slice small, but its total grows with the heap.
+2. **Marking costs no frame time on the game thread.** Mark work runs on 1–2 background cores. The game thread pays only barrier cost and bounded assists, and assists happen only when it outruns the collector.
+3. **No silent fallback to a full stop.** Pacing starts cycles early enough that a stop never happens in steady play. If one ever happens, it is counted and reported, never hidden.
+4. **Allocation stays fast under load.** Allocation is per-thread and lock-free on the fast path (symgc's thread caches), and the slow path does bounded work (steps 2 and 3).
+5. **The numbers are published.** Each release reports the worst frame, over-1 ms and over-0.25 ms counts at 2 GiB and 8 GiB, mark CPU per frame, and barrier cost, measured by the gates in step 0.
+6. **The game can steer it.** Game-facing controls (step 7): a pause budget, a collection step between frames, opt-out threads, and per-cycle statistics for a frame profiler.
+
+**Why the order changed.** A review of the order suggested after patch 0003 found seven problems.
+
+1. **Gates came after code changes.** The suggestion went straight to code. Without pass/fail benchmarks, a sweep or mark change cannot be shown to help, or to not regress throughput. Gates are cheap, so they go first.
+2. **The suggested next step was P3 work** (handshakes, thread registration) before P2. The sweep is 60% of today's worst frame, needs no compiler change, and builds parts that P3 reuses (next point). P2 goes first.
+3. **The lazy sweep alone cannot reach the target.** If allocating threads leave Probation at the restart, the 2 GiB worst frame drops from 56–81 ms to about the mark pause, 33 ms. That is still 33× over the 1 ms target. Concurrent marking is mandatory. The sweep is first because it is cheap, not because it is enough. Shared parts:
+   - the "born after mark" flag is the same thing as allocate-black;
+   - the per-slab `unswept → swept` state is what a concurrent sweep needs;
+   - ending Probation at the restart is what concurrent marking needs too.
+4. **The largest risk sits in P3 and was scheduled late.** P3 is 15–25 pw. It depends on a compiler barrier whose real LDC cost is unmeasured, and GDC will never have it. Two de-risking items move up and run in parallel with P2:
+   - the real LDC barrier build;
+   - a spike on a compiler-free route (step 4).
+5. **No correctness tooling was planned for the runtime.** The model checks the protocol, not the code. Lazy sweep and concurrent mark fail as rare use-after-free bugs. A verifier mode is built before either change (step 2a).
+6. **Pacing was in P4.** With concurrent marking, a program that allocates faster than the mark threads finish still forces a stop. On one or two background cores, marking 2 GiB takes about 134–268 ms, so 8–16 frames. The cycle must start early enough from the measured allocation rate, and mutator assists must be bounded. Without this, the P3 exit test cannot pass, so pacing moves into P3.
+7. **Finalizers had no owner.** Today they run on the thread that triggered the collection, inside the sweep. A lazy sweep runs them on whichever thread sweeps a slab, which may be the game thread mid-frame. Two things must happen before the lazy sweep ships:
+   - decide where finalizers run (proposal: a dedicated finalizer thread, ADR-5 to be updated);
+   - add finalizer resurrection to the model.
+
+**The order**
+
+| Step | Work | Phase | Size | Exit test | Needs |
+|---|---|---|---|---|---|
+| 0 | Benchmark gates and project setup | P1 | 2–4 days | Gate script flags a 5% regression on a planted slowdown | — (fork policy decided: mergeable while possible) |
+| 1 | Test-suite parity, real LDC barrier cost, real workload | P1, P3 risk | parallel | Suites pass under `gc:sdcq`; barrier cost measured | Phobos and `llvm19-devel` (approved); workload |
+| 2 | Lazy sweep, allocation during the sweep | P2 | 3–5 pw | 2 GiB worst frame ≈ mark pause (≤ 35 ms); no sweep time inside any frame | — |
+| 3 | Decommit off the allocation path, allocation speed | P2 | 1–2 pw | `alloc-1t` ≥ 1.0× conservative; `frag` ≤ 1.5× | — |
+| 4 | Spike: dirty-page remark as a compiler-free route | P3 risk | 2–4 days | Remark cost per frame measured at 2 GiB | — |
+| 5 | Concurrent SATB mark, runtime and dmd barrier, pacing | P3a | 12–18 pw | Worst pause < 1 ms at 2 GiB on `frames` | Step 1 suites |
+| 6 | LDC inline barrier | P3b | 3–7 pw | SATB cost ≤ 5% geomean, ≤ 15% worst, `.text` ≤ 1.10× | LLVM dev package |
+| 7 | Concurrent decommit, game controls, 8 GiB | P4 | 8–12 pw | Worst frame delay < 1 ms at 8 GiB on the real workload | Workload |
+| 8 | Work reducers: precise heap, precise roots, Windows | after P4 | open | Mark time per live MiB down; no target regression | — |
+
+**Step 0 — Gates and setup (P1).**
+- Turn `frames`, `alloc` and `frag` into one script that compares with a saved baseline and fails on a regression. It should report the worst frame, the over-1 ms count, Mops/s and steady RSS. Add the phase trace (worst stop-the-world, sweep time per cycle) so each change can be attributed.
+- Pin the CPU governor, or record it in the output. The first `frames` run was spoiled by `powersave` noise.
+- Keep the fork mergeable while possible (decided): small patches, one concern each, rebased on upstream. Move the fork into its own repository.
+
+**Step 1 — Unblock in parallel (P1, and the P3 risk).** These run beside steps 2–3 and do not block them.
+- Run symgc under the druntime tests, `compiler/test/runnable`, fiber code and Phobos unit tests. A failure here is a blocker found cheaply. **Uses** the approved Phobos checkout (`v2.113.0-beta.1`, see "What we need").
+- One real LDC build with the SATB barrier, to confirm the spike's numbers before P3 commits 15–25 pw. Include the bulk pre-barrier: the spike left it out, so its numbers are a lower bound. **Uses** the approved `llvm19-devel`, which the project owner installs with root.
+- A real game-shaped workload, or a description of one: live heap size, allocation per frame, thread count, whether audio and render threads allocate. It sets the pacing and the mark-core budget.
+
+**Step 2 — Lazy sweep (P2), in this order.**
+- **2a. Verifier mode first** (`-version=Symgc_verify`). Poison every freed slot. At the start of each mark, report any traced pointer into a poisoned slot, with the slot's size class and the cycle it was freed in. This catches a lost object one cycle after the bug, in any test. It is reused unchanged by step 5.
+- **2b. Model finalizers.** Add resurrection and a finalizer that stores into a live object while the sweep runs. Decide the finalizer thread (ADR-5).
+- **2c. Implement** the four slab rules checked in the model:
+  - per-extent `unswept → swept` state;
+  - a "born after mark" flag in `Extent._pad1`;
+  - `Bin.mutex` held per extent while sweeping;
+  - re-insert slabs as they are swept, and sweep on demand at refill.
+
+  A background sweeper thread does the rest. Allocating threads leave Probation at the restart.
+- **2d. Interim wins** if 2c slips: a parallel sweep by extent with the existing GC threads while the world is stopped, and skipping extents with no garbage.
+- **Exit:** `frames` at 2 GiB shows a worst frame no larger than the stop-the-world mark (about 35 ms), and no sweep time inside any frame. `frag`, `alloc` and RSS do not regress. The verifier is clean on the gates and the step 1 suites.
+
+**Step 3 — Decommit and allocation speed (P2).**
+- Move `madvise` and `mmap` to a background thread with a retained pool.
+- Batch thread-cache refills, and bound the work in every slow path.
+- **Exit:** `alloc-1t` at least equal to the conservative collector; `frag` within 1.5×; p50 frame no worse than conservative.
+
+**Step 4 — Spike: dirty-page remark (P3 risk, 2–4 days).** Mostly-concurrent marking (Boehm, Demers and Shenker, PLDI 1991) needs no compiler barrier:
+- mark concurrently;
+- then, in a stop-the-world remark, rescan the pages written since the mark started (Linux soft-dirty bits or `userfaultfd` write-protect; Windows `GetWriteWatch`);
+- rescan all stacks in the same remark.
+
+Its remark grows with the pages written during the mark, so it cannot guarantee 1 ms. It works with every compiler, though, including GDC and libraries built without barriers. Today those fall back to full stop-the-world.
+
+The spike measures pages dirtied per frame on `frames` and on the real workload, and the cost to rescan them at 2 GiB. Decide from the result:
+- if remark fits in about 1–2 ms, build it first as the fallback for modules without `MIgcBarriers`, and as an early milestone;
+- if not, record why and drop it.
+
+The SATB route of step 5 stays the target in both cases.
+
+**Step 5 — Concurrent SATB mark (P3a), correctness before speed, using dmd's out-of-line barrier.**
+- **5a.** Restart the world between `cycleStart` and the mark (patch 0003 prepared the split). Add:
+  - allocate-black, using the step 2 flag;
+  - a per-thread handshake that scans the thread's stack, flushes its SATB buffer and turns off its hybrid barrier;
+  - the thread-registration and exit rules from the model;
+  - the stack-visibility rule.
+- **5b.** Have dmd emit `_d_gc_store` at every barriered store (exchange-then-test, or a restartable sequence, per the model's race finding). Add the bulk pre-barrier in the druntime hooks and the `MIgcBarriers` flag. Fall back to stop-the-world when any loaded module lacks the flag.
+- **5c.** Pacing: start the cycle from the allocation rate and the measured mark speed on the budgeted cores, and use mutator assists in bounded steps. Run 1–2 mark threads, configurable and optionally pinned.
+- **Tests:**
+  - `plans/model/run_all.sh` with the final barrier sequence;
+  - the verifier on every suite, with an "always marking" stress mode that starts the next cycle as soon as one ends;
+  - a many-thread stress test.
+- **Exit:** worst pause under 1 ms at 2 GiB on `frames`, verifier clean. Throughput may be poor with out-of-line barriers; that is step 6.
+
+**Step 6 — LDC inline barrier (P3b).** Optimized fast path, inserted in IR generation; drop the barrier for fresh objects. **Exit:** M4 and M9 for SATB (≤ 5% geometric mean, ≤ 15% worst case, `.text` ≤ 1.10×), measured on the real workload too.
+
+**Step 7 — P4.**
+- Chunked, concurrent decommit and `minimize`.
+- Game-facing controls:
+  - a pause budget;
+  - a collection step between frames;
+  - threads that opt out of the GC (never suspended, never scanned);
+  - per-cycle statistics for a frame profiler.
+- **Exit:** worst frame delay under 1 ms at 8 GiB on the real workload, fewer than 0.1% of frames over 0.25 ms.
+
+**Step 8 — Work reducers, after the target is met.**
+- Precise heap scanning: symgc scans whole blocks (`usedCapacity` is commented out in `scanner.d`).
+- Precise static-data and TLS roots (old Phase 3).
+- Windows parity.
+
+These cut mark work and false retention, which lowers the needed headroom and the mark cores, but they do not change any pause bound.
+
+**Not in the plan:** Track B, Immix, symgc fork-mode marking (POSIX only, copy-on-write cost, no Windows), and exact stack maps (Phase 8). Each stays shelved with the reason recorded above.
+
+**Total to the 1 ms target at 2 GiB (end of step 5):** about 17–27 pw. **To the full target at 8 GiB with LDC speed (end of step 7):** about 28–46 pw.
 
 **Decisions recorded:** build on symgc, fork allowed; Immix rejected; Track B shelved; the metric is the worst frame, not p99.
 
