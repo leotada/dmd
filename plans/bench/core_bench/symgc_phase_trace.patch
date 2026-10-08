@@ -1,0 +1,42 @@
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -71,6 +71,7 @@
+ 		import d.gc.thread;
+ 		auto pauseStartTime = getMonotonicTime();
+ 		stopTheWorld();
++		auto tStopped = getMonotonicTime();
+ 
+ 		import d.gc.region;
+ 		auto dataRange = gDataRegionAllocator.computeAddressRange();
+@@ -80,9 +81,11 @@
+ 		auto managedAddressSpace = dataRange.merge(ptrRange);
+ 
+ 		prepareGCCycle();
++		auto tPrepared = getMonotonicTime();
+ 
+ 		// Go on and on until all worklists are empty.
+ 		markGC(gcCycle, managedAddressSpace);
++		auto tMarked = getMonotonicTime();
+ 
+ 		version(Symgc_druntime_hooks) {
+ 			import core.thread.symthread;
+@@ -104,7 +107,19 @@
+ 		 */
+ 		threadCache.flush();
+ 
++		auto tFlushed = getMonotonicTime();
+ 		auto pageCollectStats = collect(gcCycle);
++		version(Symgc_phase_trace) {
++			import core.stdc.stdio : fprintf, stderr;
++			auto tSwept = getMonotonicTime();
++			enum us = 10.0; // time unit is 100 ns
++			fprintf(stderr, "gcphase threads=%zu start_threads=%.0f stop=%.0f prepare=%.0f mark=%.0f restart=%.0f sweep=%.0f total=%.0f us\n",
++				cast(size_t) threadCount,
++				(pauseStartTime - info.start) / us, (tStopped - pauseStartTime) / us,
++				(tPrepared - tStopped) / us, (tMarked - tPrepared) / us,
++				(pauseStartTime + info.pauseTime - tMarked) / us,
++				(tSwept - tFlushed) / us, (tSwept - info.start) / us);
++		}
+ 		info.usedPages = pageCollectStats.pagesCommitted;
+ 		info.freeBytes += pageCollectStats.pagesCommitted * PageSize - pageCollectStats.bytesAllocated;
+ 		assert(pageCollectStats.pagesCommitted == Arena.computeUsedPageCount());

@@ -74,3 +74,23 @@ numbers hide: its ordinary frames were 1.6x slower at the median in that run. A 
 frames over 2 ms are the stop-the-world collections only (one every ~114 frames; 20 to 35 ms at 512 MiB, 56 to 89 ms
 at 2 GiB), and `strace -f -T` showed ~19.8k `madvise` calls (8 us each, 0.8% of runtime, longest 0.29 ms). The
 earlier "allocation-path jitter" reading (1027 frames over 1 ms) did not reproduce (32 at 2 GiB); treat it as noise.
+
+## Where symgc's collection time goes (`symgc_phase_trace.patch`)
+
+`patch -p1 -d symgc < bench/core_bench/symgc_phase_trace.patch`, build with `-version=Symgc_phase_trace`; each cycle
+prints one `gcphase` line to stderr (microseconds). The `frames` loop (5000 allocations per frame), last cycles:
+
+| live | threads | stop-the-world (prepare + mark) | sweep after restart | whole cycle |
+|---|---:|---:|---:|---:|
+| 512 MiB | 16 | 12.6 ms | 13.7 to 18.7 ms | 26 to 32 ms |
+| 2 GiB | 16 | 33 ms | 22 to 47 ms | 56 to 81 ms |
+| 2 GiB | 1 | 268 ms | 35 ms | 304 ms |
+| 2 GiB | 4 / 8 / 16 | 69 / 40 / 29 ms | 37 / 36 / 36 ms | |
+
+- Stop-the-world work is only prepare (1 to 2 ms) and mark; stopping and restarting threads costs 1 to 3 µs.
+- The **sweep is not in the pause but it is on the triggering thread** (`collect(gcCycle)` after `restartTheWorld`), so the
+  game thread that triggered the cycle loses the whole cycle. It also holds each arena's page-filler mutex for the whole
+  sweep, so any thread that needs a refill from that arena waits. It grows with garbage and does not scale with threads.
+- Mark is 0.13 ms per live MiB on one thread, scaling ~9x on 16 threads (parallel mark is not a latency fix for a game
+  that cannot spare 16 cores).
+- The sweep runs finalizers (`runningFinalization`) on the thread that runs it.
