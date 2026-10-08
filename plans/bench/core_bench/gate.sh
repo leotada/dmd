@@ -17,13 +17,13 @@ TOL=${TOL:-10}
 FRAME_TOL=${FRAME_TOL:-30}
 BASE=$HERE/baseline.txt
 
-# metric|direction (higher or lower is better)|tolerance class (t = TOL, f = FRAME_TOL)
+# metric|direction (higher or lower is better)|tolerance class (t = TOL, f = FRAME_TOL, i = informational)
 METRICS="mops|higher|t
 seconds|lower|t
 steady_rss_kib|lower|t
 frame_max_us|lower|f
 frame_p99_us|lower|f
-over1ms|lower|f"
+over1ms|lower|i"
 
 # label|args
 CASES="alloc-1t|alloc 1 8000000
@@ -78,7 +78,8 @@ compare() { # baseline current -> exit 1 on regression
       pct = (c - b) / b * 100
       worse = (dir[$2] == "higher") ? -pct : pct
       status = (worse > t) ? "FAIL" : "ok  "
-      if (worse > t) bad = 1
+      if (cls[$2] == "i") status = "info"       # informational: too noisy to gate (same code gave 89 and 40)
+      else if (worse > t) bad = 1
       printf "%s %-11s %-16s base=%-12s now=%-12s %+6.1f%% (limit %d%%)\n", status, $1, $2, b, c, pct, t }
     END { exit bad }' "$1" "$2"
 }
