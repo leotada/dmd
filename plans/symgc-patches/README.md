@@ -54,8 +54,25 @@ extent map; two threads driving the sweep state machine while freeing pages rele
 a block already tagged and skipped every sparse block (a leak, only the RSS metric saw it); the sweeper's own thread
 cache holding slots nobody scans (double free at exit).
 
-Known limitation, step 2b of the plan: a finalizer runs in the sweep, and the slots of other dead objects, in slabs
-swept earlier, may already be reused. Before this change nothing could allocate during a sweep.
+### 0007: finalizers before release (step 2b)
+
+With 0006 alone, a finalizer that read another dead object (the spec says it must not, but a collector that frees
+nothing until the end allows it, and programs rely on it) could find that object's slot reused or poisoned, because a
+swept slab went back in its bin at once. `finalizer_order.d` shows it: 2,000 to 285,000 damaged partners per run.
+
+Now the sweep starts with a pass over all blocks that runs every finalizer of the cycle, and clears the metadata flag
+so the release passes do not call it again. Only then are dead slots released. Threads that help with the sweep leave
+the finalize pass to the sweeper (finalizers are user code) and wait without fighting for the lock. A slab remembers
+that a slot of it ever had a finalizer (`Extent.hasFinalizers`, sticky), so the pass skips the others without touching
+their slots, and with no finalizer anywhere (`gAnyFinalizers`) the pass is skipped. Result: `finalizer_order.d` finds no
+damage in 10 of 10 runs, with and without the verifier.
+
+Cost: `alloc` with 8 threads about 12% (median 38.5 against 43.8 Mops/s); everything else within noise (frames, `frag`,
+`alloc` 1 thread). A cheaper design for later: a list of slabs that have finalizers, so the pass does not walk all
+blocks.
+
+Also fixed in 0007: the sweep serials were 8 bits and `gcCycle + 1` wrapped to 0 at cycle 255, the value of a block
+that no sweep has seen. They are 16 bits now.
 
 Build and test with the repo's dmd and druntime (symgc needs `ThreadBase.tlsGCData`; there is no Phobos):
 
