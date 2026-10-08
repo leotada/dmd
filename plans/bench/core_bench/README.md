@@ -94,3 +94,14 @@ prints one `gcphase` line to stderr (microseconds). The `frames` loop (5000 allo
 - Mark is 0.13 ms per live MiB on one thread, scaling ~9x on 16 threads (parallel mark is not a latency fix for a game
   that cannot spare 16 cores).
 - The sweep runs finalizers (`runningFinalization`) on the thread that runs it.
+
+### Sweep parts and the probation finding (same patch, `sweepparts` line)
+
+2 GiB live, 16 threads, sweep 17 to 38 ms, split (ms): dense slabs scan 3 to 13 (grows with garbage), dead-extent
+free 0.5 to 4, sparse scan 12 to 15 (constant: it walks every live sparse extent), `minimize` (decommit) 1 to 5. At
+512 MiB: dense scan 2 to 5, sparse scan 4 to 5, minimize 2 to 3. The sweep is O(live extents) plus O(garbage).
+
+**Probation.** After `restartTheWorld` the threads run again, but any thread that tries to enter the allocator
+(`enterBusyState`) waits in `Probation` until `clearWorldProbation()` at the end of the cycle (`tstate.d`). A game
+thread allocates every frame, so for it the pause is the whole cycle (mark + sweep), not just the stop-the-world part.
+The earlier worst frames (56 to 89 ms at 2 GiB) are exactly the full cycle times.
