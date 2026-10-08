@@ -1,0 +1,94 @@
+From 71ad42133b9a054e88976e05071c939a729622aa Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 13:37:05 -0300
+Subject: [PATCH] Split the collection cycle into start pause, mark and remark
+ pause
+
+The three steps still run with the world stopped, so behaviour is unchanged.
+The SATB marking flag is now set across the mark and the remark asserts that
+nothing was logged, which checks that the collector's own threads do not
+trigger a release barrier during a cycle.
+---
+ source/d/gc/collector.d | 31 ++++++++++++++++++++++++++++++-
+ source/d/gc/range.d     |  5 +++++
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 80dc72e..c33c411 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -2,6 +2,7 @@ module d.gc.collector;
+ 
+ import d.gc.arena;
+ import d.gc.emap;
++import d.gc.range;
+ import d.gc.spec;
+ import d.gc.tcache;
+ import d.gc.time;
+@@ -80,11 +81,15 @@ private:
+ 		import d.gc.range;
+ 		auto managedAddressSpace = dataRange.merge(ptrRange);
+ 
+-		prepareGCCycle();
++		// Start pause: prepare the arenas and turn the SATB log on.
++		cycleStart(managedAddressSpace);
+ 		auto tPrepared = getMonotonicTime();
+ 
+ 		// Go on and on until all worklists are empty.
+ 		markGC(gcCycle, managedAddressSpace);
++
++		// Remark pause: nothing is queued yet, because the world is still stopped.
++		cycleRemark();
+ 		auto tMarked = getMonotonicTime();
+ 
+ 		version(Symgc_druntime_hooks) {
+@@ -144,6 +149,30 @@ private:
+ 		return info;
+ 	}
+ 
++	/**
++	 * The cycle is split in a start pause, the mark, and a remark pause. For
++	 * now all three run with the world stopped, which must behave exactly as
++	 * before: mutators cannot log anything, so the SATB queue stays empty.
++	 * Making the mark concurrent moves the restart between the first two.
++	 */
++	void cycleStart(AddressRange managedAddressSpace) {
++		import d.gc.satb;
++		assert(!satbMarking(), "Marking flag already set!");
++
++		prepareGCCycle();
++
++		auto lo = managedAddressSpace.ptr;
++		satbBegin(lo, lo + managedAddressSpace.size);
++	}
++
++	void cycleRemark() {
++		import d.gc.satb;
++		satbFlushThread();
++		auto n = satbDrain((void*) { assert(false, "Pointer logged while the world was stopped!"); });
++		assert(n == 0);
++		satbEnd();
++	}
++
+ 	void prepareGCCycle() {
+ 		foreach (i; 0 .. ArenaCount) {
+ 			import d.gc.arena;
+diff --git a/source/d/gc/range.d b/source/d/gc/range.d
+index 56154ec..1ba7a5d 100644
+--- a/source/d/gc/range.d
++++ b/source/d/gc/range.d
+@@ -101,6 +101,11 @@ public:
+ 		return cast(void*) -base;
+ 	}
+ 
++	@property
++	size_t size() const {
++		return length;
++	}
++
+ 	this(const void* ptr, size_t size) {
+ 		base = -(cast(ptrdiff_t) ptr);
+ 		length = size;
+-- 
+2.51.0
+
