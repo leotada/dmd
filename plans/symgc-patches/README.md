@@ -214,3 +214,17 @@ p50 67 us, p99 110 us, max 130 us per frame. The GC frame is 690 us p50 /
 1.2 ms p99: ~140 ns per allocation against ~14 ns, and p99/p50 1.8 against 1.6.
 So the gap to close is the allocation path itself (tcache refill, slab
 locks, zeroing, `world[]` random stores), not the collector's pauses.
+
+### Correction: the malloc floor above was unfairly hot
+
+`mallocfloor.d` recycles a 64-entry ring, so every block is in L1. With a
+working set that does not fit the cache the same malloc loop costs more
+(`mallocns.d`, 5M allocations of 32..256 B): ring 64 -> 12.7 ns, 64K -> 14.4,
+1M -> 34.0, 4M (~500 MB) -> 77.6 ns. A bare `new ubyte[]` on symgc is
+90-110 ns (concurrent mark or not), so the honest gap is ~1.3-3x, not 10x, and
+most of what is left is cache misses on recycled cold memory. A SIGPROF
+self-sample of the bare loop: 22% in loads (`atomicLoad`, cache misses),
+`SlabAllocInfo` / `maybeGetPageDescriptor` / `initializeMetadata` ~12%
+(the appendable-array metadata), the rest spread over the tcache path.
+perf is not installed here; the profile came from a SIGPROF handler
+(`scratchpad` only, not committed).
