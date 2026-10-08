@@ -181,3 +181,15 @@ p99 1.42 ms, max 1.82 ms, none over 2 ms. RSS 10.3 GB. The frame's own work is
 frame; the under-1 ms target on the worst frame is not met yet. Open: mark
 threads competing with the game thread for memory bandwidth/cache (p99 rises
 ~15%), and the reference being a game's real frame, not this synthetic loop.
+
+### Heap-size independence and the floor (concurrent mark)
+
+`frames L 600 5000`, concurrent mark: live 16 MiB p99 1.26 / max 1.62 ms;
+256 MiB 1.29 / 1.52; 2 GiB 1.2-1.3 / 1.4-1.9; 8 GiB 1.42 / 1.82. The worst frame no
+longer depends on the live size (16 MiB to 8 GiB), whereas with the
+stop-the-world mark it was 4.5 ms at 16 MiB and 9.5 ms at 256 MiB.
+Mark threads 1/2/4/6 change nothing meaningful (p99 1.4 / 1.3 / 1.27 / 1.2 ms;
+more threads is slightly better because the cycle ends sooner). So the
+remaining ~0.5-0.9 ms over the 0.7 ms p50 of a 5000-allocation frame is
+allocation-path jitter (refills, sweep assist, lock waits), not the mark.
+Next: attribute it with GcbLockStats and the sweep-assist counters.
