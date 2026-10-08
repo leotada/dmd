@@ -343,6 +343,10 @@ void runFrames(size_t liveMiB, size_t frames, size_t allocsPerFrame)
         }
     }
     immutable secs = now() - t0;
+    import core.stdc.stdlib : getenv;
+    if (getenv("FRAMES_DUMP"))   // list the frames over 2 ms: index and duration, to correlate with GC activity
+        foreach (i, v; ft)
+            if (v > 2000) fprintf(stderr, "slowframe %zu %lld us\n", i, v);
     size_t o1, o2, o5, o16;
     long worst, over;
     foreach (v; ft)

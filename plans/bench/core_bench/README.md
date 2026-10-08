@@ -69,5 +69,8 @@ numbers are the per-frame *work* time, so anything above the median is the colle
 
 None is close to imperceptible. The worst frames are stop-the-world pauses (hundreds of milliseconds for the
 conservative collector, 52 to 112 ms for symgc, 14 to 40 ms for fork). symgc has a second problem the pause
-numbers hide: its ordinary frames are 1.6x slower at the median and 2 to 10x more of them exceed 1 ms. That is
-allocation-path jitter (thread-cache refills, `madvise`), not collection.
+numbers hide: its ordinary frames were 1.6x slower at the median in that run. A re-run with
+`FRAMES_DUMP=1 build/gcb_sym frames 512 1200 5000 --DRT-gcopt=gc:sdcq` (lists frames over 2 ms) showed that the
+frames over 2 ms are the stop-the-world collections only (one every ~114 frames; 20 to 35 ms at 512 MiB, 56 to 89 ms
+at 2 GiB), and `strace -f -T` showed ~19.8k `madvise` calls (8 us each, 0.8% of runtime, longest 0.29 ms). The
+earlier "allocation-path jitter" reading (1027 frames over 1 ms) did not reproduce (32 at 2 GiB); treat it as noise.
