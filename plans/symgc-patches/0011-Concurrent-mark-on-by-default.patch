@@ -1,0 +1,47 @@
+From 9059b8012ea7b873027ad0fe42c63f1d07f88734 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 21:24:15 -0300
+Subject: [PATCH 11/11] Concurrent mark on by default
+
+SYMGC_CONCURRENT_MARK=0 opts out; the unit test build keeps it opt-in because its
+threads are not druntime threads.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/dirty.d | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/source/d/gc/dirty.d b/source/d/gc/dirty.d
+index ed664f6..f083007 100644
+--- a/source/d/gc/dirty.d
++++ b/source/d/gc/dirty.d
+@@ -211,14 +211,22 @@ bool initImpl(DirtyTracker* t) {
+ 
+ 	t.tried = true;
+ 
+-	// Only when asked for, for now: SYMGC_CONCURRENT_MARK=1. SYMGC_DIRTY=0
+-	// turns the tracking off even then.
++	// On by default when the kernel supports it. SYMGC_CONCURRENT_MARK=0 or
++	// SYMGC_DIRTY=0 turns it off (a stop-the-world mark).
+ 	import core.stdc.stdlib : getenv;
+ 	auto want = getenv("SYMGC_CONCURRENT_MARK");
+-	if (!t.forced && (want is null || want[0] != '1')) {
++	if (!t.forced && want !is null && want[0] == '0') {
+ 		return false;
+ 	}
+ 
++	// The unit tests drive the collector from threads druntime does not know,
++	// so a background mark has nothing to stop: they ask for it explicitly.
++	version(Symgc_testing) {
++		if (!t.forced && (want is null || want[0] != '1')) {
++			return false;
++		}
++	}
++
+ 	auto env = getenv("SYMGC_DIRTY");
+ 	if (env !is null && env[0] == '0') {
+ 		return false;
+-- 
+2.51.0
+

@@ -228,3 +228,36 @@ self-sample of the bare loop: 22% in loads (`atomicLoad`, cache misses),
 (the appendable-array metadata), the rest spread over the tcache path.
 perf is not installed here; the profile came from a SIGPROF handler
 (`scratchpad` only, not committed).
+
+### Concurrent mark is now the default (patch 0011) and the bullet-hell test
+
+`SYMGC_CONCURRENT_MARK=0` (or `SYMGC_DIRTY=0`, or a kernel without
+`UFFD_FEATURE_WP_ASYNC`/`PAGEMAP_SCAN`) gives the stop-the-world mark. The unit
+test build (`Symgc_testing`) keeps it opt-in: its threads are not druntime
+threads, so there is nothing to stop. Evidence for the switch: battery clean
+(verify workloads, alloc 8 x30, mark_race x8, Phobos stress x30 and x200,
+finalizer_order x5), gate PASS, unit tests 111/112, and 22 Phobos modules'
+unittests (array, conv, string, format, json, containers, range, algorithm,
+typecons, bigint, regex, uni, datetime, stdio, file, path, utf, sumtype,
+concurrency, parallelism) pass in both modes (one unreproduced rc=1 in
+std.typecons with the concurrent mark, 0 in 92 reruns).
+
+`bullet_hell.d`: a headless bullet-hell written with no care for memory (new
+Bullet + closure per shot, arrays rebuilt with filter/array every frame,
+formatted HUD string, streaming level tiles, no pools, no GC.collect), paced
+at 60 fps.
+
+| 60 s, 512 MiB level, 20k bullets/s | p50 | p99 | p99.9 | max | >5 ms | >16 ms |
+|---|---|---|---|---|---|---|
+| symgc, concurrent mark | 1.03 ms | 1.83 | 2.51 | 5.4 ms | 1 | 0 |
+| symgc, stop-the-world | 0.92 | 1.72 | 6.98 | 7.3 | 25 | 0 |
+| stock druntime GC | 0.74 | 1.26 | 1.60 | 43.9 | 2 | 2 |
+
+| 120 s, 2 GiB level, 40k bullets/s | p50 | p99 | p99.9 | max | >5 ms | >16 ms |
+|---|---|---|---|---|---|---|
+| symgc, concurrent mark | 1.82 ms | 3.18 | 4.57 | 7.9 ms | 6 | 0 |
+| stock druntime GC | 1.51 | 2.38 | 2.67 | 156.9 ms | 2 | 2 |
+
+symgc never drops a 60 fps frame; the stock GC drops them (a 157 ms hitch at
+2 GiB). The price is steady-state speed: symgc's p50/p99 are 20-40% above the
+stock GC's (allocation path, dirty-page write faults, the paced sweep).
