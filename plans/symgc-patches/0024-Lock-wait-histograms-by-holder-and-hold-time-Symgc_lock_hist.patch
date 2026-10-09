@@ -1,0 +1,288 @@
+From 68e75930a94a7bcf6d1c247bac1690a559e87c93 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 16:01:14 -0300
+Subject: [PATCH] Lock wait histograms by holder and hold time
+ (Symgc_lock_hist), SYMGC_MARK_NICE
+
+Diagnostics for the page filler's lock: waits by power of two, by who held
+the lock before, and the hold time of the parts of an allocation. Off in
+normal builds. Also SYMGC_MARK_NICE to nice the mark worker threads (default
+unchanged: no effect measurable on the 500k city).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/gctime.d  | 91 +++++++++++++++++++++++++++++++++++++++++++
+ source/d/gc/page.d    | 43 ++++++++++++++++++++
+ source/d/gc/scanner.d | 11 ++++++
+ 3 files changed, 145 insertions(+)
+
+diff --git a/source/d/gc/gctime.d b/source/d/gc/gctime.d
+index ad07d32..dc0ef5e 100644
+--- a/source/d/gc/gctime.d
++++ b/source/d/gc/gctime.d
+@@ -62,10 +62,101 @@ struct GcTimer {
+ 		import d.gc.time;
+ 		auto elapsed = getMonotonicTime() - start;
+ 		auto inner = tGcTimeSum - innerAtStart;
++		version(Symgc_lock_hist) {
++			if (!tIsGcThread) {
++				lockHist(kind, elapsed);
++			}
++		}
++
+ 		record(kind, elapsed > inner ? elapsed - inner : 0);
+ 	}
+ }
+ 
++version(Symgc_lock_hist) {
++	// Count and total of the waits of each kind, by power of two of 100 ns.
++	shared ulong[24][GcTimeKindCount] gHistCount;
++	shared ulong[24][GcTimeKindCount] gHistTime;
++
++	void lockHist(GcTimeKind kind, ulong hnsecs) {
++		import core.atomic : atomicOp;
++		uint b = 0;
++		while (b < 23 && (hnsecs >> b) > 1) {
++			b++;
++		}
++
++		atomicOp!"+="(gHistCount[kind][b], 1);
++		atomicOp!"+="(gHistTime[kind][b], hnsecs);
++	}
++
++	// Waits for the page filler's lock by who held it before: 0 other,
++	// 1 allocation, 2 free, 3 prepare, 4 finalizer sweep, 5 sweep, 6 assist.
++	shared ulong[24][8] gHolderCount;
++	shared ulong[24][8] gHolderTime;
++
++	void holderHist(ubyte holder, ulong hnsecs) {
++		if (tIsGcThread) {
++			return;
++		}
++
++		import core.atomic : atomicOp;
++		uint b = 0;
++		while (b < 23 && (hnsecs >> b) > 1) {
++			b++;
++		}
++
++		atomicOp!"+="(gHolderCount[holder][b], 1);
++		atomicOp!"+="(gHolderTime[holder][b], hnsecs);
++	}
++
++	// How long the page filler's lock is held in the parts of an allocation:
++	// 0 the whole hold, 1 getting an extent, 2 getting a block (heaps),
++	// 3 acquiring a new block (region), 4 reserving the pages.
++	shared ulong[24][8] gSegCount;
++	shared ulong[24][8] gSegTime;
++
++	void segHist(uint seg, ulong hnsecs) {
++		if (tIsGcThread) {
++			return;
++		}
++
++		import core.atomic : atomicOp;
++		uint b = 0;
++		while (b < 23 && (hnsecs >> b) > 1) {
++			b++;
++		}
++
++		atomicOp!"+="(gSegCount[seg][b], 1);
++		atomicOp!"+="(gSegTime[seg][b], hnsecs);
++	}
++
++	extern(C) void __sd_gc_seg_hist(ulong* count, ulong* time) {
++		foreach (h; 0 .. 8) {
++			foreach (b; 0 .. 24) {
++				count[h * 24 + b] = gSegCount[h][b];
++				time[h * 24 + b] = gSegTime[h][b] * 100;
++			}
++		}
++	}
++
++	extern(C) void __sd_gc_holder_hist(ulong* count, ulong* time) {
++		foreach (h; 0 .. 8) {
++			foreach (b; 0 .. 24) {
++				count[h * 24 + b] = gHolderCount[h][b];
++				time[h * 24 + b] = gHolderTime[h][b] * 100;
++			}
++		}
++	}
++
++	extern(C) void __sd_gc_lock_hist(ulong* count, ulong* time) {
++		foreach (k; 0 .. GcTimeKindCount) {
++			foreach (b; 0 .. 24) {
++				count[k * 24 + b] = gHistCount[k][b];
++				time[k * 24 + b] = gHistTime[k][b] * 100;
++			}
++		}
++	}
++}
++
+ void record(GcTimeKind kind, ulong hnsecs) {
+ 	if (tIsGcThread) {
+ 		return;
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 8e692f3..3fe8b2d 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -64,6 +64,9 @@ private:
+ 	import d.sync.mutex;
+ 	shared Mutex mutex;
+ 
++	// Who held the lock last, see `gHolderCount`.
++	version(Symgc_lock_hist) shared ubyte lastHolder;
++
+ 	/**
+ 	 * We separate dense from sparse allocations.
+ 	 *
+@@ -332,6 +335,11 @@ public:
+ 			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
+ 			mutex.lock();
+ 			lockTimer.end();
++			version(Symgc_lock_hist) {
++				import d.gc.time;
++				holderHist(lastHolder, getMonotonicTime() - lockTimer.start);
++				lastHolder = 1;
++			}
+ 		}
+ 
+ 		scope(exit) mutex.unlock();
+@@ -350,6 +358,11 @@ public:
+ 			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
+ 			mutex.lock();
+ 			lockTimer.end();
++			version(Symgc_lock_hist) {
++				import d.gc.time;
++				holderHist(lastHolder, getMonotonicTime() - lockTimer.start);
++				lastHolder = 1;
++			}
+ 		}
+ 
+ 		scope(exit) mutex.unlock();
+@@ -381,6 +394,7 @@ public:
+ 		// Free the pages.
+ 		mutex.lock();
+ 		scope(exit) mutex.unlock();
++		version(Symgc_lock_hist) lastHolder = 2;
+ 
+ 		foreach (e; extents) {
+ 			(cast(PageFiller*) &this).freePagesImpl(e);
+@@ -396,6 +410,7 @@ public:
+ 
+ 		mutex.lock();
+ 		scope(exit) mutex.unlock();
++		version(Symgc_lock_hist) lastHolder = 2;
+ 
+ 		(cast(PageFiller*) &this).freePagesImpl(e, n, pages);
+ 	}
+@@ -436,6 +451,7 @@ public:
+ 			{
+ 				mutex.lock();
+ 				scope(exit) mutex.unlockFairly();
++				version(Symgc_lock_hist) lastHolder = 3;
+ 
+ 				auto tStep = getMonotonicTime();
+ 				more = self.prepareStepImpl(emap);
+@@ -494,6 +510,7 @@ public:
+ 			{
+ 				mutex.lock();
+ 				scope(exit) mutex.unlockFairly();
++				version(Symgc_lock_hist) lastHolder = 4;
+ 
+ 				if (self.sweepPhase != SweepPhase.DenseFinalize
+ 					    && self.sweepPhase != SweepPhase.SparseFinalize) {
+@@ -541,6 +558,7 @@ public:
+ 			{
+ 				mutex.lock();
+ 				scope(exit) mutex.unlockFairly();
++				version(Symgc_lock_hist) lastHolder = 5;
+ 
+ 				auto tStep = getMonotonicTime();
+ 				more = self.sweepStep(emap, gcCycle, self.sweepStats);
+@@ -623,20 +641,38 @@ private:
+ 	                     ref bool dirty) {
+ 		assert(mutex.isHeld(), "Mutex not held!");
+ 
++		version(Symgc_lock_hist) {
++			import d.gc.time, d.gc.gctime;
++			auto t0 = getMonotonicTime();
++			scope(exit) segHist(0, getMonotonicTime() - t0);
++		}
++
+ 		auto e = getOrAllocateExtent();
+ 		if (unlikely(e is null)) {
+ 			return null;
+ 		}
+ 
++		version(Symgc_lock_hist) {
++			auto t1 = getMonotonicTime();
++			segHist(1, t1 - t0);
++		}
++
+ 		auto block = extractBlock(pages, mask, ec.dense);
+ 		if (unlikely(block is null)) {
+ 			unusedExtents.insert(e);
+ 			return null;
+ 		}
+ 
++		version(Symgc_lock_hist) {
++			auto t2 = getMonotonicTime();
++			segHist(2, t2 - t1);
++		}
++
+ 		auto n = block.reserve(pages, dirty);
+ 		registerBlock(block);
+ 
++		version(Symgc_lock_hist) segHist(4, getMonotonicTime() - t2);
++
+ 		usedPageCount.fetchAdd(pages);
+ 
+ 		auto ptr = block.address + n * PageSize;
+@@ -971,6 +1007,12 @@ private:
+ 		assert(mutex.isHeld(), "Mutex not held!");
+ 		assert(!Dense || extraBlocks == 0, "Huge allocations cannot be dense!");
+ 
++		version(Symgc_lock_hist) {
++			import d.gc.time, d.gc.gctime;
++			auto tAcq = getMonotonicTime();
++			scope(exit) segHist(3, getMonotonicTime() - tAcq);
++		}
++
+ 		if (!refillBlockDescriptors()) {
+ 			return null;
+ 		}
+@@ -1291,6 +1333,7 @@ private:
+ 
+ 		mutex.lock();
+ 		scope(exit) mutex.unlockFairly();
++		version(Symgc_lock_hist) lastHolder = 6;
+ 
+ 		if (self.sweepPhase == SweepPhase.Idle) {
+ 			return AssistResult.Done;
+diff --git a/source/d/gc/scanner.d b/source/d/gc/scanner.d
+index baf7a45..17851ca 100644
+--- a/source/d/gc/scanner.d
++++ b/source/d/gc/scanner.d
+@@ -411,6 +411,17 @@ public:
+ 			import d.gc.gctime;
+ 			markGcThread();
+ 
++			// Background work, like the sweeper: when it shares a core with a
++			// mutator, the mutator comes first. A nice value applies to the
++			// calling thread only on Linux.
++			version(linux) {
++				import core.stdc.stdlib : getenv, atoi;
++				import core.sys.posix.sys.resource : setpriority, PRIO_PROCESS;
++				if (auto env = getenv("SYMGC_MARK_NICE")) {
++					setpriority(PRIO_PROCESS, 0, atoi(env));
++				}
++			}
++
+ 			// Set a flag saying we should not be using our local thread cache.
+ 			// The only allocations/free we should be doing is to resize the work list.
+ 			// Note that scanning threads DO NOT have their stack or TLS scanned,
+-- 
+2.51.0
+

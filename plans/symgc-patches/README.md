@@ -673,3 +673,49 @@ fresh slabs per arena, refilled outside the lock); return swept slabs to the bin
 cheaper appends and associative arrays in druntime. A spare-slab stash was tried before (2026-10-09, morning) and
 dropped: no gain on the frame benchmark and 12% slower `alloc-1t`; the filler-lock numbers above are the case for
 trying a better one.
+
+### The filler-lock wait was mostly noise, and the sweeper is not its cause (2026-10-09, night)
+
+The table above is one run of each. Repeating it showed that the filler-lock wait with collections on is anywhere from
+69 to 496 ms per 30 s (over the runs made today), and 57 to 190 ms with collections off (5 runs). The "+241 ms, the sweeper holds the lock"
+reading was a high draw. The machine is a desktop with a browser and other programs running, so single runs vary a lot;
+what follows is from repeated, interleaved runs.
+
+**Lock-wait histograms by holder** (`-d-version=Symgc_lock_hist`, new in aaa_sim and `d/gc/gctime.d`): every wait for
+the page filler's lock is counted by power of two of 100 ns, and by who held the lock before.
+* About 95% of the ~930,000 waits per 30 s are under 200 ns, the cost of taking the lock.
+* The holder before a long wait (100 us or more) is an allocating thread in almost every case. Sweeper steps are
+  1-6 ms of long waits per run; allocations are 0.2-94 ms.
+* The time an allocation holds the lock is short: the whole of `allocRunImpl` is 100 us or more only 13-33 times per
+  run, 6-11 ms in total. In a bad run (729 ms of waiting, about 320 waits of 0.4-1.6 ms) the holds were not longer. So
+  the delay is in getting the lock, not in the work done under it: the mutex's waiters call `sched_yield` up to 40
+  times and then park, and a parked waiter has to be woken by the holder's futex wake. When all 16 hardware threads are
+  busy (8 mark threads, 6 jobs, main, the sweeper, other programs) both cost milliseconds.
+
+**Mark threads** (city 500k, 30 s, interleaved, default is a quarter of the cores, 4 here):
+
+| mark threads | p99.9 | worst frame | frames over 16 ms |
+|---|---|---|---|
+| 1 | 506-579 ms | 562-760 ms | 10-15 per run |
+| 2 | 10.6-13.7 ms | 12-17 ms | 0-1 |
+| 4 (default) | 7.5-13.1 ms | 7.7-17 ms | 0-1 |
+| 6 | 7.5-40 ms | 7.9-722 ms | 0 in 2 runs, 73 in one |
+| 8 | 7.0-33.7 ms | 7.5-164 ms | 0 in most, 32 and 7 in two |
+
+One mark thread cannot keep up with the 500k heap and is not viable. Two are slower than four. Six and eight were
+sometimes clean and sometimes had a catastrophic run; the catastrophic runs did not come back in a later batch of 18
+(4 and 8 threads, each niced 0, 10 and 19). I cannot tell whether they were the oversubscription or other load on
+the machine.
+
+**Nice for the mark workers.** Only the sweeper was niced (10); the mark workers ran at nice 0. `SYMGC_MARK_NICE`
+(default: unchanged) sets it. Nice 0, 10 and 19 with 4 and 8 mark threads, 3 interleaved runs each: p99.9 7.0-14 ms
+for all, no order between them. No effect that the noise lets me see, so the default stays.
+
+**What this means for the plan.** Of the three candidates, the first (a fresh-slab reserve to keep job threads off the
+filler lock) does not have the case I gave it. Waits on that lock are mostly the cost of taking it, the rare long ones
+follow allocating threads and a saturated machine rather than the sweeper, and the whole lock-wait time is 70-250 ms
+per 30 s across seven threads, 0.04-0.14 ms per frame summed. On the main thread the GC time is about 0.25 ms of a
+4 ms frame (alloc 230 ms, collect 14 ms, pause 1 ms, locks 30-60 ms over 1,800 frames). The p99.9 of 7-9 ms is close
+to the collections-off run's (6-8 ms, with its own page-fault stalls at a 13 GB heap), so the tail is mostly the game's.
+What is left on the collector side is small; what is left in the frame is the game's own work and the allocation
+pattern of natural code (appends and associative arrays), which is candidate 3.

@@ -570,6 +570,11 @@ struct City {
 version(Symgc_druntime_hooks) {
 	extern(C) void __sd_gc_time_thread(ulong* dst);
 	extern(C) void __sd_gc_time_total(ulong* dst);
+	version(Symgc_lock_hist) {
+		extern(C) void __sd_gc_lock_hist(ulong* count, ulong* time);
+		extern(C) void __sd_gc_holder_hist(ulong* count, ulong* time);
+		extern(C) void __sd_gc_seg_hist(ulong* count, ulong* time);
+	}
 	enum haveGcTime = true;
 } else {
 	enum haveGcTime = false;
@@ -690,6 +695,53 @@ void main(string[] args) {
 		printf("slowest frames (frame us / gc_main us / gc_all us):");
 		foreach (i; idx[0 .. 10]) printf(" %lld/%lld/%lld", ft[i], gcMain[i], gcAll[i]);
 		printf("\n");
+
+		// A build with -d-version=Symgc_lock_hist counts every wait of each
+		// kind by power of two of 100 ns: how many there were, and their time.
+		version(Symgc_lock_hist) {
+			ulong[24 * GcClock.kinds] hc, ht;
+			__sd_gc_lock_hist(hc.ptr, ht.ptr);
+			foreach (k; 0 .. GcClock.kinds) {
+				ulong n, t;
+				foreach (b; 0 .. 24) { n += hc[k * 24 + b]; t += ht[k * 24 + b]; }
+				printf("waits %s: %llu, %.1f ms; by 2^b x 100ns (count/ms):", kindNames[k].ptr, n, t / 1e6);
+				foreach (b; 0 .. 24)
+					if (hc[k * 24 + b]) printf(" %d:%llu/%.1f", b, hc[k * 24 + b], ht[k * 24 + b] / 1e6);
+				printf("\n");
+			}
+
+			// How long an allocation holds the page filler's lock, by part.
+			{
+				ulong[24 * 8] sc, st;
+				__sd_gc_seg_hist(sc.ptr, st.ptr);
+				static immutable segNames = ["whole", "extent", "block", "newblock", "reserve"];
+				foreach (s; 0 .. 5) {
+					ulong n, t, longN, longT;
+					foreach (b; 0 .. 24) {
+						n += sc[s * 24 + b]; t += st[s * 24 + b];
+						if (b >= 10) { longN += sc[s * 24 + b]; longT += st[s * 24 + b]; }
+					}
+					printf("filler hold %-8s: %llu, %.1f ms; >=100us: %llu, %.1f ms;", segNames[s].ptr, n, t / 1e6, longN, longT / 1e6);
+					foreach (b; 8 .. 24)
+						if (sc[s * 24 + b]) printf(" %d:%llu", b, sc[s * 24 + b]);
+					printf("\n");
+				}
+			}
+
+			// The page filler's lock waits by who held the lock before.
+			ulong[24 * 8] oc, ot;
+			__sd_gc_holder_hist(oc.ptr, ot.ptr);
+			static immutable holderNames = ["other", "alloc", "free", "prepare", "finalize", "sweep", "assist", "-"];
+			foreach (h; 0 .. 7) {
+				ulong n, t, longN, longT;
+				foreach (b; 0 .. 24) {
+					n += oc[h * 24 + b]; t += ot[h * 24 + b];
+					if (b >= 10) { longN += oc[h * 24 + b]; longT += ot[h * 24 + b]; }
+				}
+				printf("filler waits after %-8s: %llu, %.1f ms; of those >=100us: %llu, %.1f ms\n",
+					holderNames[h].ptr, n, t / 1e6, longN, longT / 1e6);
+			}
+		}
 	}
 	{
 		import std.file : readText;
