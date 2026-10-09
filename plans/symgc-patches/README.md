@@ -401,3 +401,20 @@ with one mark thread had a 12 ms frame: a long mark with a thread starved).
 About 99.8% of symgc's frames are under 1 ms in this workload, and the stock
 collector's frame is 3x slower at the median because the four threads
 contend on its single lock.
+
+### Lock holds that hurt other threads (patch 0018) and the watchdog
+
+`plans/bench/core_bench/watchdog.c`: a watcher thread notices that a frame has run
+longer than a threshold and signals every thread of the process; the handler records a
+`backtrace()`. Resolved with `addr2line`, it shows what each thread was doing during the
+slow frame, which `perf` (not installed here) would have shown. Per-frame
+`getrusage(RUSAGE_THREAD)` counters added the page faults and the context switches.
+
+Findings in the multi-threaded game: slow frames had 1-3 faults (not faults), 6-14
+voluntary context switches (waits on a lock), and in the samples the main thread was in
+`Mutex.lockSlow` under `PageFiller.allocRun` while the sweeper was in `sweepFinalizers`.
+The finalize stage of patch 0016 ran with no pacing and no yield to waiters, so the
+threads that needed a slab waited for it. It is paced now. Also, returning pages to the
+OS (`madvise`) was one call per block under the same lock: 0.3-3 ms for 2 MiB; it is a
+chunk of 16 pages per step now. The slow frames with many context switches are gone;
+frames of 2-3 ms remain in some runs (single events with 0-1 switches, cause not found).

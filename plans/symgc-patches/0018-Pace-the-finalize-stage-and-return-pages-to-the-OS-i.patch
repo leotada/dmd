@@ -1,0 +1,232 @@
+From 858abd31971b3deac2747c3bceb7c64599c4f7de Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 01:35:20 -0300
+Subject: [PATCH 18/18] Pace the finalize stage and return pages to the OS in
+ small chunks
+
+Two ways the sweeper held the lock of the page filler for too long:
+
+- The finalize stage added by the cross-arena fix ran flat out, with no pacing and
+  no yield to waiters, so the threads that needed a slab waited for most of the pass
+  (found by sampling all threads when a frame ran long: the main thread sat in
+  Mutex.lockSlow under PageFiller.allocRun while the sweeper was in sweepFinalizers).
+- Returning the free pages of a block to the OS was one madvise per block under the
+  lock (0.3 to 3 ms for 2 MiB, 116 calls over 300 us in a 120 s run). It is now a chunk
+  of 16 pages per step with the lock released in between.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/block.d | 42 ++++++++++++++++++++++
+ source/d/gc/page.d  | 87 +++++++++++++++++++++++++++++++++------------
+ 2 files changed, 107 insertions(+), 22 deletions(-)
+
+diff --git a/source/d/gc/block.d b/source/d/gc/block.d
+index a57faa5..4bea286 100644
+--- a/source/d/gc/block.d
++++ b/source/d/gc/block.d
+@@ -389,6 +389,48 @@ public:
+ 		return n < PurgePageThresold ? 0 : n;
+ 	}
+ 
++	/**
++	 * Purge up to `maxPages` of the pages that are free and dirty, and say how
++	 * many were. The caller holds the lock of the filler, and a madvise on a
++	 * whole block takes up to a few milliseconds (measured: 0.3 to 3 ms for 2
++	 * MiB), which stops every thread that wants a slab or a large allocation.
++	 * Bounded chunks keep each hold short; the caller comes back for the rest.
++	 */
++	uint minimizeChunk(uint maxPages) {
++		auto toPurge = dirtyPages;
++		foreach (i, ref bits; toPurge.rawContent) {
++			bits &= ~allocatedPages.rawContent[i];
++		}
++
++		auto base = address;
++		uint purged = 0;
++
++		uint i = 0;
++		while (i < PagesInBlock && purged < maxPages) {
++			i = toPurge.findSet(i);
++			if (i >= PagesInBlock) {
++				break;
++			}
++
++			auto first = i;
++			i = toPurge.findClear(i);
++
++			auto n = i - first;
++			if (n > maxPages - purged) {
++				n = maxPages - purged;
++				i = first + n;
++			}
++
++			import d.gc.memmap;
++			pages_purge(base + first * PageSize, n * PageSize);
++			dirtyPages.clearRange(first, n);
++			purged += n;
++		}
++
++		dirtyCount -= purged;
++		return purged;
++	}
++
+ 	uint minimize() {
+ 		// If there aren't enough pages to purge, do nothing.
+ 		auto n = dirtyCount - usedCount;
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 4f61dfe..55be9d7 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -151,6 +151,10 @@ private:
+ 	// to the OS, see `minimizeBlock`.
+ 	size_t sweepRetain;
+ 
++	// The block whose free pages are being returned to the OS, a chunk per
++	// step, see `minimizeStepImpl`.
++	BlockDescriptor* minimizeCur;
++
+ 	// A step holds the lock for about this long (time unit is 100 ns).
+ 	enum SweepStepBudget = 100;
+ 
+@@ -468,16 +472,33 @@ public:
+ 	void sweepFinalizers(ref CachedExtentMap emap, ubyte gcCycle) shared {
+ 		auto self = cast(PageFiller*) &this;
+ 
++		// Paced and polite like the rest of the sweep: flat out, with the
++		// lock changing hands only when a waiter gets lucky, the mutators
++		// that need a slab wait for most of the pass.
++		ulong owed = 0;
+ 		while (true) {
+-			mutex.lock();
+-			scope(exit) mutex.unlockFairly();
++			ulong spent;
++
++			{
++				mutex.lock();
++				scope(exit) mutex.unlockFairly();
++
++				if (self.sweepPhase != SweepPhase.DenseFinalize
++					    && self.sweepPhase != SweepPhase.SparseFinalize) {
++					return;
++				}
+ 
+-			if (self.sweepPhase != SweepPhase.DenseFinalize
+-				    && self.sweepPhase != SweepPhase.SparseFinalize) {
+-				return;
++				auto tStep = getMonotonicTime();
++				self.sweepStep(emap, gcCycle, self.sweepStats);
++				spent = getMonotonicTime() - tStep;
++			}
++
++			import symgc.thread : sched_yield;
++			for (uint i = 0; mutex.hasContenders && i < 64; i++) {
++				sched_yield();
+ 			}
+ 
+-			self.sweepStep(emap, gcCycle, self.sweepStats);
++			owed = paceSweeper(owed, spent);
+ 		}
+ 	}
+ 
+@@ -1276,18 +1297,40 @@ private:
+ 	 * for the page faults when it uses the pages again, every cycle: in the
+ 	 * `alloc` benchmark it is 30% of the time.
+ 	 */
+-	void minimizeBlock(BlockDescriptor* block) {
+-		auto n = block.purgeablePages;
+-		if (n == 0) {
+-			return;
++	enum MinimizeChunkPages = 16;
++
++	/**
++	 * One step of the minimize pass. Returns false when no block is left.
++	 * The pages of a block are returned a chunk per step, with the lock
++	 * released in between, see `BlockDescriptor.minimizeChunk`.
++	 */
++	bool minimizeStepImpl(ushort serial) {
++		assert(mutex.isHeld(), "Mutex not held!");
++
++		if (minimizeCur is null) {
++			auto block = nextSweepBlock(serial);
++			if (block is null) {
++				return false;
++			}
++
++			auto n = block.purgeablePages;
++			if (n == 0) {
++				return true;
++			}
++
++			if (n <= sweepRetain) {
++				sweepRetain -= n;
++				return true;
++			}
++
++			minimizeCur = block;
+ 		}
+ 
+-		if (n <= sweepRetain) {
+-			sweepRetain -= n;
+-			return;
++		if (minimizeCur.minimizeChunk(MinimizeChunkPages) == 0) {
++			minimizeCur = null;
+ 		}
+ 
+-		block.minimize();
++		return true;
+ 	}
+ 
+ 	/**
+@@ -1407,6 +1450,10 @@ private:
+ 			prepareCurrent = null;
+ 		}
+ 
++		if (minimizeCur is block) {
++			minimizeCur = null;
++		}
++
+ 		// A block that leaves the ring is empty, or about to be reused for a
+ 		// single huge allocation: nothing is left to sweep in it.
+ 		if (sweepCurrent is block) {
+@@ -1497,15 +1544,13 @@ private:
+ 					return true;
+ 
+ 				case DenseMinimize:
+-					auto b = nextSweepBlock(minimizeSerial);
+-					if (b is null) {
++					auto tM0 = getMonotonicTime();
++					if (!minimizeStepImpl(minimizeSerial)) {
+ 						sweepPhase = SparseScan;
+ 						sweepNext = sparseBlocks.first;
+ 						continue;
+ 					}
+ 
+-					auto tM0 = getMonotonicTime();
+-					minimizeBlock(b);
+ 					gSweepT[3] += getMonotonicTime() - tM0;
+ 					return true;
+ 
+@@ -1528,8 +1573,8 @@ private:
+ 					return true;
+ 
+ 				case SparseMinimize:
+-					auto b = nextSweepBlock(minimizeSerial);
+-					if (b is null) {
++					auto tM0 = getMonotonicTime();
++					if (!minimizeStepImpl(minimizeSerial)) {
+ 						sweepPhase = Idle;
+ 						sweepNext = null;
+ 
+@@ -1549,8 +1594,6 @@ private:
+ 						return false;
+ 					}
+ 
+-					auto tM0 = getMonotonicTime();
+-					minimizeBlock(b);
+ 					gSweepT[6] += getMonotonicTime() - tM0;
+ 					return true;
+ 			}
+-- 
+2.51.0
+
