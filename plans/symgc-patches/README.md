@@ -448,3 +448,21 @@ What would remove it, not done: a lock-free stash of spare empty slabs per bin (
 collector thread, retagged as born at each epoch so the sweep does not free them), so the
 mutator takes a slab with an atomic pop instead of the filler lock. Large allocations (the 1 to 8
 MiB assets) still need the lock.
+
+### OPEN: a rare hang in the multi-threaded game (found 2026-10-09)
+
+About 1 in 10 runs of `game_mt` of 120-180 s (LDC -O3, card barrier, 2 GiB), the process stops
+making progress with one thread at 100% CPU and the others in futex waits (seen 3 times: in a
+build with the stack watchdog, in `mt_cards`, and with the CPU sampler of `prof2.c`). The
+sampler's last dump of the hung process puts 98% of the spinning thread's samples in
+`d.gc.heap.Heap!(BlockDescriptor, priorityBlockCmp)` (`heap.d` lines 328, 392, 493: the pairing
+heap's pairwise merge, `Link.isNull`), i.e. a loop in a heap of block descriptors that never ends,
+which means a corrupted (cyclic) block heap. Not reproduced under gdb (24 runs), with the verifier and
+asserts on (13 runs of 30 to 120 s), with a large-allocation stress (`huge_stress.d`, 10 runs of 60 s),
+or in 12 runs with a backtrace sampler. The earlier battery (the verify workloads, `alloc 8`, Phobos
+stress, `mark_race`, `finalizer_order`) never hung. Candidates: nothing I added changes the
+`bits` that order a block in its heap; the unlocked window in `releaseBlock`, or a path that
+changes a registered block without `unregisterBlock`/`registerBlock`, may be older than this
+session. A bisect on the fork (`755369e`, before the cross-arena finalizers, the pre-warm, the pacing
+and the chunked purge) is running. Until it is understood, treat long multi-threaded runs of this build as
+not proven.
