@@ -506,3 +506,14 @@ Multi-threaded game, 2 GiB, 60 s (3600 frames), 3 runs unpinned and 3 pinned to 
 (`taskset -c 0,2,...,14`): p99.9 0.78-0.97 ms in all six (under 1 ms), p99 0.47-0.72 ms, worst 0.9-2.2 ms. Pinning
 changes nothing, so the run-to-run spread of the p99 (0.35 vs 0.75 ms) is not SMT sharing. p99.9 of a 3600-frame run
 is 3 or 4 frames, so it moves with a handful of events; over 7200 frames it was 0.77-1.45 ms.
+
+### A real game of the owner's: mini-dungeon-crawler (raylib-d 5.5.3), integration only
+
+`~/Projetos/Jogos/mini-dungeon-crawler` (849 lines, ECS with classes, raylib through D bindings) built with the
+LDC card-barrier toolchain and symgc (raylib-d's sources compiled in, `-L-lraylib`) and run for 1500 frames, three
+times, under `Xvfb` (a virtual display, nothing on the desktop; a copy of the source with a frame counter added to
+`Game.run`). It builds, runs, and closes the window cleanly every time, with C code (raylib) holding D pointers and
+writing to D memory, which the card barrier cannot see. Frame times there (33 ms median, 40 to 54 ms p99) are
+Mesa's software rendering and `SetTargetFPS(60)`, not the collector, and the game allocates almost nothing per
+frame, so it says nothing about GC latency. Other games found there (`project-space`, `physics-raylib`,
+`lunar-lander-dgame`, `improved-palm-tree`) are of the same kind: small, window-bound, a handful of `new`.
