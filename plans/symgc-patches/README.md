@@ -468,3 +468,26 @@ A lock-free stash of spare slabs for the mutators, meant to remove the 1 to 3 ms
 measured and dropped: no change in the slow frames, and `alloc-1t` -12% in the gate.
 
 not proven.
+
+## Result against the agreed target (2026-10-09)
+
+Target chosen by the owner: p99.9 under 1 ms and no frame over 16 ms, at 2 GiB and 8 GiB of live data,
+on the benchmarks written for this work (no real game exists to test). LDC -O3, card barrier, concurrent
+mark, final fork (patch 0019). Frame work is the game's own cost plus the collector's.
+
+| workload | live | p50 | p99 | p99.9 | worst | frames >16 ms |
+|---|---|---|---|---|---|---|
+| frame loop, 5000 allocs/frame | 2 GiB | 0.37 ms | 0.73 | 1.15 | 1.18 | 0 |
+| frame loop | 8 GiB | 0.66 | 0.86 | 1.03 | 1.05 | 0 |
+| bullet hell, 40k bullets/s (2 runs) | 2 GiB | 0.72-0.73 | 1.21-1.31 | 1.43-1.56 | 1.76-1.96 | 0 |
+| multi-threaded game, 2 jobs + streaming (20 runs) | 2 GiB | 0.20-0.27 | 0.37-0.82 | 0.77-1.45 | 1.2-6.2 | 0 |
+| multi-threaded game (7 runs) | 8 GiB | 0.16-0.21 | 0.28-0.35 | 0.36-0.50 | 0.57-3.3 | 0 |
+| multi-threaded game (1 untraced run) | 8 GiB | 0.18 | 0.32 | 1.26 | **81 ms** | 1 |
+
+Met: no frame over 16 ms in every run but one; p99.9 under 1 ms in the 8 GiB multi-threaded game and
+borderline (1.03-1.15 ms) in the frame loop. Not met: p99.9 of the 2 GiB multi-threaded game (0.77 to 1.45
+ms depending on the run) and of the bullet hell (1.4 to 1.6 ms; its median is 0.72 ms because the game
+itself is heavy). Open: the one 81 ms frame at 8 GiB in an untraced run, not reproduced in 7 traced runs of
+the same game (max 3.3 ms); the cause is not known (the machine had the 8 GiB level and its page cache
+resident; an OS stall is possible but was not shown). The stock GC under LDC in the same games: p99.9 up to
+30.8 ms, worst 61 to 157 ms, 2 to 9 frames over 16 ms.
