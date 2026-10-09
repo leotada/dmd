@@ -295,3 +295,13 @@ shrinking (fewer re-arms, so fewer fault groups). The remark then rescans ~1500
 hot pages and its pause went to 1.4-8.2 ms (worst game frame 11.6 ms), worse
 than the faults. With kernel tracking the choice is faults in the game thread
 or pause in the remark; both cost about 2-8 ms for this game's hot set.
+
+### Where the game thread's time goes (bullet hell, 30 s, SIGPROF on the game thread only)
+
+~75% is the game's own code (the `filter`/`array` rebuilds, the per-bullet
+update, `Appender.put`), ~21% is in code `nm` cannot name (libc memset/memcpy
+or PLT stubs, `data_start`), and only ~12% is in the GC (`atomicLoad` 5%,
+`initializeMetadata` 4%, the rest under 1%). The 20-40% gap to the stock GC
+in typical frames is therefore not the allocation path; cache locality of
+where the slots come from (symgc's paced sweep keeps more memory in play) and
+the write-protect faults after each arm are the suspects. Not measured yet.
