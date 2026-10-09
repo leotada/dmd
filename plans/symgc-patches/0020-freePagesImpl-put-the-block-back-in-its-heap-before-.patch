@@ -1,0 +1,54 @@
+From ffafed2ef4bcd9c73138842a0c54280d800fab91 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 07:08:14 -0300
+Subject: [PATCH 20/20] freePagesImpl: put the block back in its heap before
+ the lock is dropped for the region
+
+The block was out of every heap while the lock was released to give the leading
+region of a huge extent back. A second thread freeing or growing another extent
+of the same block called unregisterBlock on a block that was not in a heap, which
+unlinks a node that is not linked and leaves a cycle in the pairing heap: the
+pairwise merge then never ended (a thread at 100% CPU, seen in the multi-threaded
+game about once in ten long runs). huge_free_race.d: 5 of 6 runs hung before,
+none of 76 after.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/page.d | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 55be9d7..41f57a3 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -693,6 +693,17 @@ private:
+ 		if (block.empty) {
+ 			releaseBlock(e, block);
+ 		} else {
++			/**
++			 * The block goes back in its heap before the lock is released
++			 * for the region. With the block out of every heap and the lock
++			 * dropped, another thread that frees (or grows) an extent of
++			 * the same block calls `unregisterBlock` on a block that is
++			 * not in a heap, which unlinks a node that is not linked and
++			 * leaves a cycle in the heap: the hang seen in the
++			 * multi-threaded game, in the pairwise merge of the heap.
++			 */
++			registerBlock(block);
++
+ 			// If the extent is larger than a block,
+ 			// we need to release the extra region.
+ 			if (e.npages > PagesInBlock) {
+@@ -701,8 +712,6 @@ private:
+ 
+ 				regionAllocator.release(e.address, e.npages / PagesInBlock);
+ 			}
+-
+-			registerBlock(block);
+ 		}
+ 
+ 		usedPageCount.fetchSub(e.npages);
+-- 
+2.51.0
+

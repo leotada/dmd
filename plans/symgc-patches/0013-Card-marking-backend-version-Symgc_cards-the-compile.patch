@@ -1,7 +1,7 @@
 From 3b80bc8d36096b23cb27eeede78b2399980c1f80 Mon Sep 17 00:00:00 2001
 From: Leonardo Tada Antunes <leonardotada@gmail.com>
 Date: Thu, 8 Oct 2026 22:54:14 -0300
-Subject: [PATCH 13/19] Card marking backend (version Symgc_cards): the
+Subject: [PATCH 13/20] Card marking backend (version Symgc_cards): the
  compiler says what the program wrote
 
 d.gc.cards holds the card table (one byte per 512 bytes of address space,

@@ -1,7 +1,7 @@
 From 755369edbfe848c78f64fbb656a1adfa7f9fe389 Mon Sep 17 00:00:00 2001
 From: Leonardo Tada Antunes <leonardotada@gmail.com>
 Date: Thu, 8 Oct 2026 23:19:28 -0300
-Subject: [PATCH 15/19] Card tracker: summary level, one byte per 64 KiB
+Subject: [PATCH 15/20] Card tracker: summary level, one byte per 64 KiB
 
 The remark reads the summary and only the cards of the regions it marks, not the
 whole table: remark at 8 GiB live 0.55-0.85 -> 0.21-0.34 ms.

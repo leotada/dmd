@@ -449,20 +449,22 @@ collector thread, retagged as born at each epoch so the sweep does not free them
 mutator takes a slab with an atomic pop instead of the filler lock. Large allocations (the 1 to 8
 MiB assets) still need the lock.
 
-### OPEN: a rare hang in the multi-threaded game (found 2026-10-09)
+### FIXED (patch 0019): a rare hang in the multi-threaded game
 
-About 1 in 10 runs of `game_mt` of 120-180 s (LDC -O3, card barrier, 2 GiB), the process stops
-making progress with one thread at 100% CPU and the others in futex waits (seen 3 times: in a
-build with the stack watchdog, in `mt_cards`, and with the CPU sampler of `prof2.c`). The
-sampler's last dump of the hung process puts 98% of the spinning thread's samples in
-`d.gc.heap.Heap!(BlockDescriptor, priorityBlockCmp)` (`heap.d` lines 328, 392, 493: the pairing
-heap's pairwise merge, `Link.isNull`), i.e. a loop in a heap of block descriptors that never ends,
-which means a corrupted (cyclic) block heap. Not reproduced under gdb (24 runs), with the verifier and
-asserts on (13 runs of 30 to 120 s), with a large-allocation stress (`huge_stress.d`, 10 runs of 60 s),
-or in 12 runs with a backtrace sampler. The earlier battery (the verify workloads, `alloc 8`, Phobos
-stress, `mark_race`, `finalizer_order`) never hung. Candidates: nothing I added changes the
-`bits` that order a block in its heap; the unlocked window in `releaseBlock`, or a path that
-changes a registered block without `unregisterBlock`/`registerBlock`, may be older than this
-session. A bisect on the fork (`755369e`, before the cross-arena finalizers, the pre-warm, the pacing
-and the chunked purge) is running. Until it is understood, treat long multi-threaded runs of this build as
+About 1 in 10 runs of `game_mt` of 120-180 s hung with one thread at 100% CPU in the pairing heap of
+block descriptors (the pairwise merge, `heap.d` 328/392/493: a cyclic heap). Cause, an old window in
+`PageFiller.freePagesImpl`: it unregistered the block, released the pages, and then, for an extent larger
+than a block, dropped the page filler lock to give the leading region back while the block was in no heap.
+A second thread freeing (or growing) another extent of the same block called `unregisterBlock` on a block
+that was not in a heap, which unlinks a node that is not linked and leaves a cycle. The block is now put
+back (`registerBlock`) before the lock is dropped. `plans/bench/core_bench/huge_free_race.d` (two threads
+freeing 2 to 8 MB extents, two freeing 40 KB to 1 MB extents that land in the same block) hung 5 times in 6
+before the fix, with the fork at `755369e` as well, and 0 times in 76 runs after (one run of the 77 failed
+without a trace while the machine was busy; not reproduced). The same stack of the spinning thread was seen
+in the three hangs of the game. The rest of this section is the investigation record kept for the
+history: the sampler `prof2.c`/`prof3.c` dumps the CPU samples of a hung process on a signal.
+
+A lock-free stash of spare slabs for the mutators, meant to remove the 1 to 3 ms frames, was built and
+measured and dropped: no change in the slow frames, and `alloc-1t` -12% in the gate.
+
 not proven.
