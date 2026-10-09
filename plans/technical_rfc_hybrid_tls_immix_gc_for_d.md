@@ -1157,6 +1157,40 @@ Next, in order, all on the 500k city:
 4. **Cheaper natural code** (item 4): profile the 500k city with collections off for associative-array and append
    costs in druntime.
 
+#### GC time per frame, and the slow-path split (patches 0022 and 0023, 2026-10-09)
+
+Item 1 above is done. Every thread counts the time it loses to memory management, and the game reads the counters
+before and after each frame (`__sd_gc_time_thread` and `__sd_gc_time_total`; the collector's own threads are not
+counted, because they are not game time). Six kinds: allocator slow path, starting or helping a collection, stopped
+by the collector, waiting for a bin's lock, getting a fresh slab, waiting for the page filler's lock.
+
+City at 500k, 30 s, all threads summed:
+
+| | collections on | collections off | added by collection |
+|---|---|---|---|
+| alloc (rest of the slow path) | 1,585 ms | 1,470 ms | +115 |
+| fresh slab | 585 ms | 423 ms | +162 |
+| filler lock wait | 343 ms | 102 ms | **+241** |
+| bin lock wait | 267 ms | 194 ms | +73 |
+| collect (start, assist) | 129 ms | 3 ms | +126 |
+| pause | 16 ms | 0 ms | +16 |
+| total | 2,925 ms | 2,192 ms | +733 ms |
+
+1. Collection adds about 0.4 ms per frame, summed over the threads. The largest piece is the wait for the page filler's
+   lock: the sweeper holds it while it works. Second is fresh slabs: each collection empties the bins, and job threads
+   take new slabs until the sweep returns the old ones.
+2. The allocator's slow path costs about 1.2 ms per frame summed over the threads even with no collection. That is
+   allocator design, not the collector.
+3. The CPU profile: the game's pathfinding 43%, the mark threads 11.7% (on other cores), associative arrays about 10%,
+   the allocator about 11% (half of it `~=` appends).
+4. The slow frames come from job threads that are delayed, which delays the frame's join.
+
+Next, in order: (a) keep job threads off the filler lock while the sweeper works, with a small reserve of fresh slabs
+per arena refilled outside the lock (a simpler spare-slab stash was tried and dropped: no gain, `alloc-1t` 12% slower);
+(b) return swept slabs to the bins sooner after an epoch starts; (c) cheaper appends and associative arrays in
+druntime; (d) the collector's CPU against the job threads (6 and 12 jobs), the barrier's throughput cost, the rare
+lock-holder stalls, and the Phobos/druntime/compiler test suites under symgc.
+
 **Total to the 1 ms target at 2 GiB (end of step 5):** about 17–27 pw. **To the full target at 8 GiB with LDC speed (end of step 7):** about 28–46 pw.
 
 **Decisions recorded:** build on symgc, fork allowed; Immix rejected; Track B shelved; the metric is the worst frame, not p99.
