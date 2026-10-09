@@ -289,3 +289,9 @@ the ioctls failed with ENOENT. Not tried: not re-arming the pages that were
 hot in the last round (no faults, but they are rescanned in the remark, so the
 pause grows to ~1 ms for a 1500-page hot set). A barrier (LDC) has neither cost:
 a store of a pointer costs a few ns and nothing faults.
+
+Also tried and reverted: stopping the dirty rounds as soon as the hot set stops
+shrinking (fewer re-arms, so fewer fault groups). The remark then rescans ~1500
+hot pages and its pause went to 1.4-8.2 ms (worst game frame 11.6 ms), worse
+than the faults. With kernel tracking the choice is faults in the game thread
+or pause in the remark; both cost about 2-8 ms for this game's hot set.
