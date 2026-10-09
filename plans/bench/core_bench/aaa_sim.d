@@ -4,7 +4,7 @@
 // GC.collect. 60 fps, a main thread plus a job pool (fork-join per frame, like a
 // real engine's job system), and a streaming thread where the genre has one.
 //
-//   aaa_sim <rts|openworld|city> [seconds=60] [assetMiB=2048] [jobs=6] [nogc=0]
+//   aaa_sim <rts|openworld|city> [seconds=60] [assetMiB=2048] [jobs=6] [nogc=0] [population=100000]
 //
 //   rts        4,000 units in two armies on a 256x256 grid: spatial hash rebuilt per
 //              frame, target search, A* paths on the job pool, projectiles, an AI
@@ -427,7 +427,7 @@ struct OpenWorld {
 int abs(int x) { return x < 0 ? -x : x; }
 
 // ---------------------------------------------------------------- city
-enum R = 200;
+__gshared int R = 200;   // road grid side; grows with the population
 
 class RoadNode { int id; V2 pos; RoadNode[] edges; }
 class Building { int id, kind; V2 pos; RoadNode access; float[6] stock; Citizen[] occupants; string name; }
@@ -462,7 +462,11 @@ struct City {
 		return c;
 	}
 
+	size_t population = 100_000;
+
 	void init() {
+		// 100k citizens: a 200x200 road grid and 15,000 buildings; scaled with the population
+		R = max(200, cast(int) sqrt(population * 0.4));
 		roads = new RoadNode[](R * R);
 		foreach (i, ref n; roads) { n = new RoadNode; n.id = cast(int) i; n.pos = V2(i % R, i / R); }
 		foreach (i, n; roads) {
@@ -470,7 +474,7 @@ struct City {
 			if (x + 1 < R) { n.edges ~= roads[i + 1]; roads[i + 1].edges ~= n; }
 			if (y + 1 < R) { n.edges ~= roads[i + R]; roads[i + R].edges ~= n; }
 		}
-		foreach (i; 0 .. 15_000) {
+		foreach (int i; 0 .. cast(int) (population * 15 / 100)) {
 			auto b = new Building;
 			b.id = i;
 			b.kind = i % 4;
@@ -479,7 +483,7 @@ struct City {
 			b.name = format("%s #%d", ["House", "Shop", "Factory", "Office"][i % 4], i);
 			buildings ~= b;
 		}
-		foreach (i; 0 .. 100_000) citizens ~= born();
+		foreach (i; 0 .. population) citizens ~= born();
 	}
 
 	static RoadNode[] route(RoadNode from, RoadNode to) {
@@ -572,6 +576,7 @@ void main(string[] args) {
 	auto assetMiB = args.length > 3 ? args[3].to!size_t : 2048;
 	auto jobs = args.length > 4 ? args[4].to!uint : 6;
 	auto nogc = args.length > 5 ? args[5].to!int : 0;
+	auto population = args.length > 6 ? args[6].to!size_t : 100_000;   // city only
 
 	pool = new TaskPool(jobs);
 	pool.isDaemon = true;
@@ -584,7 +589,7 @@ void main(string[] args) {
 	final switch (mode) {
 		case "rts": rts.init(); break;
 		case "openworld": ow.init(); streamer = new Thread(&streamThread); streamer.start(); break;
-		case "city": city.init(); break;
+		case "city": city.population = population; city.init(); break;
 	}
 
 	if (nogc) GC.disable();
@@ -621,4 +626,14 @@ void main(string[] args) {
 	printf("frame_p50_us=%lld p99=%lld p999=%lld max=%lld over1ms=%lld over2ms=%lld over5ms=%lld over16ms=%lld frames=%lld\n",
 		sorted[total / 2], sorted[total * 99 / 100], sorted[total * 999 / 1000], sorted[$ - 1],
 		over(1000), over(2000), over(5000), over(16000), cast(long) total);
+	{
+		import std.file : readText;
+		import std.string : splitLines, startsWith, strip;
+		string rss, hwm;
+		foreach (l; readText("/proc/self/status").splitLines) {
+			if (l.startsWith("VmRSS:")) rss = l[6 .. $].strip;
+			if (l.startsWith("VmHWM:")) hwm = l[6 .. $].strip;
+		}
+		printf("rss=%.*s peak_rss=%.*s\n", cast(int) rss.length, rss.ptr, cast(int) hwm.length, hwm.ptr);
+	}
 }

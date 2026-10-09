@@ -1,0 +1,171 @@
+From 620c86f8172aa9a4af8d225ba9f6df41538a6d27 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 14:11:57 -0300
+Subject: [PATCH] Concurrent mark: copy the roots in the start pause
+
+The start pause listed the stacks and TLS blocks and the mark read them after
+the world restarted. A thread that exits in between unmaps its stack, and
+glibc keeps static TLS in that mapping: the mark threads then fault
+(SIGSEGV in Worker.scanImpl). Seen in a city simulation at 1M citizens (2 of
+19 runs) and every few runs of a test that starts and joins short-lived
+threads during concurrent marks.
+
+The pause now copies each root range into chunks the scanner owns (kept
+across cycles, reset at each start pause) and the mark reads the copies. The
+remark pause still scans the live roots in place.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/collector.d | 15 ++++---
+ source/d/gc/scanner.d   | 91 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 101 insertions(+), 5 deletions(-)
+
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 182046a..7352827 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -409,7 +409,7 @@ private:
+ 		ctx.tPrepared = getMonotonicTime();
+ 		ctx.preamble = [tPre1 - tPre0, tPre2 - tPre1, ctx.tPrepared - tPre2];
+ 
+-		// 4. The start pause: only to list the stacks.
++		// 4. The start pause: only to copy the roots.
+ 		ctx.pauseStartTime = getMonotonicTime();
+ 		stopTheWorld();
+ 		ctx.tStopped = getMonotonicTime();
+@@ -417,13 +417,18 @@ private:
+ 		/**
+ 		 * Put the roots, the stacks and the thread local storage on the work
+ 		 * list now: the stacks are only valid while the world is stopped, and
+-		 * most of a D program hangs off its thread locals. This only lists
+-		 * the ranges. They are read, and traced, after the world restarts, so
+-		 * they may have changed by then: the remark pause scans them again.
++		 * most of a D program hangs off its thread locals. The ranges are
++		 * copied, not traced: the copies are traced after the world restarts.
++		 * Reading the ranges themselves then would fault when a thread exits
++		 * meanwhile (its stack and TLS are unmapped). The remark pause scans
++		 * the live roots again.
+ 		 */
+ 		markBeginGC(gcCycle, space);
+ 		markSeedGC((shared(Scanner)* s) {
+-			__sd_gc_global_scan(cast(ScanDg) &s.processGlobal);
++			// Copied now: a thread that exits after the restart takes its
++			// stack and TLS with it.
++			s.resetRootCopies();
++			__sd_gc_global_scan(cast(ScanDg) &s.processGlobalCopy);
+ 		});
+ 
+ 		restartTheWorld();
+diff --git a/source/d/gc/scanner.d b/source/d/gc/scanner.d
+index 00f19ad..77380d4 100644
+--- a/source/d/gc/scanner.d
++++ b/source/d/gc/scanner.d
+@@ -366,6 +366,22 @@ private:
+ 
+ 	ThreadHandle[] threads;
+ 
++	/**
++	 * Copies of the roots taken at the start pause of a concurrent mark.
++	 * The stacks and TLS blocks listed in that pause are read after the world
++	 * restarts, and a thread that exits in between unmaps them (glibc keeps
++	 * static TLS in the stack mapping). So the pause copies each root range
++	 * here and the mark reads the copy. The chunks are kept from one cycle to
++	 * the next and reset at each start pause, when no work item refers to them.
++	 */
++	enum MaxRootChunks = 32;
++	enum MinRootChunk = 1024 * 1024;
++	void*[MaxRootChunks] rootChunks;
++	size_t[MaxRootChunks] rootChunkSizes;
++	size_t rootChunkCount;
++	size_t rootChunkCurrent;
++	size_t rootChunkUsed;
++
+ public:
+ 
+ 	@property
+@@ -603,6 +619,81 @@ public:
+ 		addToWorkList(range);
+ 	}
+ 
++	/**
++	 * Start of the start pause of a concurrent mark: the copies of the last
++	 * cycle are no longer referred to.
++	 */
++	void resetRootCopies() shared {
++		auto t = cast(Scanner*) &this;
++		t.rootChunkCurrent = 0;
++		t.rootChunkUsed = 0;
++	}
++
++	/**
++	 * Like `processGlobal`, for the start pause of a concurrent mark: the
++	 * range is copied, with the world stopped, and the copy is what the mark
++	 * reads once the world runs again.
++	 */
++	void processGlobalCopy(const(void*)[] range) shared {
++		auto t = cast(Scanner*) &this;
++		auto bytes = range.length * PointerSize;
++		if (bytes == 0) {
++			return;
++		}
++
++		auto copy = t.rootCopySpace(bytes);
++		if (copy is null) {
++			// Out of chunks or of memory: the range is read in place, as before.
++			addToWorkList(range);
++			return;
++		}
++
++		import core.stdc.string : memcpy;
++		memcpy(copy, range.ptr, bytes);
++		addToWorkList((cast(const(void*)*) copy)[0 .. range.length]);
++	}
++
++	private void* rootCopySpace(size_t bytes) {
++		while (rootChunkCurrent < rootChunkCount) {
++			if (rootChunkUsed + bytes <= rootChunkSizes[rootChunkCurrent]) {
++				auto p = rootChunks[rootChunkCurrent] + rootChunkUsed;
++				rootChunkUsed += bytes;
++				return p;
++			}
++
++			rootChunkCurrent++;
++			rootChunkUsed = 0;
++		}
++
++		if (rootChunkCount == MaxRootChunks) {
++			return null;
++		}
++
++		// A new chunk, twice the last one, and large enough for this range.
++		size_t size = rootChunkCount == 0 ? MinRootChunk : 2 * rootChunkSizes[rootChunkCount - 1];
++		while (size < bytes) {
++			size *= 2;
++		}
++
++		version(Posix) {
++			import core.sys.posix.sys.mman;
++			auto p = mmap(null, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++			if (p == MAP_FAILED) {
++				return null;
++			}
++		} else {
++			// The concurrent mark is Linux only: nothing to copy for.
++			return null;
++		}
++
++		rootChunks[rootChunkCount] = p;
++		rootChunkSizes[rootChunkCount] = size;
++		rootChunkCurrent = rootChunkCount;
++		rootChunkCount++;
++		rootChunkUsed = bytes;
++		return p;
++	}
++
+ 	void addToWorkList(const(void*)[] range) shared {
+ 		// In order to expose some parallelism, we split the range
+ 		// into smaller chunks to be distributed.
+-- 
+2.51.0
+

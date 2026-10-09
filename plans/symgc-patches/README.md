@@ -584,3 +584,39 @@ Against its own cost, symgc's collector adds about 0.4 ms (rts) and 0.25 ms (cit
 open world. The p99.9 is above 1 ms in rts and city because the game's own frame is (2-3 ms with collections off).
 The stock GC's medians are 4-5x higher in rts and city, and so is its collections-off run (7.7 and 4.9 ms p50): the
 likely cause is its global allocation lock with six job threads allocating, not tested further.
+
+### The city at scale, and a crash it found (patch 0021)
+
+`aaa_sim city` with a population argument (roads and buildings scaled with it), 60 s, LDC -O3, card barrier.
+"collections off" is the symgc binary with `GC.disable()`: its heap grows (13 GB at 500k, 21 GB at 1M), so its
+tail includes page-fault cost and is only a rough reference.
+
+| citizens | collector | p50 | p99.9 | worst | frames >16 ms | peak RSS |
+|---|---|---|---|---|---|---|
+| 100k | symgc (3 runs) | 0.87-1.15 ms | 1.8-2.3 ms | 2.5-2.8 ms | 0 | 2.6 GB |
+| 100k | collections off | 1.00 | 2.4 | 2.5 | 0 | 4.4 GB |
+| 100k | stock | 4.85 | 33.2 | 34.7 | 19 | 2.5 GB |
+| 500k | symgc (3 runs) | 4.1-4.9 | 7.0-8.1 | 7.8-8.7 | 0 | 3.2 GB |
+| 500k | collections off | 3.5 | 6.0 | 8.0 | 0 | 12.9 GB |
+| 500k | stock | 26 | 140 | 144 | 3561 of 3600 | 2.9 GB |
+| 1M | symgc (8 runs, before and after 0021) | 6.5-12.6 | 28-65 | 37-240 | 11-141 | 4.5-4.9 GB |
+| 1M | collections off | 7.8 | 92 | 94 | 149 | 21 GB |
+| 1M | stock | 53 | 275 | 277 | 3600 of 3600 | 3.3 GB |
+
+Up to 500k citizens symgc stays under 16 ms in every frame and adds 1-2 ms at p99.9 over the game's own cost; the
+stock GC misses almost every frame at 500k. At 1M the game's own frame is not flat either (the collections-off run
+has 149 frames over 16 ms), and symgc had one 240 ms frame: the 1M tail is open and not yet attributed.
+
+**The crash.** One 1M symgc run of the matrix died with SIGSEGV, and 1 more in 18 reruns. A SIGSEGV handler
+(backtrace plus `/proc/self/maps`) showed the mark threads faulting in `Worker.scanImpl` (`scanner.d`, the load of a
+word of the range) on addresses inside 8 MiB regions bordered by 4 KiB guard pages: thread stacks that were unmapped
+when read. The start pause of the concurrent mark only listed the stack and TLS ranges; the mark read them after the
+world restarted, and a thread that exits in between takes its stack (and its static TLS, which glibc keeps in the
+stack mapping) with it. `thread_exit_race.d` (short-lived threads started and joined during concurrent marks on a
+1 GiB live heap) reproduces it in seconds: 3 crashes in 5 runs before the fix.
+
+Patch 0021 copies every root range into chunks the scanner owns during the start pause (a `memcpy` of the stacks and
+TLS, usually tens of KB) and the mark reads the copies; the remark pause still scans the live roots. After it:
+`thread_exit_race` 8 of 8 (about 164,000 threads per run) with cards and 4 of 4 with the kernel tracker (repo dmd),
+the verifier battery clean (alloc 8 verify 30/30, mark_race 8/8, Phobos stress 30/30), the 1M city 3 of 3 without a
+crash.
