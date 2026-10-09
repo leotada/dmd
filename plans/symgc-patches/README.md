@@ -272,3 +272,20 @@ to trace). Rounds now repeat until at most 512 pages (2 MiB) are left, not
 rounds) was tried and refused: the longer mark let more garbage pile up and
 frag's steady RSS went 0.90 -> 1.09 GB (gate FAIL, +25%). With 512: frag RSS
 0.90-0.93 GB, gate PASS, battery clean.
+
+### Where the remaining bullet-hell spikes come from (2 GiB, 40k bullets/s)
+
+Slow frames (3-8 ms against a 1.6 ms median) come in groups of 1-4 right after
+a cycle's arm, and carry 1300-2300 minor faults against ~6 in a normal frame
+(`RUSAGE_THREAD` per frame): the write-protect fault of the first write to each
+armed page, ~1.5 us each. The game writes every live bullet each frame
+(`b.pos += ...`), so its hot set is ~1500 pages and it pays them once per arm.
+That is the price of tracking with the kernel instead of a barrier.
+
+Tried and reverted: leaving the free pages unprotected (`UFFDIO_WRITEPROTECT`
+with mode 0 on each free run, "always reported as written"). It did nothing:
+the faults are on pages of old, live objects, not on free pages, and most of
+the ioctls failed with ENOENT. Not tried: not re-arming the pages that were
+hot in the last round (no faults, but they are rescanned in the remark, so the
+pause grows to ~1 ms for a 1500-page hot set). A barrier (LDC) has neither cost:
+a store of a pointer costs a few ns and nothing faults.
