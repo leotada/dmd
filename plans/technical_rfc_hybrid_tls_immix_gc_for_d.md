@@ -1123,6 +1123,40 @@ two stay as checks.
 5. **Then the open items from before**: the barrier's own cost (item 3 above), the rare lock-holder stalls (item 5),
    and the test suites (item 6).
 
+#### The city at 500,000 citizens is the reference (decision of 2026-10-09)
+
+Step 1 ran at 100k, 500k and 1M citizens (numbers in `plans/symgc-patches/README.md`, "The city at scale"). The
+owner set the reference at **500,000 citizens**: 1M is beyond what the target machines are meant to run, so the 1M
+tail is left open and is not worked on.
+
+At 500k (60 s, 6 job threads, 2 GiB of assets, LDC -O3, card barrier, 3 runs):
+
+| | p50 | p99.9 | worst | frames >16 ms | peak RSS |
+|---|---|---|---|---|---|
+| symgc | 4.1-4.9 ms | 7.0-8.1 ms | 7.8-8.7 ms | 0 | 3.2 GB |
+| symgc, collections off (heap grows to 13 GB) | 3.5 ms | 6.0 ms | 8.0 ms | 0 | 12.9 GB |
+| stock GC | 26 ms | 140 ms | 144 ms | 3,561 of 3,600 | 2.9 GB |
+
+Findings:
+1. symgc keeps every frame under 16 ms at 500k with 3.2 GB of RSS. The stock GC misses nearly every frame.
+2. The collector's share grows with the live heap. At 100k it adds about 0.1 ms at the median and 0.25 ms at p99.9.
+   At 500k it adds about 0.6-1.4 ms at the median and 1-2 ms at p99.9 over the collections-off run. That run's heap
+   grows to 13 GB, so its own page faults make the gap look smaller than it is.
+3. The cause of that extra 1-2 ms is not measured. Candidates: the card barrier on the job threads' pointer stores,
+   assists and lock waits on allocation, the remark pause, and mark threads competing with the six job threads for
+   the 16 hardware threads.
+4. The run found a real collector bug, now fixed (patch 0021): the concurrent mark read thread stacks that had been
+   unmapped by exiting threads.
+
+Next, in order, all on the 500k city:
+1. **The GC-attributed time counter** (item 3 of the plan): per thread, the time in allocation slow paths, assists,
+   lock waits and stop-the-world pauses, summed per frame. It splits the 1-2 ms into its parts.
+2. **The collector's CPU** (item 2): mark and sweep thread CPU per second, and the city with 6 and with 12 job threads.
+3. **Act on what 1 and 2 show**: fewer or lower-priority mark threads if they compete with the jobs, a cheaper barrier
+   if the stores dominate, per-thread page reserves if lock waits do.
+4. **Cheaper natural code** (item 4): profile the 500k city with collections off for associative-array and append
+   costs in druntime.
+
 **Total to the 1 ms target at 2 GiB (end of step 5):** about 17–27 pw. **To the full target at 8 GiB with LDC speed (end of step 7):** about 28–46 pw.
 
 **Decisions recorded:** build on symgc, fork allowed; Immix rejected; Track B shelved; the metric is the worst frame, not p99.
