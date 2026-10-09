@@ -349,12 +349,16 @@ Bullet hell (LDC -O3):
 Remark pause with cards at 2 GiB: 0.27-0.47 ms, of which ~0.22 ms is reading
 the card table (it grows with the heap; a summary level is the next step).
 
-Known issue, LDC only: `finalizer_order` fails (and a 10-object reproduction)
-with symgc built by LDC even without cards and with the synchronous sweep: in
-the first cycle that runs after allocations, the mark bits of the slab of
-finalizable objects come out all ones (everything alive) while the objects
-they point to are freed, so a destructor later reads a reused slot. DMD
-builds do not show it. Not found yet.
+Fixed (patch 0016), was thought to be LDC-only: `finalizer_order` failed with
+symgc built by LDC. The cause was real and in symgc: the finalize-first rule
+held inside one arena, not across arenas. A class with a destructor lives in
+another arena than the object it points to (finalizable objects have metadata),
+and the collector swept the arenas one after the other, so the second arena's
+destructor found its partner released and reused. DMD builds passed only because
+the arena visited first happened to hold the finalizable objects. The sweep is
+now three stages (begin, finalize, finish) driven across arenas by the collector,
+with a global flag that keeps the mutator assists out until every finalizer
+ran. 8/8 with LDC + cards, 5/5 with DMD, gate and unit tests unchanged.
 
 ### Summary level (patch 0015, LDC patch 0003)
 

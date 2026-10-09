@@ -1,7 +1,7 @@
 From a9d622500023531e9d04b856f1b2a64c37ac88a6 Mon Sep 17 00:00:00 2001
 From: Leonardo Tada Antunes <leonardotada@gmail.com>
 Date: Thu, 8 Oct 2026 20:09:34 -0300
-Subject: [PATCH 10/15] Concurrent mark: prepare the mark bits and start the
+Subject: [PATCH 10/16] Concurrent mark: prepare the mark bits and start the
  epoch without a pause
 
 The start pause only lists the roots, stacks and thread locals now (about 40
