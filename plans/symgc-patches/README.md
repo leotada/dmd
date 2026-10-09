@@ -719,3 +719,139 @@ per 30 s across seven threads, 0.04-0.14 ms per frame summed. On the main thread
 to the collections-off run's (6-8 ms, with its own page-fault stalls at a 13 GB heap), so the tail is mostly the game's.
 What is left on the collector side is small; what is left in the frame is the game's own work and the allocation
 pattern of natural code (appends and associative arrays), which is candidate 3.
+
+## The test suites and the games under three collectors (2026-10-09, night)
+
+From here on the branch has a name, **oneday**: symgc as it is at the end of `latency-p3` (concurrent mark and sweep,
+card barrier or kernel dirty pages, the patches 0004-0029). The comparison is against:
+* **stock**: the collector that comes with druntime;
+* **upstream**: symgc at the commit before our patches (`4a4cb2b`, stop the world).
+
+Everything below was run with the scripts in `plans/bench/core_bench/`: `phobos_suite.sh`, `druntime_suite.sh`,
+`compiler_suite.sh` (with `dmd_symgc.sh`), `game_three_way.sh`, `append_aa.d`, `append_cache_stress.d`. dmd is this
+repo's (2.113); LDC where said. The GC-time report of `aaa_sim` now needs `-d-version=Symgc_gctime` (upstream symgc
+has no counters).
+
+### Step 1: cheaper appends (patch 0026), and what it showed
+
+Appends are already cheap in symgc (a profile of the append loop: `ThreadCache.resize` 60%, the rest spread over the
+extent map lookup, the slot index and the metadata). The associative array is not the collector's: its cost is in
+druntime's `newaa` (probing, hashing), with allocation a small part. So only appends were changed: `ThreadCache.resize`
+remembers the slot of the last array it extended and skips the extent map lookup and the index computation; it is valid
+until any extent is freed anywhere (`gSlabFreeEpoch`, bumped in `freePagesImpl` before the pages can be reused).
+
+`append_aa`, LDC -O3, ns per append, before and after (`aa_symgc_g` and `aa_symgc_new`): length=0 then append 15.3 to
+11.8; with `assumeSafeAppend` 11.0 to 7.1; reserved arrays of 64 12.1 to 8.5; fresh arrays of 64 20.2 to 18.9 (growth
+reallocations dominate); arrays of 1M unchanged (the large path).
+
+The same micro-benchmark with dmd (-O -release -inline) for all three collectors, ns per operation, one run:
+
+| | stock | upstream | oneday |
+|---|---|---|---|
+| append: fresh arrays of 64 | 43.7 | 67.9 | 46.4 |
+| append: length=0 then append | 32.5 | 57.4 | 34.5 |
+| append: reserved arrays of 64 | 28.6 | 60.9 | 33.2 |
+| append: arrays of 1M | 24.4 | 28.5 | 31.6 |
+| aa: insert 100k int keys | 81.6 | 65.7 | 86.1 |
+| aa: many small maps of 8 | 118.8 | 117.9 | 151.9 |
+| aa: insert + lookup string keys | 144.8 | 58.5 | 63.1 |
+| aa: churn | 44.6 | 44.9 | 49.7 |
+
+Against upstream oneday appends are 25-45% cheaper; against the stock GC they are even (dmd's code generation is the
+larger part of these numbers; the LDC build above, oneday against the system LDC's stock GC, is 2x faster). The AA operations are the same for all: the gain on associative arrays has to come from druntime's AA, not from
+the collector.
+
+### The unit tests of Phobos (137 modules with unit tests, 7,058 tests; debug build, asserts on)
+
+| | modules that pass | tests | note |
+|---|---|---|---|
+| stock | 137 of 137 | 7,058 | |
+| upstream | 136 of 137 | 7,058 | `std.experimental.allocator.building_blocks.free_list` exits 1 |
+| oneday | 136 of 137 | 7,058 | the same module |
+
+`free_list`: all 20 tests pass, then the assertion "Slot is already free!" fires when the main thread's cache is
+flushed at exit, in both symgcs. Something frees a block twice; the stock GC lets it pass. Not yet traced to the test
+that does it.
+
+### The unit tests of druntime (568 modules; one runner built from the sources, run per module)
+
+| | modules that pass |
+|---|---|
+| stock | 568 of 568 |
+| upstream | 562 of 568 (`core.memory` and `core.internal.gc.impl.conservative.gc` hang until killed) |
+| oneday | 562 of 568 |
+
+The same six fail in both symgcs: `core.lifetime` and `core.memory` (`GC.runFinalizers` is not implemented),
+`rt.lifetime` (`GC.realloc` does not take attribute changes), `rt.monitor_` (`setAttr(FINALIZE)` does nothing, so a
+monitor is never freed), `core.internal.newaa` (a destructor count), and `core.internal.gc.impl.conservative.gc`
+(tests the stock collector's own internals; not applicable). These are gaps of the druntime interface, listed as open
+items below.
+
+### The compiler's runnable tests (about 700; the test programs are linked with each collector)
+
+| | failures |
+|---|---|
+| stock | 0 |
+| upstream | 20 |
+| oneday | 20 (19 as upstream; `test23722_2` failed once at the link step in the parallel run and passes 12 of 12 alone) |
+
+19 are shared: the `-betterC` and minimal-runtime tests (the wrapper adds a collector to programs that have none),
+`profilegc*`, and two shell tests. They were not examined one by one; they fail the same way under upstream.
+The first full run of oneday had two more (`test24139`, `test28`); `test28` passes 12 of 12 alone and was not
+reproduced; `test24139` was a real bug, below.
+
+### Bugs found by these runs and fixed (patches 0025, 0027-0029)
+
+1. **Two sweeps at once (0025).** `GC.collect` waited for the background sweeper to be idle and only then took the
+   collector lock; a collection started by another thread in between handed its sweep over, and the explicit one swept
+   too: "A sweep is already running!", then a hang. A stress with a thread calling `GC.collect` every 5 ms and six
+   threads allocating failed 6 runs of 12 at the commit before; 0 of 16 after. It came with the background sweeper
+   thread.
+2. **`GC.free` and `GC.realloc` of a pointer that is not a GC block (0027).** The stack, malloc'd memory or an interior
+   pointer asserted in debug builds and was used as a descriptor in release builds; the stock collector ignores the
+   first and returns null for the second. An assertion thrown with a lock held also left the lock held: the druntime
+   `core.memory` test hung on it.
+3. **Allocating from a finalizer (0028).** A finalizer runs with the page filler's lock held, so a destructor that calls
+   the GC waited for itself forever; now it throws `InvalidMemoryOperationError` like the stock collector. A game with
+   a class destructor that appends to an array would have hung.
+4. **"Unmapped block!" at exit (0029).** The collector's own pages (bitmaps) are never put in the extent map, and a
+   sparse block that holds nothing else has no leaf; the finalizer and sweep passes asserted on it. About 1 run in 600
+   of `runnable/test24139` failed (14 of 6,000 at the commit before, 7 of 6,000 with 0025-0028, 0 of 12,000 after);
+   upstream 0 of 6,000. A regression of our sweep passes. Which arena the main thread used decided it.
+
+### Open items from these runs
+
+* `free_list` double free (both symgcs).
+* The druntime interface: `GC.runFinalizers`, attribute changes in `GC.realloc`, `GC.setAttr(FINALIZE)` for monitors,
+  and `GC.profileStats`.
+* The RTS model with dmd and the kernel dirty-page tracker (setup A): 20 frames over 16 ms (the worst 48 ms) against
+  31 for the stock GC; the same model on LDC with the card barrier has none. Setup B (LDC) is the one measured for
+  games; setup A needs a look.
+
+### The game models under three collectors (60 s, 6 job threads, 2 GiB of assets, one run unless said)
+
+Same compiler for the three (dmd -O -release -inline), then LDC -O3 (stock = the system's LDC 1.40; upstream symgc
+does not run on the LDC runtime of the card barrier, which has changes it does not know).
+
+City of 500,000 citizens (the reference), 2 runs each:
+
+| | p50 | p99 | p99.9 | worst | frames over 16 ms (of 3,600) |
+|---|---|---|---|---|---|
+| dmd, stock | 24.3 ms | 32 ms | 149-155 ms | 211-226 ms | 3,596-3,598 |
+| dmd, upstream | 4.5-4.8 ms | 133-138 ms | 150-166 ms | 163-167 ms | 39-40 |
+| dmd, oneday | 4.9-5.0 ms | 8.5-8.7 ms | 10.8-11.2 ms | 12.3 ms | 0 |
+| LDC, stock | 26.7 ms | 138-140 ms | 145-150 ms | 152-156 ms | 3,597 |
+| LDC, oneday (cards) | 4.1-4.7 ms | 6.1-7.1 ms | 8.0-8.5 ms | 9.4-9.6 ms | 0 |
+
+The other models, one run each (p99.9 / worst / frames over 16 ms):
+
+| | stock (dmd) | upstream (dmd) | oneday (dmd) | stock (LDC) | oneday (LDC, cards) |
+|---|---|---|---|---|---|
+| city 100k | 37 / 38 ms / 17 | 65 / 76 ms / 15 | 3.6 / 4.6 ms / 0 | 35 / 37 ms / 19 | 3.6 / 4.5 ms / 0 |
+| rts | 19 / 26 ms / 31 | 50 / 52 ms / 15 | 20 / 48 ms / 20 | 20 / 36 ms / 35 | 6.1 / 8.2 ms / 0 |
+| open world | 14.7 / 16.4 ms / 1 | 2.3 / 38 ms / 2 | 0.9 / 1.2 ms / 0 | 13.1 / 14.2 ms / 0 | 1.05 / 1.26 ms / 0 |
+
+Reading: upstream symgc fixes the median (it is the allocator) but pauses the whole program for 130-160 ms at 500k,
+which is the stop-the-world mark of the heap; the stock GC pauses as long and also loses the median to its global
+allocation lock with six job threads. Oneday keeps every frame of the 500k city under 16 ms, 8.5 ms at p99.9 with LDC.
+The exception is the RTS under dmd with the kernel tracker, above.

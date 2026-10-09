@@ -567,7 +567,8 @@ struct City {
 // ---------------------------------------------------------------- main
 // symgc reports the time threads lose to memory management (ns: alloc slow paths,
 // collection start/assist, stopped by the collector); read around every frame.
-version(Symgc_druntime_hooks) {
+// Build with -d-version=Symgc_gctime for our symgc: upstream symgc does not have the counters.
+version(Symgc_gctime) {
 	extern(C) void __sd_gc_time_thread(ulong* dst);
 	extern(C) void __sd_gc_time_total(ulong* dst);
 	version(Symgc_lock_hist) {

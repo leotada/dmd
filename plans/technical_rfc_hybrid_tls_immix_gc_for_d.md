@@ -1191,6 +1191,29 @@ per arena refilled outside the lock (a simpler spare-slab stash was tried and dr
 druntime; (d) the collector's CPU against the job threads (6 and 12 jobs), the barrier's throughput cost, the rare
 lock-holder stalls, and the Phobos/druntime/compiler test suites under symgc.
 
+#### Test suites and games under three collectors (2026-10-09, night)
+
+The branch is called **oneday** from here on. Numbers and scripts: `plans/symgc-patches/README.md`, last section.
+
+1. **Lock waits.** The filler-lock wait the earlier table blamed on the sweeper was noise: the holder before a long wait
+   is an allocating thread, and the waits come from getting the lock on a saturated machine. A fresh-slab reserve has
+   no case and was not built. One mark thread is not viable, two are slower than four.
+2. **Appends** (patch 0026): the last slot appended to is remembered; 25-45% cheaper than upstream symgc. Associative
+   arrays are druntime's cost, not the collector's.
+3. **Phobos unit tests:** 136 of 137 modules pass under upstream symgc and under oneday (stock 137). **Druntime unit
+   tests:** 562 of 568 under both (stock 568). **Compiler runnable tests:** 20 failures under both (stock 0), 19 shared.
+   The shared ones are API gaps and tests that build without a runtime, not regressions: `GC.runFinalizers`, attributes
+   in `GC.realloc`, `setAttr(FINALIZE)`, and one double free in `free_list`.
+4. **Bugs found and fixed** (patches 0025, 0027-0029): two sweeps at once on `GC.collect`; `GC.free` and `GC.realloc` of
+   non-GC pointers; allocation from a finalizer (a deadlock); an assertion on blocks with no extent-map entry at exit
+   (a regression of our sweep, about 1 run in 600 of one compiler test).
+5. **Games, same compiler (dmd), city of 500,000:** stock p50 24 ms and 3,596 of 3,600 frames over 16 ms; upstream p50
+   4.6 ms but 39 frames over 16 ms and 130-160 ms stop-the-world pauses; oneday p50 5 ms, p99.9 11 ms, none over 16 ms
+   (LDC with cards: p99.9 8 ms). The RTS model with dmd and the kernel tracker (setup A) still has 20 frames over 16 ms.
+
+Next, in order: (a) the open items of the druntime interface and the `free_list` double free; (b) the RTS tail with
+setup A; (c) the barrier's throughput cost on the job threads; (d) cheaper associative arrays in druntime itself.
+
 **Total to the 1 ms target at 2 GiB (end of step 5):** about 17–27 pw. **To the full target at 8 GiB with LDC speed (end of step 7):** about 28–46 pw.
 
 **Decisions recorded:** build on symgc, fork allowed; Immix rejected; Track B shelved; the metric is the worst frame, not p99.

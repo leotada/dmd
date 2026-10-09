@@ -1,0 +1,56 @@
+From 0d045aa24af896de4f2d5411a5986828a4b2843b Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 17:14:20 -0300
+Subject: [PATCH 1/2] Explicit collection: look again for a running sweep once
+ the collector lock is held
+
+GC.collect waited for the background sweeper to go idle and only then took
+the collector lock. A collection started by another thread in between handed
+its sweep to the sweeper, and the explicit collection then swept too: two
+sweeps at once ('A sweep is already running!', then a hang). Found by a
+stress with a thread calling GC.collect every 5 ms (6 of 12 runs failed).
+A sweep is only handed over with the lock held, so check again under it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/collector.d | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index fb751ee..64bcdc8 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -170,11 +170,25 @@ struct Collector {
+ 	}
+ 
+ 	void runGCCycle() {
+-		// An explicit collection is synchronous: let a running background
+-		// sweep end first, it needs the collector lock to finish.
+-		gSweeper.waitIdle();
++		/**
++		 * An explicit collection is synchronous: let a running background
++		 * sweep end first, it needs the collector lock to finish, so we
++		 * cannot wait for it with the lock held. Another thread may start
++		 * a collection, and hand its sweep over, between the wait and the
++		 * lock: a sweep is only handed over with the lock held, so look
++		 * again once we have it, and go back to waiting if there is one.
++		 */
++		while (true) {
++			gSweeper.waitIdle();
++
++			gCollectorState.mutex.lock();
++			if (!gSweeper.isActive) {
++				break;
++			}
++
++			gCollectorState.mutex.unlock();
++		}
+ 
+-		gCollectorState.mutex.lock();
+ 		scope(exit) gCollectorState.mutex.unlock();
+ 
+ 		CollectionInfo info;
+-- 
+2.51.0
+

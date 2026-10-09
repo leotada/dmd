@@ -1,0 +1,189 @@
+From 808b7e03b2a0e16295fedbb74938809ac816e430 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 17:14:20 -0300
+Subject: [PATCH 2/2] Appends: remember the last slot appended to
+
+ThreadCache.resize keeps the slot of the last array it extended, so the next
+append skips the extent map lookup and the slot index computation. Valid
+while no extent was freed anywhere (gSlabFreeEpoch, bumped in freePagesImpl
+before the pages can be handed out again). 23-35% off repeated appends.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/page.d   | 11 ++++++++
+ source/d/gc/slab.d   | 34 +++++++++++++++++++++++++
+ source/d/gc/tcache.d | 60 ++++++++++++++++++++++++++++++++++++--------
+ 3 files changed, 95 insertions(+), 10 deletions(-)
+
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 3fe8b2d..e577b74 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -50,6 +50,14 @@ __gshared size_t gSweepHardLimit = size_t.max;
+  */
+ __gshared size_t gSweepRetainPages = 0;
+ 
++/**
++ * Counts the extents freed, in all arenas. A thread that remembers where an
++ * array lives (see `ThreadCache.resize`) knows it is stale when this changed:
++ * freed pages may come back as a slab of another size class.
++ */
++import d.sync.atomic : Atomic;
++shared Atomic!uint gSlabFreeEpoch;
++
+ struct PageFiller {
+ private:
+ 	@property package
+@@ -734,6 +742,9 @@ private:
+ 		assert(pages > 0 && pages <= PagesInBlock, "Invalid number of pages!");
+ 		assert(n <= PagesInBlock - pages, "Invalid index!");
+ 
++		// Before the pages can be handed out again.
++		gSlabFreeEpoch.fetchAdd(1);
++
+ 		auto block = e.block;
+ 		unregisterBlock(block);
+ 
+diff --git a/source/d/gc/slab.d b/source/d/gc/slab.d
+index f616df2..3a05f8a 100644
+--- a/source/d/gc/slab.d
++++ b/source/d/gc/slab.d
+@@ -177,6 +177,40 @@ public:
+ 		_hasMetadata = ec.supportsMetadata && e.hasMetadata(index);
+ 	}
+ 
++	/**
++	 * For a slot we looked up before, see `ThreadCache.resize`. Whether the
++	 * slot has metadata is read again, it changes with the slot's contents.
++	 */
++	this(Extent* e, uint index, uint slotSize, void* address) {
++		this.e = e;
++		this.index = index;
++		this.slotSize = slotSize;
++		this._address = address;
++
++		supportsMetadata = true;
++		_hasMetadata = e.hasMetadata(index);
++	}
++
++	@property
++	bool metadataSupported() {
++		return supportsMetadata;
++	}
++
++	@property
++	Extent* slabExtent() {
++		return e;
++	}
++
++	@property
++	uint slotIndex() {
++		return index;
++	}
++
++	@property
++	uint slotBytes() {
++		return slotSize;
++	}
++
+ 	@property
+ 	auto hasMetadata() {
+ 		return _hasMetadata;
+diff --git a/source/d/gc/tcache.d b/source/d/gc/tcache.d
+index 775520b..5ac78c1 100644
+--- a/source/d/gc/tcache.d
++++ b/source/d/gc/tcache.d
+@@ -33,6 +33,20 @@ private:
+ 	size_t deallocated;
+ 	size_t nextDeallocationEvent;
+ 
++	/**
++	 * The slot of the last array this thread appended to, so that appending
++	 * again skips the extent map lookup and the work to find the slot's
++	 * index. It is good as long as no slab or extent was freed anywhere
++	 * since: `appendEpoch` is `gSlabFreeEpoch` at the lookup.
++	 */
++	const(void)* appendBase;
++	const(void)* appendEnd;
++	import d.gc.extent : Extent;
++	Extent* appendExtent;
++	uint appendIndex;
++	uint appendSlotSize;
++	uint appendEpoch;
++
+ 	package CachedExtentMap emap;
+ 
+ 	/**
+@@ -923,6 +937,18 @@ private:
+ 			return true;
+ 		}
+ 
++		import d.gc.page : gSlabFreeEpoch;
++		import d.sync.atomic : MemoryOrder;
++		auto epoch = gSlabFreeEpoch.load!(MemoryOrder.Relaxed)();
++
++		// Appending to the slot we appended to last.
++		if (slice.ptr >= appendBase && slice.ptr < appendEnd
++			    && appendEpoch == epoch) {
++			auto si = SlabAllocInfo(appendExtent, appendIndex, appendSlotSize,
++			                        cast(void*) appendBase);
++			return resizeSlab!AdjustUsedCapacity(si, slice, size);
++		}
++
+ 		auto pd = maybeGetPageDescriptor(slice.ptr);
+ 		auto e = pd.extent;
+ 		if (e is null) {
+@@ -931,18 +957,16 @@ private:
+ 
+ 		if (pd.isSlab()) {
+ 			auto si = SlabAllocInfo(pd, slice.ptr);
+-			auto usedCapacity = si.usedCapacity;
+-
+-			if (!validateCapacity(slice, si.address, usedCapacity)) {
+-				return false;
+-			}
+-
+-			auto newCapacity = usedCapacity + size;
+-			if (AdjustUsedCapacity) {
+-				return si.setUsedCapacity(newCapacity);
++			if (si.metadataSupported) {
++				appendBase = si.address;
++				appendEnd = si.address + si.slotBytes;
++				appendExtent = si.slabExtent;
++				appendIndex = si.slotIndex;
++				appendSlotSize = si.slotBytes;
++				appendEpoch = epoch;
+ 			}
+ 
+-			return newCapacity <= si.slotCapacity;
++			return resizeSlab!AdjustUsedCapacity(si, slice, size);
+ 		}
+ 
+ 		auto usedCapacity = e.usedCapacity;
+@@ -969,6 +993,22 @@ private:
+ 		return true;
+ 	}
+ 
++	bool resizeSlab(bool AdjustUsedCapacity)(ref SlabAllocInfo si,
++	                                         const void[] slice, size_t size) {
++		auto usedCapacity = si.usedCapacity;
++
++		if (!validateCapacity(slice, si.address, usedCapacity)) {
++			return false;
++		}
++
++		auto newCapacity = usedCapacity + size;
++		if (AdjustUsedCapacity) {
++			return si.setUsedCapacity(newCapacity);
++		}
++
++		return newCapacity <= si.slotCapacity;
++	}
++
+ 	bool growLarge(PageDescriptor pd, uint npages) {
+ 		state.enterBusyState();
+ 		scope(exit) state.exitBusyState();
+-- 
+2.51.0
+

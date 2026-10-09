@@ -1,0 +1,52 @@
+From dbd0d223c2aaa70853eda785523eb8102d7009aa Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 18:13:09 -0300
+Subject: [PATCH 5/5] Sweep: a block with nothing in the extent map reads as
+ empty instead of asserting
+
+The collector's own pages (bitmaps) are never mapped, and a sparse block that
+holds nothing else has no leaf in the map. The finalizer and sweep passes
+looked up every block of the ring and asserted 'Unmapped block!' on it: about
+1 run in 600 of the compiler test runnable/test24139 failed at exit, depending
+on which arena the main thread used. The passes already skip a page with no
+extent; give a block without a leaf the same answer for all its pages.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/emap.d | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/source/d/gc/emap.d b/source/d/gc/emap.d
+index fd15c5a..af37c85 100644
+--- a/source/d/gc/emap.d
++++ b/source/d/gc/emap.d
+@@ -237,9 +237,15 @@ private:
+ 	alias Leaf = ExtentMapTree.Leaf;
+ 
+ public:
++	/**
++	 * A block with no leaf has no page in the map yet, or ever: the pages
++	 * the collector takes for its own use (bitmaps) are not mapped, and a
++	 * block that holds nothing else is never mapped at all. Every page of
++	 * it reads as having no extent, which the sweep skips like an
++	 * allocation in flight.
++	 */
+ 	this(void* block, shared(Leaf)* leaf) {
+ 		assert(isAligned(block, BlockSize), "Invalid block address!");
+-		assert(leaf !is null, "Unmapped block!");
+ 
+ 		this.block = block;
+ 		this.leaves = cast(shared(Leaf[PagesInBlock])*) leaf;
+@@ -247,7 +253,7 @@ public:
+ 
+ 	auto lookup(uint index) {
+ 		assert(index < PagesInBlock, "Invalid index!");
+-		return (*leaves)[index].load();
++		return leaves is null ? PageDescriptor(0) : (*leaves)[index].load();
+ 	}
+ }
+ 
+-- 
+2.51.0
+
