@@ -1,0 +1,275 @@
+From bf5370352f7cf7cff89e99f75ffb310fd167d344 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 22:54:14 -0300
+Subject: [PATCH 1/2] Add -gc-card-marking: post-store card marking barrier for
+ a concurrent GC
+
+An IR pass, run last, that marks a byte of the card table after each store of
+a pointer to memory that is not an alloca or a global, after atomic pointer
+stores and exchanges, and after memcpy/memmove to such memory.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ gen/optimizer.cpp            |  10 +++
+ gen/passes/GCCardMarking.cpp | 163 +++++++++++++++++++++++++++++++++++
+ gen/passes/GCCardMarking.h   |  35 ++++++++
+ 3 files changed, 208 insertions(+)
+ create mode 100644 gen/passes/GCCardMarking.cpp
+ create mode 100644 gen/passes/GCCardMarking.h
+
+diff --git a/gen/optimizer.cpp b/gen/optimizer.cpp
+index 6efc1903dd..e9c34ae9cd 100644
+--- a/gen/optimizer.cpp
++++ b/gen/optimizer.cpp
+@@ -24,6 +24,7 @@
+ #endif
+ 
+ #include "gen/passes/GarbageCollect2Stack.h"
++#include "gen/passes/GCCardMarking.h"
+ #include "gen/passes/StripExternals.h"
+ #include "gen/passes/SimplifyDRuntimeCalls.h"
+ #include "gen/passes/WasmPointersSpill.h"
+@@ -107,6 +108,11 @@ static cl::opt<bool> disableSimplifyLibCalls(
+     "disable-simplify-libcalls", cl::ZeroOrMore,
+     cl::desc("Disable simplification of well-known C runtime calls"));
+ 
++static cl::opt<bool> gcCardMarking(
++    "gc-card-marking", cl::ZeroOrMore, cl::Hidden, cl::init(false),
++    cl::desc("Mark the GC card of every pointer store to non-stack memory "
++             "(post-store barrier for a mostly-concurrent collector)"));
++
+ static cl::opt<bool> disableGCToStack(
+     "disable-gc2stack", cl::ZeroOrMore,
+     cl::desc("Disable promotion of GC allocations to stack memory"));
+@@ -579,6 +585,9 @@ void runOptimizationPasses(llvm::Module *M, llvm::TargetMachine *TM) {
+     mpm = pb.buildPerModuleDefaultPipeline(level);
+   }
+ 
++  if (gcCardMarking) {
++    mpm.addPass(GCCardMarkingPass());
++  }
+ 
+   mpm.run(*M,mam);
+ }
+@@ -653,6 +662,7 @@ void outputOptimizationSettings(llvm::raw_ostream &hash_os) {
+   hash_os << disableSimplifyDruntimeCalls;
+   hash_os << disableSimplifyLibCalls;
+   hash_os << disableGCToStack;
++  hash_os << gcCardMarking;
+   hash_os << stripDebug;
+   hash_os << disableLoopUnrolling;
+   hash_os << disableLoopVectorization;
+diff --git a/gen/passes/GCCardMarking.cpp b/gen/passes/GCCardMarking.cpp
+new file mode 100644
+index 0000000000..1d4c00973e
+--- /dev/null
++++ b/gen/passes/GCCardMarking.cpp
+@@ -0,0 +1,163 @@
++//===-- GCCardMarking.cpp - GC card marking barrier -----------------------===//
++//
++// See GCCardMarking.h.
++//
++//===----------------------------------------------------------------------===//
++
++#include "gen/passes/GCCardMarking.h"
++
++#include "llvm/Analysis/ValueTracking.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InlineAsm.h"
++#include "llvm/IR/InstIterator.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/IntrinsicInst.h"
++
++using namespace llvm;
++
++namespace {
++
++constexpr unsigned CardShift = 9; // 512 byte cards
++
++struct Marker {
++  Module &M;
++  LLVMContext &C;
++  Type *IntPtrTy;
++  GlobalVariable *CardBase;
++  FunctionCallee CardRange;
++  InlineAsm *CompilerBarrier;
++
++  explicit Marker(Module &M)
++      : M(M), C(M.getContext()),
++        IntPtrTy(M.getDataLayout().getIntPtrType(M.getContext())) {
++    auto *PtrTy = PointerType::getUnqual(C);
++    CardBase = M.getGlobalVariable("__sd_gc_card_base");
++    if (!CardBase) {
++      CardBase = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
++                                    GlobalValue::ExternalLinkage, nullptr,
++                                    "__sd_gc_card_base");
++    }
++    CardRange = M.getOrInsertFunction(
++        "__sd_gc_card_range", Type::getVoidTy(C), PtrTy, IntPtrTy);
++    // Keeps the compiler from moving the card store above the pointer store.
++    CompilerBarrier = InlineAsm::get(FunctionType::get(Type::getVoidTy(C), false),
++                                     "", "~{memory}", /*hasSideEffects=*/true);
++  }
++
++  /// Memory that the collector does not need cards for: stack slots (scanned
++  /// with the stack) and globals (roots, rescanned with the stacks).
++  static bool isUntracked(const Value *Dst) {
++    const Value *Obj = getUnderlyingObject(Dst);
++    return isa<AllocaInst>(Obj) || isa<GlobalVariable>(Obj) ||
++           (isa<Argument>(Obj) && cast<Argument>(Obj)->hasByValAttr());
++  }
++
++  static bool storesPointer(const Value *V) {
++    Type *T = V->getType();
++    return T->isPtrOrPtrVectorTy();
++  }
++
++  void markCard(IRBuilder<> &B, Value *Addr) {
++    B.CreateCall(CompilerBarrier);
++    auto *Int = B.CreatePtrToInt(Addr, IntPtrTy);
++    auto *Idx = B.CreateLShr(Int, ConstantInt::get(IntPtrTy, CardShift));
++    auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
++    auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
++    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
++  }
++
++  void markRange(IRBuilder<> &B, Value *Dst, Value *Size) {
++    B.CreateCall(CompilerBarrier);
++    if (auto *CI = dyn_cast<ConstantInt>(Size)) {
++      uint64_t N = CI->getZExtValue();
++      if (N == 0) {
++        return;
++      }
++      // At most two cards for up to 512 bytes: first and last byte.
++      if (N <= (1u << CardShift)) {
++        markCardNoBarrier(B, Dst);
++        if (N > 1) {
++          auto *Last = B.CreateGEP(Type::getInt8Ty(C), Dst,
++                                   ConstantInt::get(IntPtrTy, N - 1));
++          markCardNoBarrier(B, Last);
++        }
++        return;
++      }
++    }
++    B.CreateCall(CardRange, {Dst, B.CreateZExtOrTrunc(Size, IntPtrTy)});
++  }
++
++  void markCardNoBarrier(IRBuilder<> &B, Value *Addr) {
++    auto *Int = B.CreatePtrToInt(Addr, IntPtrTy);
++    auto *Idx = B.CreateLShr(Int, ConstantInt::get(IntPtrTy, CardShift));
++    auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
++    auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
++    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
++  }
++};
++
++} // namespace
++
++bool GCCardMarking::run(Module &M) {
++  Marker K(M);
++  bool Changed = false;
++
++  for (Function &F : M) {
++    if (F.isDeclaration()) {
++      continue;
++    }
++    // The barrier code itself, and the collector, are never instrumented.
++    if (F.getName().starts_with("__sd_gc_")) {
++      continue;
++    }
++
++    SmallVector<Instruction *, 32> Work;
++    for (Instruction &I : instructions(F)) {
++      if (auto *SI = dyn_cast<StoreInst>(&I)) {
++        if (Marker::storesPointer(SI->getValueOperand()) &&
++            !Marker::isUntracked(SI->getPointerOperand())) {
++          Work.push_back(&I);
++        }
++      } else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
++        if (Marker::storesPointer(RMW->getValOperand()) &&
++            !Marker::isUntracked(RMW->getPointerOperand())) {
++          Work.push_back(&I);
++        }
++      } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
++        if (Marker::storesPointer(CX->getNewValOperand()) &&
++            !Marker::isUntracked(CX->getPointerOperand())) {
++          Work.push_back(&I);
++        }
++      } else if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
++        if (!Marker::isUntracked(MT->getRawDest())) {
++          Work.push_back(&I);
++        }
++      }
++    }
++
++    if (!Work.empty()) {
++      // The barrier reads and writes memory the function did not declare.
++      F.setMemoryEffects(MemoryEffects::unknown());
++    }
++
++    for (Instruction *I : Work) {
++      IRBuilder<> B(I->getNextNode());
++      B.SetCurrentDebugLocation(I->getDebugLoc());
++      if (auto *SI = dyn_cast<StoreInst>(I)) {
++        K.markCard(B, SI->getPointerOperand());
++      } else if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
++        K.markCard(B, RMW->getPointerOperand());
++      } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
++        K.markCard(B, CX->getPointerOperand());
++      } else if (auto *MT = dyn_cast<MemTransferInst>(I)) {
++        K.markRange(B, MT->getRawDest(), MT->getLength());
++      }
++      Changed = true;
++    }
++  }
++
++  return Changed;
++}
+diff --git a/gen/passes/GCCardMarking.h b/gen/passes/GCCardMarking.h
+new file mode 100644
+index 0000000000..4f4b81e291
+--- /dev/null
++++ b/gen/passes/GCCardMarking.h
+@@ -0,0 +1,35 @@
++//===-- gen/passes/GCCardMarking.h - GC card marking barrier ----*- C++ -*-===//
++//
++// Post-store barrier for a mostly-concurrent garbage collector (incremental
++// update, card marking): after every store of a pointer to memory that is not
++// a stack slot or a global, set the byte of the 512 byte card that holds the
++// stored-to address. The collector rescans the dirty cards with the program
++// stopped, instead of asking the kernel which pages were written.
++//
++// The runtime provides:
++//   extern(C) __gshared ubyte* __sd_gc_card_base;   // biased: base + (addr >> 9)
++//   extern(C) void __sd_gc_card_range(void* dst, size_t size);
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++#include "gen/llvm.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/PassManager.h"
++
++struct LLVM_LIBRARY_VISIBILITY GCCardMarking {
++  bool run(llvm::Module &M);
++};
++
++struct LLVM_LIBRARY_VISIBILITY GCCardMarkingPass
++    : public llvm::PassInfoMixin<GCCardMarkingPass> {
++  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
++    return pass.run(M) ? llvm::PreservedAnalyses::none()
++                       : llvm::PreservedAnalyses::all();
++  }
++
++  static llvm::StringRef name() { return "GCCardMarking"; }
++
++private:
++  GCCardMarking pass;
++};
+-- 
+2.51.0
+

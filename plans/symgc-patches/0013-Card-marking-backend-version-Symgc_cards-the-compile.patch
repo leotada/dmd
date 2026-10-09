@@ -1,0 +1,275 @@
+From 3b80bc8d36096b23cb27eeede78b2399980c1f80 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 22:54:14 -0300
+Subject: [PATCH 13/14] Card marking backend (version Symgc_cards): the
+ compiler says what the program wrote
+
+d.gc.cards holds the card table (one byte per 512 bytes of address space,
+mapped before any instrumented code runs) and the runtime half of the barrier.
+With -version=Symgc_cards the dirty rounds and the remark read and clear the
+cards instead of asking the kernel. Needs ldc2 -gc-card-marking on the program,
+druntime and Phobos.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/cards.d | 145 ++++++++++++++++++++++++++++++++++++++++++++
+ source/d/gc/dirty.d |  65 ++++++++++++++++++--
+ 2 files changed, 206 insertions(+), 4 deletions(-)
+ create mode 100644 source/d/gc/cards.d
+
+diff --git a/source/d/gc/cards.d b/source/d/gc/cards.d
+new file mode 100644
+index 0000000..5693d9d
+--- /dev/null
++++ b/source/d/gc/cards.d
+@@ -0,0 +1,145 @@
++module d.gc.cards;
++
++/**
++ * Card marking, the compiler-assisted way to know what the program wrote.
++ *
++ * With `-version=Symgc_cards` the collector does not ask the kernel which
++ * pages were written (d.gc.dirty); the compiler says so. Code built with
++ * ldc2 `-gc-card-marking` sets one byte in the card table, `base[addr >> 9]`,
++ * after each store of a pointer to memory that is not on the stack or a
++ * global, and after each memcpy/memmove to such memory. The collector reads
++ * and clears the table to find the 512 byte cards to scan again.
++ *
++ * Compared to the kernel route: a store that is not a pointer (a float in an
++ * object that is written every frame) dirties nothing, nothing faults after a
++ * collection cycle starts, and the pause only depends on the pointers the
++ * program wrote. The price: every store of a pointer costs three more
++ * instructions, and writes that do not come from instrumented code (a C
++ * library, `read()` into a buffer) are not seen.
++ */
++
++
++import core.sys.posix.sys.mman;
++import core.atomic;
++
++enum CardShift = 9;
++enum CardSize = size_t(1) << CardShift;
++
++// The whole user address space: 2^47 bytes of addresses, one byte per card.
++enum TableSize = size_t(1) << (47 - CardShift);
++
++/**
++ * The code the compiler emits loads this on each barrier, and indexes it
++ * with `address >> CardShift`.
++ */
++extern(C) __gshared ubyte* __sd_gc_card_base;
++
++// Mapped before any code that stores a pointer runs, not lazily.
++pragma(crt_constructor)
++extern(C) void __sd_gc_card_init() {
++	enum MAP_NORESERVE = 0x4000; // Linux
++	enum Flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
++	auto p = mmap(null, TableSize, PROT_READ | PROT_WRITE, Flags, -1, 0);
++	if (p is MAP_FAILED) {
++		import core.stdc.stdio : fputs, stderr;
++		import core.stdc.stdlib : abort;
++		fputs("symgc: cannot map the card table\n", stderr);
++		abort();
++	}
++
++	__sd_gc_card_base = cast(ubyte*) p;
++}
++
++/**
++ * Mark every card of a range. The compiler calls this after a copy that
++ * may carry pointers into memory it cannot see through.
++ */
++extern(C) void __sd_gc_card_range(void* dst, size_t size) {
++	if (size == 0) {
++		return;
++	}
++
++	auto first = cast(size_t) dst >> CardShift;
++	auto last = (cast(size_t) dst + size - 1) >> CardShift;
++	__sd_gc_card_base[first .. last + 1] = 1;
++}
++
++/**
++ * Read and clear the cards of [start, start + size), calling `dg` with the
++ * page aligned runs that cover the dirty ones. Returns the number of pages.
++ */
++size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*, size_t) dg) {
++	enum PageSize = 4096;
++	enum CardsPerPage = PageSize / CardSize;
++
++	auto lo = start >> CardShift;
++	auto hi = (start + size) >> CardShift;
++	auto base = __sd_gc_card_base;
++
++	size_t pages = 0;
++	size_t runLo = 0;
++	size_t runHi = 0;
++
++	void flush() {
++		if (runLo < runHi) {
++			pages += (runHi - runLo) / PageSize;
++			if (dg !is null) {
++				dg(cast(const(void)*) runLo, runHi - runLo);
++			}
++		}
++
++		runLo = runHi = 0;
++	}
++
++	void page(size_t pageIndex) {
++		auto s = pageIndex * PageSize;
++		if (s == runHi && runHi != 0) {
++			runHi = s + PageSize;
++			return;
++		}
++
++		flush();
++		runLo = s;
++		runHi = s + PageSize;
++	}
++
++	// Eight cards at a time: an exchange of the whole word is atomic against
++	// the byte stores of the program, so a card set after it is seen next time.
++	size_t i = lo;
++	while (i < hi) {
++		if ((i & 7) == 0 && i + 8 <= hi) {
++			auto w = cast(shared(ulong)*) (base + i);
++			if (atomicLoad!(MemoryOrder.raw)(*w) == 0) {
++				i += 8;
++				continue;
++			}
++
++			auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
++			foreach (j; 0 .. 8) {
++				if ((v >> (8 * j)) & 0xff) {
++					page((i + j) / CardsPerPage);
++				}
++			}
++
++			i += 8;
++			continue;
++		}
++
++		auto b = cast(shared(ubyte)*) (base + i);
++		if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
++			page(i / CardsPerPage);
++		}
++
++		i++;
++	}
++
++	flush();
++	return pages;
++}
++
++/**
++ * Forget what was written so far (a collection is about to start).
++ */
++void clearCards(size_t start, size_t size) {
++	collectCards(start, size, null);
++}
+diff --git a/source/d/gc/dirty.d b/source/d/gc/dirty.d
+index f083007..e509900 100644
+--- a/source/d/gc/dirty.d
++++ b/source/d/gc/dirty.d
+@@ -33,11 +33,62 @@ version(linux) version(X86_64) {
+ 
+ alias DirtyRangeDg = void delegate(const(void)* start, size_t size);
+ 
++/**
++ * With `Symgc_cards`, the ranges to look at are the ones that hold pointers;
++ * the cards themselves are in d.gc.cards.
++ */
++version(Symgc_cards) {
++	enum MaxCardRanges = 4096;
++
++	struct CardRanges {
++		Mutex mutex;
++		size_t count;
++		size_t[MaxCardRanges] starts;
++		size_t[MaxCardRanges] sizes;
++
++	shared:
++		bool available() {
++			import core.stdc.stdlib : getenv;
++			auto env = getenv("SYMGC_CONCURRENT_MARK");
++			return env is null || env[0] != '0';
++		}
++
++		void register(void* start, size_t size) {
++			mutex.lock();
++			scope(exit) mutex.unlock();
++
++			auto t = cast(CardRanges*) &this;
++			assert(t.count < MaxCardRanges, "Too many pointer regions!");
++			t.starts[t.count] = cast(size_t) start;
++			t.sizes[t.count] = size;
++			t.count++;
++		}
++
++		size_t collect(scope DirtyRangeDg dg) {
++			mutex.lock();
++			scope(exit) mutex.unlock();
++
++			import d.gc.cards;
++			auto t = cast(CardRanges*) &this;
++			size_t pages = 0;
++			foreach (i; 0 .. t.count) {
++				pages += collectCards(t.starts[i], t.sizes[i], dg);
++			}
++
++			return pages;
++		}
++	}
++
++	shared CardRanges gCardRanges;
++}
++
+ /**
+  * Is tracking available? Decided once, on the first call.
+  */
+ bool dirtyAvailable() {
+-	version(DirtyTracking) {
++	version(Symgc_cards) {
++		return gCardRanges.available();
++	} else version(DirtyTracking) {
+ 		return gDirty.ensureInit();
+ 	} else {
+ 		return false;
+@@ -50,7 +101,9 @@ bool dirtyAvailable() {
+  * tracking is turned off for good: a mark that missed a range would be unsound.
+  */
+ void dirtyRegister(void* start, size_t size) {
+-	version(DirtyTracking) {
++	version(Symgc_cards) {
++		gCardRanges.register(start, size);
++	} else version(DirtyTracking) {
+ 		gDirty.register(start, size);
+ 	}
+ }
+@@ -61,7 +114,9 @@ void dirtyRegister(void* start, size_t size) {
+  * larger, so arming is an optimization and never needed for correctness.
+  */
+ void dirtyArm() {
+-	version(DirtyTracking) {
++	version(Symgc_cards) {
++		gCardRanges.collect(null);
++	} else version(DirtyTracking) {
+ 		gDirty.collect(null);
+ 	}
+ }
+@@ -72,7 +127,9 @@ void dirtyArm() {
+  * of pages reported.
+  */
+ size_t dirtyCollect(scope DirtyRangeDg dg) {
+-	version(DirtyTracking) {
++	version(Symgc_cards) {
++		return gCardRanges.collect(dg);
++	} else version(DirtyTracking) {
+ 		return gDirty.collect(dg);
+ 	} else {
+ 		return 0;
+-- 
+2.51.0
+

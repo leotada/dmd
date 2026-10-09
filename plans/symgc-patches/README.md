@@ -305,3 +305,53 @@ or PLT stubs, `data_start`), and only ~12% is in the GC (`atomicLoad` 5%,
 in typical frames is therefore not the allocation path; cache locality of
 where the slots come from (symgc's paced sweep keeps more memory in play) and
 the write-protect faults after each arm are the suspects. Not measured yet.
+
+## The compiler route: ldc2 -gc-card-marking + the Symgc_cards backend (patch 0014)
+
+`plans/ldc-patches/` holds the LDC side (branch `gc-card-marking` of the LDC
+checkout at `ldc/`, built with the LLVM 19 dev package): an IR pass that runs
+last and, after each store of a pointer to memory that is not an alloca or a
+global, after atomic pointer stores/exchanges and after memcpy/memmove to such
+memory, sets one byte in a card table (one byte per 512 bytes of address
+space, `__sd_gc_card_base[addr >> 9] = 1`). Stores of floats, ints and so on
+dirty nothing. symgc's side is `d/gc/cards.d` (table mapped in
+`.preinit_array`, 2^38 bytes of NORESERVE address space) selected with
+`-version=Symgc_cards`: the dirty rounds and the remark read and clear cards
+instead of asking the kernel for dirty pages. Runtime and Phobos have to be
+built with the flag too (`ldc-build-rt2`: LDC master druntime + the dmd Phobos
+checkout, D_EXTRA_FLAGS=-gc-card-marking).
+
+Correctness (LDC -O1 verify build, card barrier, concurrent mark):
+`mark_race` 8/8 OK (the same program without the barrier crashes on a freed
+live node), `alloc 8` x30 clean, Phobos stress 30/30, all gcb workloads run.
+
+Frames (gcb `frames`, 5000 allocations per frame, LDC -O3, 600 frames):
+
+| 2 GiB live | p50 | p99 | worst |
+|---|---|---|---|
+| kernel dirty pages (uffd), 5 runs | 0.36 ms | 0.71-0.77 | 0.80-1.09 ms |
+| card barrier, 5 runs | 0.33 | 0.68-0.72 | 0.75-0.84 ms |
+
+Bullet hell (LDC -O3):
+
+| 60 s, 512 MiB level, 20k bullets/s | p50 | p99 | worst | >16 ms |
+|---|---|---|---|---|
+| stock GC (LDC 1.40) | 0.24 ms | 0.55 | 21.6 | 2 |
+| symgc, kernel tracking | 0.47 | 0.94 | 1.69 | 0 |
+| symgc, card barrier | 0.34 | 0.70 | 2.77 (1 frame) | 0 |
+
+| 120 s, 2 GiB level, 40k bullets/s | p50 | p99 | worst | >16 ms |
+|---|---|---|---|---|
+| stock GC (LDC 1.40) | 0.52 | 0.94 | 80.2 | 2 |
+| symgc, kernel tracking | 0.73 | 1.43 | 3.10 | 0 |
+| symgc, card barrier | 0.68 | 1.12 | 1.64 | 0 |
+
+Remark pause with cards at 2 GiB: 0.27-0.47 ms, of which ~0.22 ms is reading
+the card table (it grows with the heap; a summary level is the next step).
+
+Known issue, LDC only: `finalizer_order` fails (and a 10-object reproduction)
+with symgc built by LDC even without cards and with the synchronous sweep: in
+the first cycle that runs after allocations, the mark bits of the slab of
+finalizable objects come out all ones (everything alive) while the objects
+they point to are freed, so a destructor later reads a reused slot. DMD
+builds do not show it. Not found yet.
