@@ -620,3 +620,28 @@ TLS, usually tens of KB) and the mark reads the copies; the remark pause still s
 `thread_exit_race` 8 of 8 (about 164,000 threads per run) with cards and 4 of 4 with the kernel tracker (repo dmd),
 the verifier battery clean (alloc 8 verify 30/30, mark_race 8/8, Phobos stress 30/30), the 1M city 3 of 3 without a
 crash.
+
+### GC time per frame (patch 0022): where the city's time goes
+
+Patch 0022 counts, per thread and in total, the time threads lose to memory management: **alloc** (the allocator's
+slow paths: bin refill with its lock waits, large allocations), **collect** (starting or helping a collection) and
+**pause** (stopped by the collector). Inner timers are taken out of outer ones, so the kinds do not overlap.
+`__sd_gc_time_thread` / `__sd_gc_time_total` return nanoseconds; `aaa_sim` reads both around every frame.
+
+City, 500k citizens, 20 s, one run each, LDC -O3, card barrier:
+
+| | collections on | collections off |
+|---|---|---|
+| frame p50 / p99.9 / worst | 5.3 / 10.7 / 12.8 ms | 5.6 / 9.6 / 9.8 ms |
+| main thread's GC time per frame p50 / p99.9 / max | 0.19 / 2.45 / 3.1 ms | 0.15 / 0.39 / 2.2 ms |
+| all threads' GC time per frame (sum) p50 / p99.9 / max | 1.04 / 10.1 / 22 ms | 0.89 / 7.1 / 7.5 ms |
+| run total, all threads: alloc / collect / pause | 1,347 / 79 / 12 ms | 1,160 / 2 / 0 ms |
+
+* Pauses are negligible: all threads together were stopped 12 ms in 20 s.
+* The allocator's slow path dominates and is there without collections too: ~1.2 s of thread time in 20 s, about
+  1 ms per frame summed over seven threads. Collection adds ~15% to it, plus 79 ms of start and assist.
+* The slow frames are the job threads': in the ten slowest frames the main thread lost 0.1-0.3 ms itself (one 3.1 ms)
+  but the job threads 1-22 ms summed, which delays the frame's join.
+
+Next: split the refill slow path (lock waits, fresh pages and page faults, slabs found by the sweep) and make it
+cheaper for job threads.

@@ -565,6 +565,26 @@ struct City {
 }
 
 // ---------------------------------------------------------------- main
+// symgc reports the time threads lose to memory management (ns: alloc slow paths,
+// collection start/assist, stopped by the collector); read around every frame.
+version(Symgc_druntime_hooks) {
+	extern(C) void __sd_gc_time_thread(ulong* dst);
+	extern(C) void __sd_gc_time_total(ulong* dst);
+	enum haveGcTime = true;
+} else {
+	enum haveGcTime = false;
+}
+
+struct GcClock {
+	ulong[3] thread, total;
+	void read() {
+		static if (haveGcTime) {
+			__sd_gc_time_thread(thread.ptr);
+			__sd_gc_time_total(total.ptr);
+		}
+	}
+}
+
 extern(C) int cmpLong(const void* a, const void* b) {
 	auto x = *cast(const long*) a, y = *cast(const long*) b;
 	return x < y ? -1 : (x > y);
@@ -596,8 +616,13 @@ void main(string[] args) {
 	immutable used0 = GC.stats().usedSize;
 	immutable total = seconds * 60;
 	auto ft = new long[](total);
+	auto gcMain = new long[](total);   // us the main thread lost to memory management
+	auto gcAll = new long[](total);    // us all threads lost, summed (job threads run in parallel)
+	ulong[3] kindMain, kindAll;        // ns per kind over the run
 	string hud;
 	foreach (f; 0 .. total) {
+		GcClock c0, c1;
+		c0.read();
 		immutable t0 = MonoTime.currTime;
 		final switch (mode) {
 			case "rts": rts.frame(f); hud = rts.hud; break;
@@ -605,6 +630,16 @@ void main(string[] args) {
 			case "city": city.frame(f); hud = city.hud; break;
 		}
 		ft[f] = (MonoTime.currTime - t0).total!"usecs";
+		c1.read();
+		ulong m = 0, a = 0;
+		foreach (k; 0 .. 3) {
+			m += c1.thread[k] - c0.thread[k];
+			a += c1.total[k] - c0.total[k];
+			kindMain[k] += c1.thread[k] - c0.thread[k];
+			kindAll[k] += c1.total[k] - c0.total[k];
+		}
+		gcMain[f] = m / 1000;
+		gcAll[f] = a / 1000;
 		long spent = ft[f];
 		while (spent < frameUs && spent >= 0) {
 			Thread.sleep(dur!"usecs"(frameUs - spent < 500 ? frameUs - spent : 500));
@@ -626,6 +661,30 @@ void main(string[] args) {
 	printf("frame_p50_us=%lld p99=%lld p999=%lld max=%lld over1ms=%lld over2ms=%lld over5ms=%lld over16ms=%lld frames=%lld\n",
 		sorted[total / 2], sorted[total * 99 / 100], sorted[total * 999 / 1000], sorted[$ - 1],
 		over(1000), over(2000), over(5000), over(16000), cast(long) total);
+	static if (haveGcTime) {
+		// The collector's share of each frame, and the game's own time without it.
+		auto own = new long[](total);
+		foreach (i; 0 .. total) own[i] = ft[i] - gcMain[i];
+		void dist(string name, long[] v) {
+			auto s = v.dup;
+			qsort(s.ptr, s.length, long.sizeof, &cmpLong);
+			printf("%-28s p50=%lld p99=%lld p999=%lld max=%lld (us)\n", name.ptr,
+				s[total / 2], s[total * 99 / 100], s[total * 999 / 1000], s[$ - 1]);
+		}
+		dist("gc_main (main thread)", gcMain);
+		dist("gc_all (all threads, sum)", gcAll);
+		dist("frame minus gc_main", own);
+		printf("gc time over the run, ms: main alloc=%.1f collect=%.1f pause=%.1f | all alloc=%.1f collect=%.1f pause=%.1f\n",
+			kindMain[0] / 1e6, kindMain[1] / 1e6, kindMain[2] / 1e6, kindAll[0] / 1e6, kindAll[1] / 1e6, kindAll[2] / 1e6);
+		// the ten slowest frames, split
+		auto idx = new size_t[](total);
+		foreach (i; 0 .. total) idx[i] = i;
+		import std.algorithm : sort;
+		idx.sort!((x, y) => ft[x] > ft[y]);
+		printf("slowest frames (frame us / gc_main us / gc_all us):");
+		foreach (i; idx[0 .. 10]) printf(" %lld/%lld/%lld", ft[i], gcMain[i], gcAll[i]);
+		printf("\n");
+	}
 	{
 		import std.file : readText;
 		import std.string : splitLines, startsWith, strip;

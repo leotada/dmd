@@ -1,0 +1,185 @@
+From 64fe12086a586a44d748a8a43c64f5866854aa07 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 14:45:18 -0300
+Subject: [PATCH] Count the time threads lose to memory management
+
+Per thread and in total: the allocator's slow paths (bin refill, large
+allocations), starting or helping a collection, and time stopped by the
+collector. Each timer takes out what inner timers recorded, so the kinds do
+not overlap. Read with __sd_gc_time_thread / __sd_gc_time_total (ns) around a
+frame to split the frame into the program's own time and the collector's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/capi.d   | 17 +++++++++++
+ source/d/gc/gctime.d | 73 ++++++++++++++++++++++++++++++++++++++++++++
+ source/d/gc/signal.d |  5 +++
+ source/d/gc/tcache.d | 13 ++++++++
+ 4 files changed, 108 insertions(+)
+ create mode 100644 source/d/gc/gctime.d
+
+diff --git a/source/d/gc/capi.d b/source/d/gc/capi.d
+index c99eeae..9a6609d 100644
+--- a/source/d/gc/capi.d
++++ b/source/d/gc/capi.d
+@@ -93,6 +93,23 @@ uint __sd_gc_disable() {
+ 	return disableAutomaticCollections();
+ }
+ 
++/**
++ * Time lost to memory management, in nanoseconds: `dst[0]` the allocator's
++ * slow paths, `dst[1]` starting or helping a collection, `dst[2]` stopped by
++ * the collector. For the calling thread since it started, or for all threads
++ * since the program started. Read it before and after a frame for the
++ * collector's share of that frame.
++ */
++void __sd_gc_time_thread(ulong* dst) {
++	import d.gc.gctime;
++	readThread(dst);
++}
++
++void __sd_gc_time_total(ulong* dst) {
++	import d.gc.gctime;
++	readTotal(dst);
++}
++
+ PageDescriptor __sd_gc_maybe_get_page_descriptor(void* ptr) {
+ 	return threadCache.maybeGetPageDescriptor(ptr);
+ }
+diff --git a/source/d/gc/gctime.d b/source/d/gc/gctime.d
+new file mode 100644
+index 0000000..66f040d
+--- /dev/null
++++ b/source/d/gc/gctime.d
+@@ -0,0 +1,73 @@
++module d.gc.gctime;
++
++/**
++ * Time the program's own threads lose to memory management, so a program
++ * can tell its own frame time from the collector's:
++ *  - Alloc: the allocator's slow paths (refilling a thread bin from an arena,
++ *    with its lock waits, and large allocations);
++ *  - Collect: deciding on, starting or waiting for a collection, and helping
++ *    the sweep (assist);
++ *  - Pause: stopped by the collector (start and remark pauses).
++ *
++ * Each timer counts its own time only: whatever an inner timer recorded
++ * meanwhile (a pause during a refill, a collection during an allocation) is
++ * taken out, so the kinds add up without counting anything twice.
++ *
++ * Times are in hnsecs internally and reported in nanoseconds.
++ */
++enum GcTimeKind : uint {
++	Alloc,
++	Collect,
++	Pause,
++}
++
++enum GcTimeKindCount = 3;
++
++/// All threads since the start.
++shared ulong[GcTimeKindCount] gGcTimeTotal;
++
++/// This thread since it started.
++ulong[GcTimeKindCount] tGcTime;
++ulong tGcTimeSum;
++
++struct GcTimer {
++	ulong start;
++	ulong innerAtStart;
++	GcTimeKind kind;
++
++	static GcTimer begin(GcTimeKind kind) {
++		import d.gc.time;
++		return GcTimer(getMonotonicTime(), tGcTimeSum, kind);
++	}
++
++	void end() {
++		import d.gc.time;
++		auto elapsed = getMonotonicTime() - start;
++		auto inner = tGcTimeSum - innerAtStart;
++		record(kind, elapsed > inner ? elapsed - inner : 0);
++	}
++}
++
++void record(GcTimeKind kind, ulong hnsecs) {
++	tGcTime[kind] += hnsecs;
++	tGcTimeSum += hnsecs;
++
++	import core.atomic : atomicOp;
++	atomicOp!"+="(gGcTimeTotal[kind], hnsecs);
++}
++
++/**
++ * The counters as nanoseconds, in `GcTimeKind` order.
++ */
++void readThread(ulong* dst) {
++	foreach (i; 0 .. GcTimeKindCount) {
++		dst[i] = tGcTime[i] * 100;
++	}
++}
++
++void readTotal(ulong* dst) {
++	import core.atomic : atomicLoad;
++	foreach (i; 0 .. GcTimeKindCount) {
++		dst[i] = atomicLoad(gGcTimeTotal[i]) * 100;
++	}
++}
+diff --git a/source/d/gc/signal.d b/source/d/gc/signal.d
+index 54da4f6..6e7b0fc 100644
+--- a/source/d/gc/signal.d
++++ b/source/d/gc/signal.d
+@@ -129,6 +129,11 @@ void suspendThreadImpl(ThreadState* ts, void* stackTop) {
+ 	threadCache.stackTop = stackTop;
+ 	scope(exit) threadCache.stackTop = null;
+ 
++	// Time stopped by the collector.
++	import d.gc.gctime;
++	auto gcTimer = GcTimer.begin(GcTimeKind.Pause);
++	scope(exit) gcTimer.end();
++
+ 	import d.gc.hooks;
+ 	__sd_gc_pre_suspend_hook(stackTop);
+ 	scope(exit) __sd_gc_post_suspend_hook();
+diff --git a/source/d/gc/tcache.d b/source/d/gc/tcache.d
+index 299f3db..775520b 100644
+--- a/source/d/gc/tcache.d
++++ b/source/d/gc/tcache.d
+@@ -543,6 +543,11 @@ private:
+ 			return ptr;
+ 		}
+ 
++		// The slow path: time lost to memory management.
++		import d.gc.gctime;
++		auto gcTimer = GcTimer.begin(GcTimeKind.Alloc);
++		scope(exit) gcTimer.end();
++
+ 		// We are about to allocate, make room for it if needed.
+ 		version(Symgc_phase_trace) {
+ 			import d.gc.time;
+@@ -668,6 +673,10 @@ private:
+ 		assert(!isScanningThread, "Trying to allocate while in scanning thread!");
+ 		ensureThreadCacheIsInitialized();
+ 
++		import d.gc.gctime;
++		auto gcTimer = GcTimer.begin(GcTimeKind.Alloc);
++		scope(exit) gcTimer.end();
++
+ 		// We are about to allocate, make room for it if needed.
+ 		maybeRunGCCycle();
+ 
+@@ -847,6 +856,10 @@ private:
+ 
+ 		nextGCRun = allocated + BlockSize;
+ 
++		import d.gc.gctime;
++		auto gcTimer = GcTimer.begin(GcTimeKind.Collect);
++		scope(exit) gcTimer.end();
++
+ 		import d.gc.collector;
+ 		auto collector = Collector(&this);
+ 
+-- 
+2.51.0
+
