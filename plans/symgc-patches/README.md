@@ -355,3 +355,12 @@ the first cycle that runs after allocations, the mark bits of the slab of
 finalizable objects come out all ones (everything alive) while the objects
 they point to are freed, so a destructor later reads a reused slot. DMD
 builds do not show it. Not found yet.
+
+### Summary level (patch 0015, LDC patch 0003)
+
+The barrier also sets one summary byte per 64 KiB; the collector reads the
+summary and only the cards of the regions it marks. Remark at 8 GiB live:
+0.55-0.85 -> 0.21-0.34 ms. `frames 8192` (LDC -O3, card barrier): p50 0.38 ms,
+p99 0.77-0.81 ms, worst 1.06-1.12 ms (1 to 4 frames of 1200 over 1 ms; the
+excess over the median is not a collector pause). Battery with the summary:
+`mark_race` 8/8, `alloc 8` verify x30 clean, Phobos stress 30/30.

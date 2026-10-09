@@ -1,0 +1,76 @@
+From c6aac75c20fe1ae85572ea4a0721d99f541fa9ae Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 23:19:28 -0300
+Subject: [PATCH 3/3] gc-card-marking: also set a 64 KiB summary byte
+
+So that the collector finds the dirty cards of a many-GiB heap without reading
+the whole card table.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ gen/passes/GCCardMarking.cpp | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/gen/passes/GCCardMarking.cpp b/gen/passes/GCCardMarking.cpp
+index 1d4c00973e..8c6d42534d 100644
+--- a/gen/passes/GCCardMarking.cpp
++++ b/gen/passes/GCCardMarking.cpp
+@@ -20,13 +20,15 @@ using namespace llvm;
+ 
+ namespace {
+ 
+-constexpr unsigned CardShift = 9; // 512 byte cards
++constexpr unsigned CardShift = 9;     // 512 byte cards
++constexpr unsigned SummaryShift = 16; // 64 KiB summary
+ 
+ struct Marker {
+   Module &M;
+   LLVMContext &C;
+   Type *IntPtrTy;
+   GlobalVariable *CardBase;
++  GlobalVariable *SummaryBase;
+   FunctionCallee CardRange;
+   InlineAsm *CompilerBarrier;
+ 
+@@ -40,6 +42,12 @@ struct Marker {
+                                     GlobalValue::ExternalLinkage, nullptr,
+                                     "__sd_gc_card_base");
+     }
++    SummaryBase = M.getGlobalVariable("__sd_gc_card_summary_base");
++    if (!SummaryBase) {
++      SummaryBase = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
++                                       GlobalValue::ExternalLinkage, nullptr,
++                                       "__sd_gc_card_summary_base");
++    }
+     CardRange = M.getOrInsertFunction(
+         "__sd_gc_card_range", Type::getVoidTy(C), PtrTy, IntPtrTy);
+     // Keeps the compiler from moving the card store above the pointer store.
+@@ -67,6 +75,16 @@ struct Marker {
+     auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
+     auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
+     B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
++    markSummary(B, Int);
++  }
++
++  /// One byte per 64 KiB, so that finding the dirty cards of a big heap does
++  /// not mean reading all of the card table.
++  void markSummary(IRBuilder<> &B, Value *AddrInt) {
++    auto *SIdx = B.CreateLShr(AddrInt, ConstantInt::get(IntPtrTy, SummaryShift));
++    auto *SBase = B.CreateLoad(PointerType::getUnqual(C), SummaryBase);
++    auto *SSlot = B.CreateGEP(Type::getInt8Ty(C), SBase, SIdx);
++    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), SSlot);
+   }
+ 
+   void markRange(IRBuilder<> &B, Value *Dst, Value *Size) {
+@@ -96,6 +114,7 @@ struct Marker {
+     auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
+     auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
+     B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
++    markSummary(B, Int);
+   }
+ };
+ 
+-- 
+2.51.0
+

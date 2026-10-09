@@ -1,7 +1,7 @@
 From bf5370352f7cf7cff89e99f75ffb310fd167d344 Mon Sep 17 00:00:00 2001
 From: Leonardo Tada Antunes <leonardotada@gmail.com>
 Date: Thu, 8 Oct 2026 22:54:14 -0300
-Subject: [PATCH 1/2] Add -gc-card-marking: post-store card marking barrier for
+Subject: [PATCH 1/3] Add -gc-card-marking: post-store card marking barrier for
  a concurrent GC
 
 An IR pass, run last, that marks a byte of the card table after each store of
