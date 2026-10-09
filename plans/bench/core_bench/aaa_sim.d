@@ -576,7 +576,9 @@ version(Symgc_druntime_hooks) {
 }
 
 struct GcClock {
-	ulong[3] thread, total;
+	// alloc, collect, pause, bin lock, fresh slab, filler lock
+	enum kinds = 6;
+	ulong[kinds] thread, total;
 	void read() {
 		static if (haveGcTime) {
 			__sd_gc_time_thread(thread.ptr);
@@ -618,7 +620,7 @@ void main(string[] args) {
 	auto ft = new long[](total);
 	auto gcMain = new long[](total);   // us the main thread lost to memory management
 	auto gcAll = new long[](total);    // us all threads lost, summed (job threads run in parallel)
-	ulong[3] kindMain, kindAll;        // ns per kind over the run
+	ulong[GcClock.kinds] kindMain, kindAll;   // ns per kind over the run
 	string hud;
 	foreach (f; 0 .. total) {
 		GcClock c0, c1;
@@ -632,7 +634,7 @@ void main(string[] args) {
 		ft[f] = (MonoTime.currTime - t0).total!"usecs";
 		c1.read();
 		ulong m = 0, a = 0;
-		foreach (k; 0 .. 3) {
+		foreach (k; 0 .. GcClock.kinds) {
 			m += c1.thread[k] - c0.thread[k];
 			a += c1.total[k] - c0.total[k];
 			kindMain[k] += c1.thread[k] - c0.thread[k];
@@ -674,8 +676,12 @@ void main(string[] args) {
 		dist("gc_main (main thread)", gcMain);
 		dist("gc_all (all threads, sum)", gcAll);
 		dist("frame minus gc_main", own);
-		printf("gc time over the run, ms: main alloc=%.1f collect=%.1f pause=%.1f | all alloc=%.1f collect=%.1f pause=%.1f\n",
-			kindMain[0] / 1e6, kindMain[1] / 1e6, kindMain[2] / 1e6, kindAll[0] / 1e6, kindAll[1] / 1e6, kindAll[2] / 1e6);
+		static immutable kindNames = ["alloc", "collect", "pause", "binlock", "freshslab", "fillerlock"];
+		foreach (who, arr; [kindMain, kindAll]) {
+			printf("gc time over the run, ms, %s:", who == 0 ? "main".ptr : "all ".ptr);
+			foreach (k; 0 .. GcClock.kinds) printf(" %s=%.1f", kindNames[k].ptr, arr[k] / 1e6);
+			printf("\n");
+		}
 		// the ten slowest frames, split
 		auto idx = new size_t[](total);
 		foreach (i; 0 .. total) idx[i] = i;

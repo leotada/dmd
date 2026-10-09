@@ -643,5 +643,33 @@ City, 500k citizens, 20 s, one run each, LDC -O3, card barrier:
 * The slow frames are the job threads': in the ten slowest frames the main thread lost 0.1-0.3 ms itself (one 3.1 ms)
   but the job threads 1-22 ms summed, which delays the frame's join.
 
-Next: split the refill slow path (lock waits, fresh pages and page faults, slabs found by the sweep) and make it
-cheaper for job threads.
+**The slow path split (patch 0023).** Three more timers inside it: waiting for the bin's lock, getting a fresh slab
+from the page filler (without its lock wait), and waiting for the page filler's lock; `alloc` is now what is left.
+The collector's own threads record nothing. City, 500k citizens, 30 s, one run each, all threads summed:
+
+| | collections on | collections off | added by collection |
+|---|---|---|---|
+| alloc (the rest of the slow path) | 1,585 ms | 1,470 ms | +115 |
+| fresh slab | 585 | 423 | +162 |
+| filler lock wait | 343 | 102 | **+241** |
+| bin lock wait | 267 | 194 | +73 |
+| collect (start, assist) | 129 | 3 | +126 |
+| pause | 16 | 0 | +16 |
+| total | 2,925 | 2,192 | +733 |
+
+* What collection adds is about 24 ms per second of thread time, 0.4 ms per frame summed over seven threads. The
+  largest part is waiting for the page filler's lock (3.4x with collections on), which the sweeper holds while it
+  works; then fresh slabs (the bins are emptied at each epoch start, so threads take new slabs until the sweep
+  returns old ones) and starting or assisting collections.
+* Most of the slow-path time is the allocator's own, collection or not: about 1.2 ms per frame summed over the
+  threads.
+* A SIGPROF profile of the same run (CPU only; lock waits do not show): the game's pathfinding 43%, the collector's
+  mark threads 11.7% (background, on other cores), shared libraries 8.8%, associative arrays and hashing about 10%,
+  the allocator about 11% (appends `~=` through `resize`/`allocAppendable` 5%, the slow path 2.6%, extent-map lookups
+  1.1%, refill 1.1%).
+
+Candidates, from these numbers: keep job threads off the filler lock while the sweeper works (a small reserve of
+fresh slabs per arena, refilled outside the lock); return swept slabs to the bins sooner after an epoch starts;
+cheaper appends and associative arrays in druntime. A spare-slab stash was tried before (2026-10-09, morning) and
+dropped: no gain on the frame benchmark and 12% slower `alloc-1t`; the filler-lock numbers above are the case for
+trying a better one.

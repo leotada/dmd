@@ -1,0 +1,200 @@
+From f6a09150061de6ae950490727a5928dcf51368d0 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 15:01:05 -0300
+Subject: [PATCH] GC time: split the slow path (bin lock, fresh slab, filler
+ lock)
+
+Three more timers inside the allocator's slow path, so a refill shows where
+it waits: the bin's lock, getting a new slab from the page filler, and the
+page filler's lock. The collector's own threads are marked and record
+nothing: they take the same locks, and that is not time the program lost.
+__sd_gc_time_thread / __sd_gc_time_total now fill six values.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/bin.d       | 16 ++++++++++++++--
+ source/d/gc/capi.d      | 12 +++++++-----
+ source/d/gc/collector.d |  3 +++
+ source/d/gc/gctime.d    | 26 ++++++++++++++++++++++++--
+ source/d/gc/page.d      | 16 ++++++++++++++--
+ source/d/gc/scanner.d   |  3 +++
+ 6 files changed, 65 insertions(+), 11 deletions(-)
+
+diff --git a/source/d/gc/bin.d b/source/d/gc/bin.d
+index 9bce120..88d5408 100644
+--- a/source/d/gc/bin.d
++++ b/source/d/gc/bin.d
+@@ -62,7 +62,13 @@ struct Bin {
+ 		auto insert = bottom;
+ 
+ 		Refill: {
+-			mutex.lock();
++			{
++				import d.gc.gctime;
++				auto lockTimer = GcTimer.begin(GcTimeKind.BinLock);
++				mutex.lock();
++				lockTimer.end();
++			}
++
+ 			scope(exit) mutex.unlock();
+ 
+ 			auto slabs = &(cast(Bin*) &this).slabs;
+@@ -140,7 +146,13 @@ struct Bin {
+ 			return insert;
+ 		}
+ 
+-		freshSlab = filler.allocSlab(emap, sizeClass);
++		{
++			import d.gc.gctime;
++			auto slabTimer = GcTimer.begin(GcTimeKind.FreshSlab);
++			freshSlab = filler.allocSlab(emap, sizeClass);
++			slabTimer.end();
++		}
++
+ 		assert(freshSlab is null || freshSlab.nfree == nslots);
+ 
+ 		progressed = false;
+diff --git a/source/d/gc/capi.d b/source/d/gc/capi.d
+index 9a6609d..0674242 100644
+--- a/source/d/gc/capi.d
++++ b/source/d/gc/capi.d
+@@ -94,11 +94,13 @@ uint __sd_gc_disable() {
+ }
+ 
+ /**
+- * Time lost to memory management, in nanoseconds: `dst[0]` the allocator's
+- * slow paths, `dst[1]` starting or helping a collection, `dst[2]` stopped by
+- * the collector. For the calling thread since it started, or for all threads
+- * since the program started. Read it before and after a frame for the
+- * collector's share of that frame.
++ * Time lost to memory management, in nanoseconds, six values: `dst[0]` the
++ * allocator's slow paths, `dst[1]` starting or helping a collection, `dst[2]`
++ * stopped by the collector, and three parts of the slow paths, not counted in
++ * `dst[0]`: `dst[3]` waiting for a bin's lock, `dst[4]` getting a new slab,
++ * `dst[5]` waiting for the page filler's lock. For the calling thread since it
++ * started, or for all the program's threads since it started. Read it before
++ * and after a frame for the collector's share of that frame.
+  */
+ void __sd_gc_time_thread(ulong* dst) {
+ 	import d.gc.gctime;
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 7352827..fb751ee 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -1025,6 +1025,9 @@ private:
+ 				setpriority(PRIO_PROCESS, 0, nice);
+ 			}
+ 
++			import d.gc.gctime;
++			markGcThread();
++
+ 			(cast(shared(Sweeper)*) arg).run();
+ 		}
+ 
+diff --git a/source/d/gc/gctime.d b/source/d/gc/gctime.d
+index 66f040d..ad07d32 100644
+--- a/source/d/gc/gctime.d
++++ b/source/d/gc/gctime.d
+@@ -9,9 +9,17 @@ module d.gc.gctime;
+  *    the sweep (assist);
+  *  - Pause: stopped by the collector (start and remark pauses).
+  *
++ *  - BinLock, FreshSlab, FillerLock: parts of Alloc, timed on their own to see
++ *    where a refill waits: the bin's lock, getting a new slab from the page
++ *    filler (its work, without its lock wait), and the page filler's lock.
++ *
+  * Each timer counts its own time only: whatever an inner timer recorded
+  * meanwhile (a pause during a refill, a collection during an allocation) is
+- * taken out, so the kinds add up without counting anything twice.
++ * taken out, so the kinds add up without counting anything twice. Alloc is
++ * what is left of a slow path once its parts are taken out.
++ *
++ * Only the program's threads count: the collector's own threads (marking,
++ * sweeping) take the same locks, and that is not time the program lost.
+  *
+  * Times are in hnsecs internally and reported in nanoseconds.
+  */
+@@ -19,9 +27,19 @@ enum GcTimeKind : uint {
+ 	Alloc,
+ 	Collect,
+ 	Pause,
++	BinLock,
++	FreshSlab,
++	FillerLock,
+ }
+ 
+-enum GcTimeKindCount = 3;
++enum GcTimeKindCount = 6;
++
++/// Set on the collector's own threads: they record nothing.
++bool tIsGcThread;
++
++void markGcThread() {
++	tIsGcThread = true;
++}
+ 
+ /// All threads since the start.
+ shared ulong[GcTimeKindCount] gGcTimeTotal;
+@@ -49,6 +67,10 @@ struct GcTimer {
+ }
+ 
+ void record(GcTimeKind kind, ulong hnsecs) {
++	if (tIsGcThread) {
++		return;
++	}
++
+ 	tGcTime[kind] += hnsecs;
+ 	tGcTimeSum += hnsecs;
+ 
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 41f57a3..8e692f3 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -327,7 +327,13 @@ public:
+ 
+ 		auto mask = uint.max << allocClass;
+ 
+-		mutex.lock();
++		{
++			import d.gc.gctime;
++			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
++			mutex.lock();
++			lockTimer.end();
++		}
++
+ 		scope(exit) mutex.unlock();
+ 
+ 		return (cast(PageFiller*) &this).allocRunImpl(pages, mask, ec, dirty);
+@@ -339,7 +345,13 @@ public:
+ 		uint extraBlocks = (pages - 1) / PagesInBlock;
+ 		pages = modUp(pages, PagesInBlock);
+ 
+-		mutex.lock();
++		{
++			import d.gc.gctime;
++			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
++			mutex.lock();
++			lockTimer.end();
++		}
++
+ 		scope(exit) mutex.unlock();
+ 
+ 		return (cast(PageFiller*) &this).allocHugeImpl(pages, extraBlocks);
+diff --git a/source/d/gc/scanner.d b/source/d/gc/scanner.d
+index 77380d4..baf7a45 100644
+--- a/source/d/gc/scanner.d
++++ b/source/d/gc/scanner.d
+@@ -408,6 +408,9 @@ public:
+ 			import d.gc.tcache;
+ 			threadCache.activateGC(false);
+ 
++			import d.gc.gctime;
++			markGcThread();
++
+ 			// Set a flag saying we should not be using our local thread cache.
+ 			// The only allocations/free we should be doing is to resize the work list.
+ 			// Note that scanning threads DO NOT have their stack or TLS scanned,
+-- 
+2.51.0
+
