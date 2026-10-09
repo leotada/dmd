@@ -418,3 +418,8 @@ threads that needed a slab waited for it. It is paced now. Also, returning pages
 OS (`madvise`) was one call per block under the same lock: 0.3-3 ms for 2 MiB; it is a
 chunk of 16 pages per step now. The slow frames with many context switches are gone;
 frames of 2-3 ms remain in some runs (single events with 0-1 switches, cause not found).
+
+After patch 0018, multi-threaded game (LDC -O3, card barrier, 2 GiB live, 180 s, 10800
+frames): p50 0.22 ms, p99 0.38 ms, p99.9 0.75 ms, worst 1.99 ms, 5 frames over 1 ms
+(0.05%), none over 2 ms. Before it, the same game had p99 0.77 ms and about 20 frames
+over 1 ms per 7200. Stock GC (LDC 1.40): p50 0.72, p99 3.9, p99.9 30.8, worst 60.8 ms.
