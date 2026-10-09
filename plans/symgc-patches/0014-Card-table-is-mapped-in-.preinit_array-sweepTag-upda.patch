@@ -1,7 +1,7 @@
 From 083ba8171b2aec412312b295789a3bf9475141f3 Mon Sep 17 00:00:00 2001
 From: Leonardo Tada Antunes <leonardotada@gmail.com>
 Date: Thu, 8 Oct 2026 23:08:40 -0300
-Subject: [PATCH 14/16] Card table is mapped in .preinit_array; sweepTag update
+Subject: [PATCH 14/17] Card table is mapped in .preinit_array; sweepTag update
  is a compare and swap
 
 The constructors of a program run in no defined order, and a pointer store

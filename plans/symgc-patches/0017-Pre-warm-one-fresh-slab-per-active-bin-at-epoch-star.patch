@@ -1,0 +1,170 @@
+From d552c30bb470d8a7321fe7eb6773ed06d30980b4 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 00:01:54 -0300
+Subject: [PATCH 17/17] Pre-warm one fresh slab per active bin at epoch start;
+ pace the concurrent prepare
+
+A collection that starts empties the bins, and the program then made a slab for
+each size class it used, all in its next frame (1.5-1.9 ms frames at the start of
+each cycle in the 2 GiB bullet hell). The collector thread now gives each bin that
+was in use a fresh, born slab before the program asks. The concurrent prepare is
+paced like the sweep.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/arena.d     | 20 ++++++++++++++++++--
+ source/d/gc/bin.d       | 33 +++++++++++++++++++++++++++++++--
+ source/d/gc/collector.d | 11 +++++++++--
+ source/d/gc/page.d      |  8 ++++++++
+ 4 files changed, 66 insertions(+), 6 deletions(-)
+
+diff --git a/source/d/gc/arena.d b/source/d/gc/arena.d
+index 5fdaf5e..1a7bf7b 100644
+--- a/source/d/gc/arena.d
++++ b/source/d/gc/arena.d
+@@ -300,9 +300,25 @@ package:
+ 	/**
+ 	 * `clearBinsForCollection` when `lockBins` is held.
+ 	 */
+-	void clearLockedBins() shared {
++	ulong[(BinCount + 63) / 64] clearLockedBins() shared {
++		ulong[(BinCount + 63) / 64] active;
+ 		foreach (i; 0 .. BinCount) {
+-			bins[i].clearLocked();
++			if (bins[i].clearLocked()) {
++				active[i / 64] |= ulong(1) << (i % 64);
++			}
++		}
++
++		return active;
++	}
++
++	/**
++	 * Give the bins that were in use a fresh slab each (see `Bin.prewarm`).
++	 */
++	void prewarmBins(ref CachedExtentMap emap, ref const ulong[(BinCount + 63) / 64] active) shared {
++		foreach (i; 0 .. BinCount) {
++			if ((active[i / 64] >> (i % 64)) & 1) {
++				bins[i].prewarm(&filler, emap, cast(ubyte) i);
++			}
+ 		}
+ 	}
+ 
+diff --git a/source/d/gc/bin.d b/source/d/gc/bin.d
+index c332207..9bce120 100644
+--- a/source/d/gc/bin.d
++++ b/source/d/gc/bin.d
+@@ -232,10 +232,39 @@ package:
+ 		(cast(PriorityExtentHeap*) &slabs).clear();
+ 	}
+ 
+-	void clearLocked() shared {
++	bool clearLocked() shared {
+ 		assert(mutex.isHeld(), "Mutex not held!");
+ 
+-		(cast(PriorityExtentHeap*) &slabs).clear();
++		auto heap = cast(PriorityExtentHeap*) &slabs;
++		auto wasActive = !heap.empty;
++		heap.clear();
++		return wasActive;
++	}
++
++	/**
++	 * Put a fresh slab in the bin before the program asks for one. A
++	 * collection that starts empties the bins, and the program would then
++	 * have to make a slab for each size class it uses, all in its next
++	 * frame. Called by the collector thread, with the epoch started: the slab
++	 * is born in it, like any slab made from now on.
++	 */
++	void prewarm(shared(PageFiller)* filler, ref CachedExtentMap emap, ubyte sizeClass) shared {
++		auto fresh = filler.allocSlab(emap, sizeClass);
++		if (fresh is null) {
++			return;
++		}
++
++		import d.gc.extent : gSweepCycle;
++		auto epoch = gSweepCycle.load();
++
++		mutex.lock();
++		scope(exit) mutex.unlock();
++
++		if (epoch != 0 && fresh.sweepTag != epoch) {
++			fresh.sweepTag = epoch;
++		}
++
++		(cast(PriorityExtentHeap*) &slabs).insert(fresh);
+ 	}
+ 
+ 	void combineAfterCollection(ref PriorityExtentHeap cSlabs) shared {
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 34be3e2..03510f4 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -704,6 +704,8 @@ private:
+ 		 * release a lock somebody else holds.
+ 		 */
+ 		shared(Arena)*[ArenaCount] locked;
++		import d.gc.sizeclass : BinCount;
++		ulong[(BinCount + 63) / 64][ArenaCount] active;
+ 		uint count = 0;
+ 
+ 		foreach (i; 0 .. ArenaCount) {
+@@ -716,13 +718,18 @@ private:
+ 
+ 		startEpoch();
+ 
+-		foreach (a; locked[0 .. count]) {
+-			a.clearLockedBins();
++		foreach (i, a; locked[0 .. count]) {
++			active[i] = a.clearLockedBins();
+ 		}
+ 
+ 		foreach_reverse (a; locked[0 .. count]) {
+ 			a.unlockBins();
+ 		}
++
++		// The program is about to ask for a slab per size class it uses.
++		foreach (i, a; locked[0 .. count]) {
++			a.prewarmBins(emap, active[i]);
++		}
+ 	}
+ 
+ 	/**
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 73bcd20..4f61dfe 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -410,14 +410,20 @@ public:
+ 			self.beginPrepareImpl(gcCycle);
+ 		}
+ 
++		// Paced like the sweep: flat out, the prepare of a big heap slows
++		// the thread that allocates for as long as it takes.
++		ulong owed = 0;
+ 		while (true) {
+ 			bool more;
++			ulong spent;
+ 
+ 			{
+ 				mutex.lock();
+ 				scope(exit) mutex.unlockFairly();
+ 
++				auto tStep = getMonotonicTime();
+ 				more = self.prepareStepImpl(emap);
++				spent = getMonotonicTime() - tStep;
+ 			}
+ 
+ 			if (!more) {
+@@ -428,6 +434,8 @@ public:
+ 			for (uint i = 0; mutex.hasContenders && i < 64; i++) {
+ 				sched_yield();
+ 			}
++
++			owed = paceSweeper(owed, spent);
+ 		}
+ 	}
+ 
+-- 
+2.51.0
+

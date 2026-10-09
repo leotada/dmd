@@ -368,3 +368,15 @@ summary and only the cards of the regions it marks. Remark at 8 GiB live:
 p99 0.77-0.81 ms, worst 1.06-1.12 ms (1 to 4 frames of 1200 over 1 ms; the
 excess over the median is not a collector pause). Battery with the summary:
 `mark_race` 8/8, `alloc 8` verify x30 clean, Phobos stress 30/30.
+
+### Cycle-start spikes (patch 0017)
+
+The few slow frames of the 2 GiB bullet hell (1.5-1.9 ms, 4 of 7200) all sat
+at the start of a cycle: the epoch empties the bins, and the program then made
+a slab for each size class it used in its next frame. The collector thread now
+puts a fresh born slab in each bin that was in use before it lets the program
+go, and the concurrent prepare is paced like the sweep. Bullet hell, LDC -O3,
+card barrier: 2 GiB / 40k bullets/s p50 0.72, p99 1.22, worst 1.49 ms and no
+frame over 1.5 ms (was worst 1.65-1.92 ms); 512 MiB / 20k/s p50 0.38, p99 0.71,
+worst 1.04 ms. DMD battery, LDC battery (mark_race 8/8, alloc 8 verify x30,
+Phobos stress 30/30), gate and unit tests clean.
