@@ -261,3 +261,14 @@ at 60 fps.
 symgc never drops a 60 fps frame; the stock GC drops them (a 157 ms hitch at
 2 GiB). The price is steady-state speed: symgc's p50/p99 are 20-40% above the
 stock GC's (allocation path, dirty-page write faults, the paced sweep).
+
+### Dirty rounds: remark threshold 2048 -> 512 pages (patch 0012)
+
+A bullet-hell frame of 7.8 ms traced to one remark pause of 5.95 ms (556
+pages written since the last round, whose reachable subgraph the remark had
+to trace). Rounds now repeat until at most 512 pages (2 MiB) are left, not
+2048. Bullet hell (60 s, 512 MiB, 20k/s): worst frame 5.4 -> 2.2-2.7 ms, p50
+1.03 -> 0.93 ms, max remark pause 0.3-0.6 ms. A threshold of 128 pages (and 12
+rounds) was tried and refused: the longer mark let more garbage pile up and
+frag's steady RSS went 0.90 -> 1.09 GB (gate FAIL, +25%). With 512: frag RSS
+0.90-0.93 GB, gate PASS, battery clean.

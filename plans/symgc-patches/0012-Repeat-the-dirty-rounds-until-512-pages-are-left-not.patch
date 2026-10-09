@@ -1,0 +1,32 @@
+From f763964c7037454d2a89761afce6b5c6fa4856e4 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Thu, 8 Oct 2026 21:52:13 -0300
+Subject: [PATCH 12/12] Repeat the dirty rounds until 512 pages are left, not
+ 2048
+
+A remark that had to trace the subgraph behind 556 freshly written pages took
+6 ms in a game frame. 128 pages was too slow to converge (more garbage piles
+up: frag RSS +25%), 512 keeps both.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/collector.d | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 61ed480..ccb2f0f 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -438,7 +438,7 @@ private:
+ 		scope(exit) list.free();
+ 
+ 		enum MaxRounds = 8;
+-		enum RemarkPages = 2048; // 8 MiB
++		enum RemarkPages = 512; // 2 MiB
+ 
+ 		uint rounds = 0;
+ 		size_t lastPages = 0;
+-- 
+2.51.0
+
