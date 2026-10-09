@@ -491,3 +491,13 @@ itself is heavy). Open: the one 81 ms frame at 8 GiB in an untraced run, not rep
 the same game (max 3.3 ms); the cause is not known (the machine had the 8 GiB level and its page cache
 resident; an OS stall is possible but was not shown). The stock GC under LDC in the same games: p99.9 up to
 30.8 ms, worst 61 to 157 ms, 2 to 9 frames over 16 ms.
+
+### Is the tail of the bullet hell the collector's? No.
+
+The bullet hell (2 GiB level, 40k bullets/s, 3600 frames) run with `GC.disable()` after the level is built, so
+no collection runs in the frame loop: p50 0.71 ms, p99 1.22-1.24, p99.9 1.45-1.52, worst 1.57-1.95. With the
+collector on: p50 0.71-0.72, p99 1.18-1.24, p99.9 1.36-1.46, worst 1.56-1.67. The same. The 1.4-1.5 ms
+p99.9 of that game is its own cost (45k live bullets updated every frame, rebuilt arrays, formatted strings),
+not the collector. (The multi-threaded game cannot be measured this way: with the collector off the
+heap grows without bound and the frames die in page faults. Its median is 0.16-0.17 ms without collections
+and 0.25-0.29 ms with them, so the collector costs it about 0.1 ms per typical frame.)
