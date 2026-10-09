@@ -501,3 +501,8 @@ p99.9 of that game is its own cost (45k live bullets updated every frame, rebuil
 not the collector. (The multi-threaded game cannot be measured this way: with the collector off the
 heap grows without bound and the frames die in page faults. Its median is 0.16-0.17 ms without collections
 and 0.25-0.29 ms with them, so the collector costs it about 0.1 ms per typical frame.)
+
+Multi-threaded game, 2 GiB, 60 s (3600 frames), 3 runs unpinned and 3 pinned to one thread per physical core
+(`taskset -c 0,2,...,14`): p99.9 0.78-0.97 ms in all six (under 1 ms), p99 0.47-0.72 ms, worst 0.9-2.2 ms. Pinning
+changes nothing, so the run-to-run spread of the p99 (0.35 vs 0.75 ms) is not SMT sharing. p99.9 of a 3600-frame run
+is 3 or 4 frames, so it moves with a handful of events; over 7200 frames it was 0.77-1.45 ms.
