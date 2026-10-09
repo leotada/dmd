@@ -1059,6 +1059,70 @@ These cut mark work and false retention, which lowers the needed headroom and th
 
 **Not in the plan:** Track B, Immix, symgc fork-mode marking (POSIX only, copy-on-write cost, no Windows), and exact stack maps (Phase 8). Each stays shelved with the reason recorded above.
 
+#### Next steps after the 2026-10-09 results
+
+State: steps 0 to 6 are done in some form (concurrent mark by default, card barrier through LDC), steps 7 and 8 are not started. The agreed target (p99.9 under 1 ms and no frame over 16 ms at 2 and 8 GiB) is **not met**: p99.9 is 0.77-1.45 ms for the 2 GiB multi-threaded game and 1.4-1.6 ms for the bullet hell (whose own cost is above 1 ms), one untraced 8 GiB run had an 81 ms frame that was never explained, and no allocation-heavy real game has been run, so the claim that pools, per-frame allocation limits and manual `GC.collect` are unnecessary is not shown. Results are in `plans/symgc-patches/README.md`. Order of the work below; items 1 to 6 need no game from the owner, item 7 does.
+
+1. **Make the target measurable on any game.** A per-thread counter of the time spent in the collector (slow-path allocation, assist, lock waits, stop-the-world), readable once per frame. The criterion becomes p99.9 of the GC-attributed delay, not of the total frame, which mixes in the game's own cost (the bullet hell cannot meet 1 ms for that reason). This is also the "per-cycle statistics for a frame profiler" of step 7.
+2. **A barrier-hole detector.** A debug mode that, at the end of each cycle, re-scans the whole heap and reports anything reachable but not marked. Run on a game that uses C libraries, it shows whether writes the card barrier cannot see (C code, `read()` into a GC buffer) lose objects. If they do, the fallback is cards plus kernel dirty pages together.
+3. **Measure what was never measured.** The mutator cost of the barrier on `core_bench` at -O3 (step 6's exit test, at most 5% geomean, was never checked), steady RSS against the stock GC in the game workloads, and a multi-hour soak with the verifier on.
+4. **Find the 81 ms frame.** Many 8 GiB `game_mt` runs with the watchdog sampler plus per-frame scheduler and memory-pressure counters. First hypothesis, not tested: `mmap_lock` contention, where a `munmap` of a huge allocation blocks every thread's page faults.
+5. **Remove the lock-holder stalls** (rare 1-3 ms frames: the sweeper is descheduled while it holds the page filler lock): a per-thread reserve of pages so the common allocation path does not take the lock, or a split lock.
+6. **Finish step 1.** Phobos unit tests, the druntime tests and `compiler/test/runnable` under `gc:sdcq`; none ran to the end.
+7. **Run the owner's allocation-heavy game** against the stock GC with the LDC toolchain: remove the pools and the manual `GC.collect` calls and check the GC-attributed p99.9 and the worst frame. This is the real acceptance test of the goal.
+8. **Portability and game controls (step 7 of the order, and step 8).** Windows has `GetWriteWatch`, which is the dirty-page tracking there; DMD would need the card pass ported from LDC. Threads that opt out of the GC (audio) and the statistics API. After the target is met: precise heap scanning, which cuts mark work and false retention but changes no pause bound.
+
+#### Findings from the game workloads, and the plan from here (2026-10-09, later)
+
+**What the games showed** (numbers in `plans/symgc-patches/README.md`, sections "A ported game: trigger-rally-d", "Stress
+variant of the bullet hell" and "Game-shaped workloads modelled on big games"):
+
+1. A real ported game (`trigger-rally-d`) runs under symgc with the card barrier, with SDL, OpenGL and OpenAL holding D
+   pointers, and allocates too little to test a collector (69 MB heap, a few tens of KB of garbage per frame; the stock
+   GC's longest pause there is 0.69 ms).
+2. In the game-shaped workloads (`aaa_sim.d`: RTS, open world, city; 10 to 70 MiB/s of garbage from natural code, a
+   6-thread job pool, 2 or 8 GiB resident) symgc had no frame over 16 ms; the stock GC had 1, 0, 19 and 3. Against the
+   same game with collections off, symgc adds about 0.25 ms at p99.9 in the city, 0.4 ms in the RTS and nothing visible
+   in the open world. The tails above 1 ms in the city and the RTS are the games' own frames.
+3. The stock GC is 4 to 5 times slower at the **median** in the city and the RTS, also with collections off: allocation
+   itself, probably its global lock with six job threads allocating (not tested further). For a game the allocator's
+   throughput matters as much as the pauses.
+4. Natural D code has footguns that cost more than the collector: an array shrunk with a slice and appended again
+   reallocates on every append (the first A* allocated 8 GiB/s). The built-in associative array allocates a node per
+   entry. Neither is the collector's fault, and a game programmer meets both.
+
+**The city as the reference workload.** The owner picked the city scenario as the one closest to the games that need
+this most (Cities: Skylines II, made with Unity, is known for its performance problems). It becomes the main benchmark; the other
+two stay as checks.
+
+**Is there much more to win?** On pauses, not much at this scale: the collector's share of a city frame is about
+0.1 ms at the median and 0.25 ms at p99.9. The larger wins are elsewhere:
+- *scale*: a city of 100,000 citizens is small next to the games it stands for; mark work grows with the pointer-rich
+  live heap (citizens, routes, buildings), not with the asset data;
+- *CPU taken from the game*: concurrent marking and sweeping run on cores that a city builder's job system also wants;
+  that cost was never measured;
+- *allocation speed and the runtime's own data structures* (associative arrays, appends), which decide the median frame
+  of code written without care.
+
+**Plan, in order.**
+
+1. **City at real scale.** Add a population parameter to `aaa_sim city` and run 100k, 500k and 1M citizens (routes,
+   buildings and roads scaled with it) with the collector on and off. This finds where the collector stops being
+   invisible: the mark time per cycle against the allocation rate, and whether a cycle still ends before the heap
+   target forces the program to wait. Five runs per cell, p99.9 and worst frame, steady RSS.
+2. **Measure the collector's CPU.** Per-thread CPU time of the mark and sweep threads (`getrusage` / `/proc/self/task`)
+   per cycle and per second, next to the game's job threads; then the same city with 6 and with 12 job threads on the
+   16 hardware threads, to see whether the collector competes with the job system. This is the number a Cities:
+   Skylines comparison would be about.
+3. **The GC-attributed time counter** (item 1 of the list above), so every city run reports the collector's share of
+   each frame directly instead of by subtracting a collections-off run.
+4. **Cheaper natural code.** Profile the city with collections off (SIGPROF sampler): if the built-in associative
+   array and array appends dominate, a faster AA (open addressing, no node per entry) and a cheaper append path in
+   druntime would speed up every program written this way. This is a runtime-library change, separate from the
+   collector, and it is where the median frame can still drop.
+5. **Then the open items from before**: the barrier's own cost (item 3 above), the rare lock-holder stalls (item 5),
+   and the test suites (item 6).
+
 **Total to the 1 ms target at 2 GiB (end of step 5):** about 17–27 pw. **To the full target at 8 GiB with LDC speed (end of step 7):** about 28–46 pw.
 
 **Decisions recorded:** build on symgc, fork allowed; Immix rejected; Track B shelved; the metric is the worst frame, not p99.

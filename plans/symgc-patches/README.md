@@ -517,3 +517,70 @@ writing to D memory, which the card barrier cannot see. Frame times there (33 ms
 Mesa's software rendering and `SetTargetFPS(60)`, not the collector, and the game allocates almost nothing per
 frame, so it says nothing about GC latency. Other games found there (`project-space`, `physics-raylib`,
 `lunar-lander-dgame`, `improved-palm-tree`) are of the same kind: small, window-bound, a handful of `new`.
+
+### A ported game: trigger-rally-d (2026-10-09), and why it cannot test the collector
+
+`leotada/trigger-rally-d` (D port of Trigger Rally, SDL2/OpenGL/OpenAL through dlopen, 16k lines, ECS-free classes).
+A scratch copy (the repo is not touched) with a benchmark hook: auto-start of a race, full throttle with weaving,
+fixed 1/60 step, per-frame times of the game logic (`tick`) and of `render` (the buffer swap, which blocks on the
+display, is not counted). On the RX 6600 with hardware GL, 1500 frames of "aegyptian", two runs per collector:
+logic p50 21-29 us, p99.9 158-192 us, worst 163-379 us, render p99.9 14.6-15.1 ms (the GPU driver), no frame over
+1 ms in the logic, for the stock GC (LDC 1.40) and for symgc + card barrier (-O3) alike. The stock GC ran 23
+collections with a longest pause of 0.69 ms on a 69 MB heap. symgc ran the game without a crash, with C code
+(SDL, GL, OpenAL) holding D pointers. Static reading of the code: the per-frame garbage is small (a `new PCollision`
+per vehicle part and tick, `drawtile ~=` 49 tiles, particle arrays compacted with `.length = j` and re-grown, about
+a dozen HUD strings), a few tens of KB per frame, and the live heap is small because textures and meshes live in GL.
+So this game does not stress a collector and says nothing about pools or manual `GC.collect`. In software rendering
+(Mesa llvmpipe under Xvfb) it takes 80 ms per frame and minutes of shader compilation, which is unusable for timing.
+
+### Stress variant of the bullet hell (`bullet_hell_stress.d`)
+
+The bullet hell with the game's own cost turned down (bullets live 0.05x as long: few live objects) and the churn
+turned up (`bulletsPerSecond`, a `garbageBytes` temporary per shot), plus `nogc=1` to run the same loop without the
+collector as the reference for the game's own cost. LDC -O3, 30 s (1800 frames), no pools, no `GC.collect`.
+
+| config | collector | p50 | p99 | p99.9 | worst | frames >16 ms |
+|---|---|---|---|---|---|---|
+| 2 GiB, 100k bullets/s, +256 B/shot | stock | 0.13 ms | 0.81 | **52.8** | 58.3 | 4 |
+| same | symgc + cards | 0.12-0.19 | 0.63-0.78 | 0.80-0.86 | 0.94-0.99 | 0 |
+| same, collector off (reference) | none | 0.14 | 1.00 | 1.16 | 1.21 | 0 |
+| 8 GiB, same load | stock | 0.13 | 0.98 | **193** | 198 | 2 |
+| same | symgc + cards | 0.19 | 0.88 | 1.19 | **7.1** (one frame) | 0 |
+| 2 GiB, 200k bullets/s, +1 KiB/shot | stock | 0.22 | **51.2** | 56.9 | 66.5 | 26 |
+| same | symgc + cards | 0.23 | 1.62 | 2.48 | 2.56 | 0 |
+
+With the reference run the collector's tail is not above the game's own tail at 2 GiB. At 8 GiB the symgc run had
+one 7.1 ms frame (not repeated yet: one run). The heavy row has no collector-off reference yet (200 MB/s of garbage;
+466 frames over 1 ms are probably the allocation cost itself). Single runs per cell except the first symgc row (2 runs).
+
+### Game-shaped workloads modelled on big games (`aaa_sim.d`)
+
+Three scenarios at 60 fps with a main thread and a 6-thread job pool (fork-join per frame), written without care for
+memory (classes, closures, rebuilt arrays, associative arrays, strings; no pools, no `GC.collect`), with 2 GiB of
+resident asset data (pointer-free buffers plus metadata objects) unless noted:
+* **rts**: 4,000 units, spatial hash rebuilt per frame, target search, A* (binary heap, AA for costs) time-sliced to
+  10 paths a frame on the jobs, projectiles, an AI commander, kills and respawns, event log, selection UI. 70 MiB/s.
+* **openworld**: driving at 108 km/h through a 64x64-cell world; a streaming thread builds the cells ahead (1-3 MiB
+  mesh, 256 KiB collision, 400 props with components, 15 NPCs), far cells are dropped; ~840 NPCs with AI on the jobs,
+  250 cars, contacts, mission variables, HUD. 10 MiB/s.
+* **city**: 100,000 citizens, 15,000 buildings, a 200x200 road graph; a thirtieth of the citizens per frame on the
+  jobs, about 1,000 route searches a second, economy tick, traffic counts, births and deaths, info panels. 61 MiB/s.
+
+(Allocation rates measured with the stock GC and `GC.disable()`. Two first versions were too heavy and changed before
+any measurement here: the A* open list was a D slice shrunk and re-appended, which reallocates on every node (8 GiB/s),
+and the city searched 6x more routes (615 MiB/s).)
+
+LDC -O3, 60 s (3600 frames) per run, one run per cell. "symgc, collections off" is the same binary with
+`GC.disable()` after setup: the game's own frame cost with symgc's allocator.
+
+| scenario | stock GC p50 / p99.9 / worst, >16 ms | symgc + cards p50 / p99.9 / worst, >16 ms | symgc, collections off p50 / p99.9 / worst |
+|---|---|---|---|
+| rts | 8.0 / 15.6 / 16.2 ms, 1 | 1.67 / 3.14 / 3.80 ms, 0 | 1.76 / 2.73 / 3.00 ms |
+| openworld | 0.30 / 12.3 / 12.5 ms, 0 | 0.17 / 0.51 / 1.57 ms, 0 | 0.17 / 0.54 / 1.81 ms |
+| city | 4.87 / 33.3 / 33.9 ms, 19 | 1.13 / 2.30 / 2.90 ms, 0 | 1.05 / 2.06 / 2.41 ms |
+| openworld, 8 GiB assets | 0.32 / 3.4 / 27.7 ms, 3 | 0.22 / 0.42 / 0.47 ms, 0 | not run |
+
+Against its own cost, symgc's collector adds about 0.4 ms (rts) and 0.25 ms (city) at p99.9 and nothing visible in the
+open world. The p99.9 is above 1 ms in rts and city because the game's own frame is (2-3 ms with collections off).
+The stock GC's medians are 4-5x higher in rts and city, and so is its collections-off run (7.7 and 4.9 ms p50): the
+likely cause is its global allocation lock with six job threads allocating, not tested further.
