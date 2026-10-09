@@ -380,3 +380,24 @@ card barrier: 2 GiB / 40k bullets/s p50 0.72, p99 1.22, worst 1.49 ms and no
 frame over 1.5 ms (was worst 1.65-1.92 ms); 512 MiB / 20k/s p50 0.38, p99 0.71,
 worst 1.04 ms. DMD battery, LDC battery (mark_race 8/8, alloc 8 verify x30,
 Phobos stress 30/30), gate and unit tests clean.
+
+### Multi-threaded game (`game_mt.d`), LDC -O3
+
+A main thread at 60 fps building a scene graph (classes, arrays, strings,
+`format`) every frame, two job threads running search with associative
+arrays and growing arrays all the time, a streaming thread loading and
+dropping 1-8 MiB assets every 40 ms, and a level of live data. No pools, no
+`GC.collect`. 90 s at 2 GiB, 5400 frames:
+
+| collector | p50 | p99 | p99.9 | worst | >2 ms | >16 ms |
+|---|---|---|---|---|---|---|
+| stock GC (LDC 1.40) | 0.72 ms | 3.93 | 30.8 | 60.8 ms | 299 | 9 |
+| symgc, card barrier (5 runs) | 0.21-0.29 | 0.50-0.82 | 0.95-1.28 | 1.2-6.0 ms | 0-3 | 0 |
+
+At 512 MiB (60 s): stock p50 0.80, p99 2.82, worst 12.9 ms, 75 frames over 2 ms;
+symgc p50 0.26, p99 0.80, worst 3.2 ms, 1 frame over 2 ms. Mark threads 1/2/4
+change little; the few slow frames are single events at a cycle start (one run
+with one mark thread had a 12 ms frame: a long mark with a thread starved).
+About 99.8% of symgc's frames are under 1 ms in this workload, and the stock
+collector's frame is 3x slower at the median because the four threads
+contend on its single lock.
