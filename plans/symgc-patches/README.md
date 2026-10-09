@@ -431,3 +431,20 @@ runs with it finished normally. Over those two runs (21600 frames) 8 frames pass
 (0.04%); in most of them the main thread had already left the frame by the time the sample
 landed, one was waiting for the page filler lock (`PageFiller.allocRun`) while another thread
 was in the region allocator's tree.
+
+### The rare 1-3 ms frames: the sweeper preempted while it holds the page filler lock
+
+Per-phase timing of the sweeper's steps (multi-threaded game, 120 s, 2 GiB): the longest
+single step was 1.0 ms in the dense finalize, 3.0 ms in the sparse finalize and 3.0 ms in the
+sparse scan, although the loops check a 10 us budget. Every step over 0.5 ms (30 to 57 per run)
+had `faults=0 invol=1`: one involuntary context switch, so the sweeper was descheduled while it
+held the lock, and a mutator that needed a slab or a large allocation waited for it to run again.
+A scheduling noise test (`noise.c`: a 60 Hz thread with 250 us of work, with and without six
+burner threads) shows no such stalls (max 272 us over 7177 frames), so it is the process's own
+threads sharing CPUs, not the machine. Neither `nice 0` for the sweeper (`SYMGC_SWEEP_NICE`) nor a
+lower duty (25, 10) changed the number of long steps.
+
+What would remove it, not done: a lock-free stash of spare empty slabs per bin (refilled by the
+collector thread, retagged as born at each epoch so the sweep does not free them), so the
+mutator takes a slab with an atomic pop instead of the filler lock. Large allocations (the 1 to 8
+MiB assets) still need the lock.

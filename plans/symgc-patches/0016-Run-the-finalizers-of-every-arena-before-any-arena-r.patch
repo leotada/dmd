@@ -1,7 +1,7 @@
 From b5fa1f3b92c71671168a60b05eaa41e720acae92 Mon Sep 17 00:00:00 2001
 From: Leonardo Tada Antunes <leonardotada@gmail.com>
 Date: Thu, 8 Oct 2026 23:30:10 -0300
-Subject: [PATCH 16/18] Run the finalizers of every arena before any arena
+Subject: [PATCH 16/19] Run the finalizers of every arena before any arena
  releases a slot
 
 The sweep of one arena finalized its own dead objects and then released them,

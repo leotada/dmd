@@ -1,7 +1,7 @@
 From f763964c7037454d2a89761afce6b5c6fa4856e4 Mon Sep 17 00:00:00 2001
 From: Leonardo Tada Antunes <leonardotada@gmail.com>
 Date: Thu, 8 Oct 2026 21:52:13 -0300
-Subject: [PATCH 12/18] Repeat the dirty rounds until 512 pages are left, not
+Subject: [PATCH 12/19] Repeat the dirty rounds until 512 pages are left, not
  2048
 
 A remark that had to trace the subgraph behind 556 freshly written pages took

@@ -1,0 +1,33 @@
+From ef9b561078af6c5a888bcf57c44e8ffe7b2d7102 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 03:49:40 -0300
+Subject: [PATCH 19/19] SYMGC_SWEEP_NICE: the nice value of the sweeper thread
+ (default 10)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/collector.d | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 03510f4..182046a 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -1012,7 +1012,12 @@ private:
+ 			 */
+ 			version(linux) {
+ 				import core.sys.posix.sys.resource : setpriority, PRIO_PROCESS;
+-				setpriority(PRIO_PROCESS, 0, 10);
++				int nice = 10;
++				if (auto env = getenv("SYMGC_SWEEP_NICE")) {
++					nice = atoi(env);
++				}
++
++				setpriority(PRIO_PROCESS, 0, nice);
+ 			}
+ 
+ 			(cast(shared(Sweeper)*) arg).run();
+-- 
+2.51.0
+

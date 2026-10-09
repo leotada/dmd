@@ -1,7 +1,7 @@
 From 92da0a97970bcdd7bc444a41fc1b67fabd33ecef Mon Sep 17 00:00:00 2001
 From: Leonardo Tada Antunes <leonardotada@gmail.com>
 Date: Thu, 8 Oct 2026 16:32:23 -0300
-Subject: [PATCH 06/18] Sweep concurrently with the mutators, on a background
+Subject: [PATCH 06/19] Sweep concurrently with the mutators, on a background
  thread
 
 The stop-the-world part of a cycle (prepare, mark) is unchanged and still runs
