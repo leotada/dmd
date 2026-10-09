@@ -423,3 +423,11 @@ After patch 0018, multi-threaded game (LDC -O3, card barrier, 2 GiB live, 180 s,
 frames): p50 0.22 ms, p99 0.38 ms, p99.9 0.75 ms, worst 1.99 ms, 5 frames over 1 ms
 (0.05%), none over 2 ms. Before it, the same game had p99 0.77 ms and about 20 frames
 over 1 ms per 7200. Stock GC (LDC 1.40): p50 0.72, p99 3.9, p99.9 30.8, worst 60.8 ms.
+
+Watchdog note: it first used SIGUSR2, which druntime's stop-the-world uses to resume
+threads; one long run hung (a thread at 100% CPU for 47 minutes) and 16 runs of the
+same program without the watchdog did not. It uses a real-time signal now, and two 180 s
+runs with it finished normally. Over those two runs (21600 frames) 8 frames passed 1.2 ms
+(0.04%); in most of them the main thread had already left the frame by the time the sample
+landed, one was waiting for the page filler lock (`PageFiller.allocRun`) while another thread
+was in the region allocator's tree.

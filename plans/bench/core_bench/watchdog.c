@@ -24,7 +24,7 @@ static void handler(int s) {
 }
 static void signal_all(void) {
   DIR* d = opendir("/proc/self/task"); struct dirent* e;
-  while ((e = readdir(d))) { int tid = atoi(e->d_name); if (tid > 0) syscall(SYS_tgkill, getpid(), tid, SIGUSR2); }
+  while ((e = readdir(d))) { int tid = atoi(e->d_name); if (tid > 0) syscall(SYS_tgkill, getpid(), tid, (SIGRTMIN + 3)); }
   closedir(d);
 }
 static void* watcher(void* a) {
@@ -38,7 +38,7 @@ static void* watcher(void* a) {
 }
 void wd_start(long threshold_us) {
   target = pthread_self(); main_tid = syscall(SYS_gettid);
-  struct sigaction sa = {0}; sa.sa_handler = handler; sa.sa_flags = SA_RESTART; sigaction(SIGUSR2, &sa, 0);
+  struct sigaction sa = {0}; sa.sa_handler = handler; sa.sa_flags = SA_RESTART; sigaction((SIGRTMIN + 3), &sa, 0);
   pthread_t t; pthread_create(&t, 0, watcher, (void*) threshold_us);
 }
 void wd_frame_begin(long id) { frame_id = id; frame_start_us = now_us(); }
