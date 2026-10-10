@@ -899,10 +899,9 @@ ints 3.5 to 9.3 ns. Patch 0031 makes `__sd_gc_card_range` use plain byte stores 
 Not done: a check-then-set barrier (test the card byte first) is 3x cheaper in a model but unsafe on x86 (the card load
 can pass the earlier pointer store; a dirty round could clear the card and lose the write), and a fence removes the
 gain; the multi-threaded layout runs were erratic; the remark-pause card scan cost was not measured.
-Proposals for the LDC pass (`GCCardMarking.cpp`, not applied): (1) skip `MemTransferInst` when the frontend knows the
-copy is pointer-free (the largest clear win; texture and asset buffers); (2) mark the table-base loads
-`!invariant.load` so LLVM hoists them; (3) one mark per run of stores to the same object in a basic block; (4) an
-option to skip `d.gc.*`/`symgc.*` (no measurable gain; `realloc`'s copy must stay marked).
+Applied to the LDC pass (`GCCardMarking.cpp`):
+- Patch 0006: (1) skip `MemTransferInst` when known pointer-free; (2) mark table-base loads `!invariant.load` so LLVM hoists them.
+- Patch 0007: (3) coalesce stores to the same object within basic block segments into a single `CompilerBarrier` and at most two card marks (`MinOffset` and `MaxOffset`), yielding -23.8% store latency in `fillTwoFields` (1.70 to 1.30 ns) and `fillStructs` (1.68 to 1.28 ns), and -25% on unrolled array stores.
 Benchmarks: `barrier_micro.d`, `barrier_variants.d`, `barrier_variants2.d`.
 
 ### 4. Cheaper associative arrays (`plans/ldc-patches/0004`, `0005`; not applied to the trees)

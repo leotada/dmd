@@ -1,6 +1,6 @@
 [BENCH] Benchmark enabled via TRIGGER_BENCH_SECS=15
 Trigger Rally init
-Build: 0.6.7 on Oct 10 2026 at 18:12:43
+Build: 0.6.7 on Oct 10 2026 at 20:10:51
 Initialising virtual file system
 Setting writable user directory to "/home/leonardo/.local/share/trigger-rally-team/trigger-rally/"
 Failed to create directory "/players"
@@ -835,38 +835,40 @@ Loading image "textures/sky/blue.jpg"
 Loading .mtl Material "/vehicles/cordo_kitcar/cordo_kitcar.mtl"
 Loading image "/vehicles/cordo_kitcar/cordo_kitcar.png"
 Loading image "/vehicles/cordo_kitcar/cordo_kitcar_emission.png"
-[SLOW FRAME 14] 2834.10 ms
-[SLOW FRAME 21] 35464.81 ms
+[SLOW FRAME 42] 467.71 ms
+[SLOW FRAME 46] 201.44 ms
+[SLOW FRAME 58] 106.03 ms
+[SLOW FRAME 64] 304.62 ms
+[SLOW FRAME 70] 2070.92 ms
+[SLOW FRAME 84] 107.13 ms
+[SLOW FRAME 89] 273.28 ms
+[SLOW FRAME 99] 100.05 ms
+[SLOW FRAME 110] 126.63 ms
+[SLOW FRAME 115] 201.05 ms
+[SLOW FRAME 119] 640.50 ms
+[SLOW FRAME 130] 3299.92 ms
 
 ==================== BENCHMARK RESULTS ====================
 Collector: stock (DRuntime Default GC)
-Duration: 38.74 s | Total Frames: 18 | Average FPS: 0.46
+Duration: 15.03 s | Total Frames: 141 | Average FPS: 9.38
 Frame Latency (ms):
-  min:    12.21 ms
-  avg:   2146.48 ms
-  p50:    19.76 ms
-  p90:   2834.10 ms
-  p95:   35464.81 ms
-  p99:   35464.81 ms
-  p99.9: 35464.81 ms
-  max:   35464.81 ms
+  min:    33.78 ms
+  avg:   105.41 ms
+  p50:    54.07 ms
+  p90:    65.82 ms
+  p95:   201.05 ms
+  p99:   2070.92 ms
+  p99.9: 3299.92 ms
+  max:   3299.92 ms
 Frame Threshold Violations:
-  frames >  5.0 ms:    18 (100.00%)
-  frames > 10.0 ms:    18 (100.00%)
-  frames > 16.6 ms (missed 60 FPS):    12 (66.67%)
-  frames > 33.3 ms (missed 30 FPS):     4 (22.22%)
+  frames >  5.0 ms:   141 (100.00%)
+  frames > 10.0 ms:   141 (100.00%)
+  frames > 16.6 ms (missed 60 FPS):   141 (100.00%)
+  frames > 33.3 ms (missed 30 FPS):   141 (100.00%)
 Memory Footprint:
-  RSS: 530.0 MiB
+  RSS: 532.5 MiB
 Stock GC Profiling Stats:
   Collections count: 22
-  Total pause time:  5.209 ms
-  Max pause time:    0.591 ms
+  Total pause time:  5.232 ms
+  Max pause time:    0.547 ms
 ===========================================================
-Exit requested
-Race finished in invalid state 0
-Shutting down audio subsystem
-Shutting down model subsystem
-Shutting down effects subsystem
-Shutting down texture subsystem
-Shutting down render subsystem
-Shutdown complete
