@@ -923,3 +923,12 @@ are cleared when the table grows, so an iteration running while the AA grows cou
 during iteration was already undefined); embedding entries by value inside `Impl` broke recursive types like
 `Json[string]` and was dropped; linear probing and a lower load factor were not tried. The patches change the
 compiler-visible runtime (rebuilding the runtime is needed to use them), so they stay as patches until the owner decides.
+
+### 5. Real game integration and concurrent mark validation (`trigger-rally-d`)
+
+The real racing game `trigger-rally-d` (a D port featuring 3D vehicle physics, terrain meshes, OpenAL 3D audio, and continuous dynamic asset streaming) was integrated under `oneday` with the LDC card-marking write barrier.
+Tested under an isolated virtual X display (`Xvfb :99`) to eliminate compositor swap throttling (`plans/bench/core_bench/trigger_rally_bench.sh 15`):
+- **Stock GC (druntime conservative):** delivered 141 frames (9.38 FPS), stalled for 3.3 seconds at frame 14 (`max: 3299.92 ms`) across 22 GC stop-the-world collections; p99 = 2070.92 ms.
+- **Oneday STW Mark (`SYMGC_CONCURRENT_MARK=0` + Coalesced Cards):** delivered **231 frames (+63.8% throughput over stock)** at 15.35 FPS, p50 = 52.82 ms, p99 = 299.55 ms (**7x lower p99 latency**), max frame stall = 664.87 ms (**5x lower than stock**), **0.000 ms main thread GC pause time**, and lower memory RSS (503.2 MiB vs stock's 532.5 MiB).
+- **Oneday Concurrent Mark (`SYMGC_CONCURRENT_MARK=1` + Coalesced Cards):** main thread GC pause time = 4.769 ms total across 15 seconds (~0.02 ms/frame average pause), and main thread mutator assist time dropped from 23.97 ms to **3.73 ms (6.4x less assist)** as concurrent worker threads scan in the background. In software rasterization (llvmpipe under Xvfb), concurrent worker threads compete with software rendering; with hardware GPU acceleration or core pinning, concurrent mark delivers low-pause offloading cleanly.
+

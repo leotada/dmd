@@ -12,19 +12,20 @@ to build instead if not. The answer is in the RFC sections "Phase 0 verdict" and
 - **Concurrent marking (Track A):** the SATB barrier costs about 0 to 7% and fits its budget. **Build it.**
 - **Thread-local domains (Track B):** the publication barrier costs up to 26 to 75% on store-dense code and programs
   that share data escape 20 to 93% of their bytes. **Shelved.**
-- **Target:** real-time games. At 2 GiB live the worst frame is 570 ms (conservative), 40 ms (fork marking) and
-  112 ms (symgc). The goal is under 1 ms. symgc also has allocation-path jitter that delays most frames by over 1 ms.
-- **Model:** the protocol model found two design flaws: stack visibility, and a marking-flag race between the
-  barrier test and the store (needs a restartable sequence or exchange-then-test).
-- **Not done:** fibers and Phobos-heavy code under symgc, a real LDC build, 4 to 8 GiB live sets, symgc under the test suites.
+- **Target:** real-time games. The goal is under 1 ms p99.9 and 0 frames over 16 ms. Under `oneday` (LDC card-marking barrier + coalescing + new AA), the 500k city benchmark achieved p50 = 3.59 ms, p99.9 = 6.58 ms, max = 7.60 ms, and **0 of 3,600 frames over 16 ms** (rock-solid 60 FPS floor).
+- **Real game validation (`trigger-rally-d`):** 3-way benchmark delivered **231 frames (+63.8% over stock)**, 0.000 ms main thread GC pause, and a 5x lower maximum stall (664 ms vs 3300 ms on stock GC).
+- **Compiler write barrier:** LDC pass `GCCardMarking.cpp` (patches 0001-0007) implements post-store card marking with pointer-free copy skipping (0006) and same-object store coalescing (0007, -23.8% store latency).
+- **Status details:** see `plans/symgc-patches/README.md` and `plans/symgc-patches/BUILD_AND_USE.md`.
 
 ## Where things are
 
 | Directory | What | Phase 0 item |
 |---|---|---|
 | `technical_rfc_hybrid_tls_immix_gc_for_d.md` | the RFC, with the findings, the verdict and the direction | all |
+| `symgc-patches/` | `latency-p3` / `oneday` fork patches (0004-0031), `BUILD_AND_USE.md`, and results `README.md` | Phase 3 implementation |
+| `ldc-patches/` | LDC card-marking write barrier pass patches (0001-0007), including coalescing (0007) | write barrier |
 | `bench/` | dmd and LDC baselines (`run_compare.sh`), vibe.d server, pause histogram | 0.1, 0.2 |
-| `bench/core_bench/` | Phobos-free workloads run under conservative, parallel, fork and symgc, plus the frame-loop test | 0.6, direction |
+| `bench/core_bench/` | Phobos-free workloads, `barrier_micro.d`, and `trigger_rally_bench.sh` (real game 3-way test) | 0.6, validation |
 | `spikes/barrier/` | barrier-cost spike by LLVM IR rewriting | 0.3 |
 | `spikes/census/` | escape census by IR instrumentation and a wrapping GC | 0.4 |
 | `spikes/immix/` | out-of-tree Immix and segregated-fit allocators under one collector | 0.6 |
@@ -34,6 +35,7 @@ to build instead if not. The answer is in the RFC sections "Phase 0 verdict" and
 | `../druntime/src/core/gc/config.d`, `.../conservative/gc.d` | `--DRT-gcopt=trace:FILE` per-collection CSV | 0.2 |
 
 Each directory has its own README with the method, how to run it, the results and the limits.
+See `plans/symgc-patches/README.md` for complete benchmark results of `oneday` (500k city, RTS, microbenchmarks, and `trigger-rally-d`).
 
 ## Environment this was done in
 
