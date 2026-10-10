@@ -1,0 +1,993 @@
+From e037339cf6e9015327db0f07b3db7cf8dc90fabd Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Fri, 9 Oct 2026 20:24:22 -0300
+Subject: [PATCH 1/2] druntime interface: runFinalizers, FINALIZE after
+ allocation, realloc attributes, profileStats
+
+GC.runFinalizers(segment): runs the finalizers whose destructor lies in the
+segment (a library being unloaded) for the allocations of every arena, with
+the sweep's rules (no allocation from a finalizer) and with the stock
+semantic for struct destructors that throw (FinalizeError). The finalizer is
+forgotten first, so neither the sweep nor a later destroy runs it again.
+
+GC.setAttr/clrAttr(FINALIZE) and getAttr: a class instance gets a finalizer
+after its allocation (druntime does this when an object gets a monitor, so
+that the monitor is freed). A small slab slot has no room for the pointer,
+so it goes in a table outside the heap (d.gc.late) that the finalizer pass of
+the sweep and the free paths look at; a large block takes it directly. Before,
+a monitor was never freed: 0 of 3000 here, 2999 of 3000 now.
+
+GC.realloc: no attributes means keep the block's (NO_SCAN), as in the other
+collectors; a plain block is no longer turned into an appendable one by a
+resize (GC.getAttr told), and a large plain block no longer reports
+APPENDABLE. GC.query/addrOf of a slot that is free in this thread's cache (a
+GC.free, or never handed out) say that it is not allocated.
+
+GC.profileStats: collections, collection and pause time, for explicit and
+automatic cycles.
+
+-version=Symgc_check_free: stop at the call that frees a slot twice. It
+showed that the double free of Phobos' free_list test is a Region copied
+by value and destroyed twice (region.d has the TODO).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/arena.d     |   4 +
+ source/d/gc/capi.d      |  19 ++++
+ source/d/gc/collector.d |  70 ++++++++++++++
+ source/d/gc/hooks.d     |  55 +++++++++++
+ source/d/gc/late.d      | 205 ++++++++++++++++++++++++++++++++++++++++
+ source/d/gc/page.d      | 124 +++++++++++++++++++++++-
+ source/d/gc/slab.d      |   9 ++
+ source/d/gc/tbin.d      |  15 +++
+ source/d/gc/tcache.d    | 132 +++++++++++++++++++++++++-
+ source/symgc/gcobj.d    |  64 +++++++++++--
+ 10 files changed, 682 insertions(+), 15 deletions(-)
+ create mode 100644 source/d/gc/late.d
+
+diff --git a/source/d/gc/arena.d b/source/d/gc/arena.d
+index 1a7bf7b..08d69c7 100644
+--- a/source/d/gc/arena.d
++++ b/source/d/gc/arena.d
+@@ -263,6 +263,10 @@ package:
+ 		filler.sweepFinalizers(emap, gcCycle);
+ 	}
+ 
++	void runFinalizersInSegment(ref CachedExtentMap emap, const(void)[] segment) shared {
++		filler.runFinalizersInSegment(emap, segment);
++	}
++
+ 	void finishSweep(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) shared {
+ 		filler.finishSweep(emap, gcCycle, stats);
+ 	}
+diff --git a/source/d/gc/capi.d b/source/d/gc/capi.d
+index 0674242..27e1094 100644
+--- a/source/d/gc/capi.d
++++ b/source/d/gc/capi.d
+@@ -65,6 +65,25 @@ void __sd_gc_collect() {
+ 	collector.runGCCycle();
+ }
+ 
++void __sd_gc_run_finalizers(const void[] segment) {
++	import d.gc.collector;
++	auto collector = Collector(&threadCache);
++	collector.runFinalizers(segment);
++}
++
++void __sd_gc_profile_stats(ulong* dst) {
++	import d.gc.collector;
++	profileStats(dst);
++}
++
++bool __sd_gc_set_finalizer_attr(void* ptr, void* finalizer) {
++	return threadCache.setFinalizerAttr(ptr, finalizer);
++}
++
++void __sd_gc_clear_finalizer_attr(void* ptr) {
++	threadCache.clearFinalizerAttr(ptr);
++}
++
+ void __sd_gc_add_roots(const void[] range) {
+ 	import d.gc.global;
+ 	gState.addRoots(range);
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 64bcdc8..6a92e81 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -193,6 +193,37 @@ struct Collector {
+ 
+ 		CollectionInfo info;
+ 		runGCCycleLocked(info, false);
++		(cast(CollectorState*) &gCollectorState).recordProfile(info);
++	}
++
++	/**
++	 * `GC.runFinalizers`: run the finalizers that lie in `segment`. Like an
++	 * explicit collection, with no sweep running and none starting.
++	 */
++	void runFinalizers(const(void)[] segment) {
++		while (true) {
++			gSweeper.waitIdle();
++
++			gCollectorState.mutex.lock();
++			if (!gSweeper.isActive) {
++				break;
++			}
++
++			gCollectorState.mutex.unlock();
++		}
++
++		scope(exit) gCollectorState.mutex.unlock();
++
++		// Finalizers run as in a sweep: they may not allocate.
++		threadCache.startCollection();
++		scope(exit) threadCache.endCollection();
++
++		foreach (i; 0 .. ArenaCount) {
++			auto a = Arena.getIfInitialized(i);
++			if (a !is null) {
++				a.runFinalizersInSegment(emap, segment);
++			}
++		}
+ 	}
+ 
+ private:
+@@ -886,6 +917,23 @@ CollectionInfo lastCollectionInfo() {
+ 	return (cast(CollectorState*)&gCollectorState).lastCollectionInfo;
+ }
+ 
++/**
++ * The totals of all the cycles since the start, five values: the number of
++ * collections, the time spent collecting, the time threads were paused, and
++ * the longest pause and collection (100 ns).
++ */
++void profileStats(ulong* dst) {
++	gCollectorState.mutex.lock();
++	scope(exit) gCollectorState.mutex.unlock();
++
++	auto s = cast(CollectorState*) &gCollectorState;
++	dst[0] = s.numCollections;
++	dst[1] = s.totalCollectionTime;
++	dst[2] = s.totalPauseTime;
++	dst[3] = s.maxPauseTime;
++	dst[4] = s.maxCollectionTime;
++}
++
+ /**
+  * Stop the background sweeper thread, if there is one. Called when the GC
+  * is torn down.
+@@ -1123,6 +1171,13 @@ private:
+ 	 */
+ 	ulong amortizedDuration;
+ 
++	// What GC.profileStats reports.
++	ulong numCollections;
++	ulong totalCollectionTime;
++	ulong totalPauseTime;
++	ulong maxPauseTime;
++	ulong maxCollectionTime;
++
+ 	size_t amortizedHeapSize = DefaultMinHeapSize;
+ 	size_t peakHeapSize = DefaultMinHeapSize;
+ 
+@@ -1243,6 +1298,7 @@ private:
+ 		}
+ 
+ 		lastCollectionInfo = info;
++		recordProfile(info);
+ 		updateTargetPageCount();
+ 	}
+ 
+@@ -1256,9 +1312,23 @@ public:
+ 
+ 		auto self = cast(CollectorState*) &this;
+ 		self.lastCollectionInfo = info;
++		self.recordProfile(info);
+ 		self.updateTargetPageCount();
+ 	}
+ 
++	/**
++	 * Count a finished cycle for `GC.profileStats`; times are in 100 ns.
++	 * Called for every cycle, with the collector lock held.
++	 */
++	void recordProfile(ref CollectionInfo info) {
++		auto duration = info.stop - info.start;
++		numCollections++;
++		totalCollectionTime += duration;
++		totalPauseTime += info.pauseTime;
++		maxPauseTime = max(maxPauseTime, info.pauseTime);
++		maxCollectionTime = max(maxCollectionTime, duration);
++	}
++
+ private:
+ 
+ 	void updateTargetPageCount() {
+diff --git a/source/d/gc/hooks.d b/source/d/gc/hooks.d
+index be7c33f..6ac0b5a 100755
+--- a/source/d/gc/hooks.d
++++ b/source/d/gc/hooks.d
+@@ -145,6 +145,61 @@ void __sd_gc_finalize(void* ptr, size_t usedSpace, void* finalizer) {
+ 	}
+ }
+ 
++/**
++ * Finalize a class instance that got its finalizer with `GC.setAttr`, see
++ * `d.gc.late`.
++ */
++void __sd_gc_finalize_late(void* ptr) {
++	version(Symgc_druntime_hooks) {
++		rt_finalize2(ptr, false, false);
++	}
++}
++
++// hooks for GC.runFinalizers, see `PageFiller.runBlockFinalizers`.
++extern(C) int rt_hasFinalizerInSegment(void* p, size_t size, TypeInfo typeInfo,
++                                       scope const(void)[] segment) nothrow;
++extern(C) void rt_finalizeFromGC(void* p, size_t size, uint attr,
++                                 TypeInfo typeInfo) nothrow;
++
++/**
++ * Whether the finalizer of the block (a class destructor, or a struct's) lies
++ * in `segment`. `usedSpace` is the used capacity of the block, with the
++ * padding byte of an appendable block, as for `__sd_gc_finalize`.
++ */
++bool __sd_gc_has_finalizer_in_segment(void* ptr, size_t usedSpace,
++                                      void* finalizer, const(void)[] segment) {
++	version(Symgc_druntime_hooks) {
++		import symgc.gcobj : TYPEINFO_IN_BLOCK;
++		if (finalizer == TYPEINFO_IN_BLOCK) {
++			return rt_hasFinalizerInSegment(ptr, 0, null, segment) != 0;
++		}
++
++		return rt_hasFinalizerInSegment(ptr, usedSpace - 1,
++		                                cast(TypeInfo) finalizer, segment) != 0;
++	} else {
++		return false;
++	}
++}
++
++/**
++ * Finalize the way the other collectors do on `GC.runFinalizers`: an
++ * exception from a struct destructor is turned into a FinalizeError.
++ */
++void __sd_gc_finalize_from_gc(void* ptr, size_t usedSpace, void* finalizer) {
++	version(Symgc_druntime_hooks) {
++		import symgc.gcobj : TYPEINFO_IN_BLOCK;
++		import core.memory : GC;
++		if (finalizer == TYPEINFO_IN_BLOCK) {
++			rt_finalizeFromGC(ptr, 0, 0, null);
++		} else {
++			rt_finalizeFromGC(ptr, usedSpace - 1, GC.BlkAttr.APPENDABLE,
++			                  cast(TypeInfo) finalizer);
++		}
++	} else {
++		__sd_gc_finalize(ptr, usedSpace, finalizer);
++	}
++}
++
+ void __sd_gc_register_global_segments() {
+ 	version(Symgc_druntime_hooks) {
+ 		// druntime handles this on its own
+diff --git a/source/d/gc/late.d b/source/d/gc/late.d
+new file mode 100644
+index 0000000..dc9f678
+--- /dev/null
++++ b/source/d/gc/late.d
+@@ -0,0 +1,205 @@
++module d.gc.late;
++
++/**
++ * Class instances that were given a finalizer after they were allocated:
++ * `GC.setAttr(p, GC.BlkAttr.FINALIZE)`, which druntime does on an object that
++ * gets a monitor, so that the monitor is freed when the object dies.
++ *
++ * A slot of a small slab only has room for a finalizer when it was allocated
++ * with one (the pointer lives in the slot's last word), and the size of an
++ * object is not known here, so the slot cannot be changed afterwards. These
++ * are kept in a table of their addresses instead, outside of the heap (so that
++ * it does not keep them alive). The sweep looks a dead slot up in it when the
++ * slab is flagged `hasFinalizers`, and the free paths remove the entry.
++ */
++
++import d.sync.mutex;
++
++private shared Mutex gLateMutex;
++
++// Open addressing, linear probing, power of two capacity, 1 marks a removed
++// entry. Only touched with the mutex held, except for the count.
++private __gshared void** gTable;
++private __gshared size_t gCapacity;
++private __gshared size_t gUsed; // entries and removed entries
++private shared size_t gCount; // entries
++
++private enum Removed = cast(void*) 1;
++
++/**
++ * Whether there may be an entry at all: a relaxed read, to keep the paths
++ * that need not look at the table out of the lock.
++ */
++bool lateAny() {
++	import core.atomic : atomicLoad, MemoryOrder;
++	return atomicLoad!(MemoryOrder.raw)(gCount) != 0;
++}
++
++private size_t slotOf(void* p, size_t mask) {
++	return ((cast(size_t) p >> 3) * 0x9E3779B97F4A7C15UL >> 20) & mask;
++}
++
++/**
++ * Remember that the allocation at `p` (its first byte) is a class instance
++ * to finalize when it dies. Returns false when the table cannot grow.
++ */
++bool lateAdd(void* p) {
++	gLateMutex.lock();
++	scope(exit) gLateMutex.unlock();
++
++	if ((gUsed + 1) * 4 > gCapacity * 3 && !grow()) {
++		return false;
++	}
++
++	auto mask = gCapacity - 1;
++	auto i = slotOf(p, mask);
++	size_t firstRemoved = size_t.max;
++	while (true) {
++		auto q = gTable[i];
++		if (q is null) {
++			break;
++		}
++
++		if (q is p) {
++			return true;
++		}
++
++		if (q is Removed && firstRemoved == size_t.max) {
++			firstRemoved = i;
++		}
++
++		i = (i + 1) & mask;
++	}
++
++	if (firstRemoved != size_t.max) {
++		i = firstRemoved;
++	} else {
++		gUsed++;
++	}
++
++	gTable[i] = p;
++
++	import core.atomic : atomicOp;
++	atomicOp!"+="(gCount, 1);
++	return true;
++}
++
++/**
++ * Forget `p`. Returns whether it was there.
++ */
++bool lateRemove(void* p) {
++	if (!lateAny()) {
++		return false;
++	}
++
++	gLateMutex.lock();
++	scope(exit) gLateMutex.unlock();
++
++	auto mask = gCapacity - 1;
++	auto i = slotOf(p, mask);
++	while (true) {
++		auto q = gTable[i];
++		if (q is null) {
++			return false;
++		}
++
++		if (q is p) {
++			gTable[i] = Removed;
++
++			import core.atomic : atomicOp;
++			atomicOp!"-="(gCount, 1);
++			return true;
++		}
++
++		i = (i + 1) & mask;
++	}
++}
++
++bool lateContains(void* p) {
++	if (!lateAny()) {
++		return false;
++	}
++
++	gLateMutex.lock();
++	scope(exit) gLateMutex.unlock();
++
++	auto mask = gCapacity - 1;
++	auto i = slotOf(p, mask);
++	while (true) {
++		auto q = gTable[i];
++		if (q is null) {
++			return false;
++		}
++
++		if (q is p) {
++			return true;
++		}
++
++		i = (i + 1) & mask;
++	}
++}
++
++private bool grow() {
++	import core.stdc.stdlib : calloc, free;
++
++	// Rehash into a table big enough for the live entries, dropping the
++	// removed ones.
++	auto live = gCount;
++	auto newCapacity = gCapacity == 0 ? 64 : gCapacity;
++	while (newCapacity * 3 < (live + 1) * 4 * 2) {
++		newCapacity *= 2;
++	}
++
++	auto table = cast(void**) calloc(newCapacity, (void*).sizeof);
++	if (table is null) {
++		return false;
++	}
++
++	auto mask = newCapacity - 1;
++	foreach (j; 0 .. gCapacity) {
++		auto q = gTable[j];
++		if (q is null || q is Removed) {
++			continue;
++		}
++
++		auto i = slotOf(q, mask);
++		while (table[i] !is null) {
++			i = (i + 1) & mask;
++		}
++
++		table[i] = q;
++	}
++
++	free(gTable);
++	gTable = table;
++	gCapacity = newCapacity;
++	gUsed = live;
++	return true;
++}
++
++@"late" unittest {
++	void* a = cast(void*) 0x1000;
++	void* b = cast(void*) 0x2000;
++
++	assert(!lateContains(a));
++	assert(lateAdd(a));
++	assert(lateAdd(a));
++	assert(lateAdd(b));
++	assert(lateContains(a) && lateContains(b));
++	assert(lateRemove(a));
++	assert(!lateRemove(a));
++	assert(!lateContains(a) && lateContains(b));
++
++	// Growth and removed entries.
++	foreach (i; 0 .. 1000) {
++		assert(lateAdd(cast(void*) (0x10000 + i * 16)));
++	}
++
++	foreach (i; 0 .. 1000) {
++		assert(lateContains(cast(void*) (0x10000 + i * 16)));
++		assert(lateRemove(cast(void*) (0x10000 + i * 16)));
++	}
++
++	assert(lateRemove(b));
++	assert(!lateAny());
++}
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index e577b74..6c140b2 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -1719,15 +1719,32 @@ private:
+ 	static
+ 	void finalizeSlabNimble(ulong evicted, ulong metadataFlags, int sizeClass,
+ 	                        Extent* e, size_t nimbleIndex) {
++		import d.gc.slab;
++		auto slotSize = binInfos[sizeClass].slotSize;
++		void* nimbleBase = e.address + (nimbleIndex * 64 * slotSize);
++
++		// Objects that got their finalizer after their allocation, which have
++		// no room for it in their slot, see `d.gc.late`.
++		import d.gc.late;
++		if (evicted != 0 && e.hasFinalizers && lateAny()) {
++			auto late = evicted;
++			while (late != 0) {
++				auto index = countTrailingZeros(late);
++				late &= late - 1;
++
++				void* ptr = nimbleBase + index * slotSize;
++				if (lateRemove(ptr)) {
++					import d.gc.hooks;
++					__sd_gc_finalize_late(ptr);
++				}
++			}
++		}
++
+ 		auto toFinalize = evicted & metadataFlags;
+ 		if (toFinalize == 0) {
+ 			return;
+ 		}
+ 
+-		import d.gc.slab;
+-		auto slotSize = binInfos[sizeClass].slotSize;
+-		void* nimbleBase = e.address + (nimbleIndex * 64 * slotSize);
+-
+ 		// All set bits in toFinalize have metadata. If no slot of the slab
+ 		// ever had a finalizer, there is nothing to call, and no reason to
+ 		// touch the memory of the dead slots.
+@@ -1962,6 +1979,105 @@ private:
+ 		return true;
+ 	}
+ 
++	/**
++	 * `GC.runFinalizers`: run the finalizers of the allocations of this filler
++	 * whose destructor lies in `segment` (a library that is being unloaded),
++	 * and forget them. Nothing is freed: the memory goes back to the heap when
++	 * the objects are collected, without a second finalization. Run with no
++	 * collection going on, see `Collector.runFinalizers`.
++	 *
++	 * A slot that was freed and is still in a thread's bin looks allocated
++	 * from here; its finalizer is cleared when the slot is freed again.
++	 */
++	package void runFinalizersInSegment(ref CachedExtentMap emap,
++	                                    const(void)[] segment) shared {
++		auto self = cast(PageFiller*) &this;
++
++		mutex.lock();
++		scope(exit) mutex.unlock();
++
++		for (auto r = self.denseBlocks.range; !r.empty; r.popFront()) {
++			self.runBlockFinalizers(emap, r.front, segment);
++		}
++
++		for (auto r = self.sparseBlocks.range; !r.empty; r.popFront()) {
++			self.runBlockFinalizers(emap, r.front, segment);
++		}
++	}
++
++	void runBlockFinalizers(ref CachedExtentMap emap, BlockDescriptor* block,
++	                        const(void)[] segment) {
++		assert(mutex.isHeld(), "Mutex not held!");
++
++		import d.gc.hooks, d.gc.slab;
++		auto bem = emap.blockLookup(block.address);
++
++		uint i = 0;
++		while (i < PagesInBlock) {
++			i = block.nextAllocatedPage(i);
++			if (i >= PagesInBlock) {
++				break;
++			}
++
++			auto pd = bem.lookup(i);
++			auto e = pd.extent;
++			if (e is null) {
++				i++;
++				continue;
++			}
++
++			auto ec = pd.extentClass;
++			auto npages = e.npages;
++			if (ec.isLarge()) {
++				npages = modUp(npages, PagesInBlock);
++			}
++
++			i += npages;
++
++			if (ec.isLarge()) {
++				auto f = e.finalizer;
++				auto size = e.usedCapacity;
++				if (f !is null && __sd_gc_has_finalizer_in_segment(e.address, size, f, segment)) {
++					// Forget it first: an Error from the finalizer goes up.
++					e.setFinalizer(null);
++					__sd_gc_finalize_from_gc(e.address, size, f);
++				}
++
++				continue;
++			}
++
++			if (!ec.supportsMetadata || !e.hasFinalizers) {
++				continue;
++			}
++
++			auto sc = ec.sizeClass;
++			auto slotSize = binInfos[sc].slotSize;
++			auto nimble = alignUp(binInfos[sc].nslots, 64) / 64;
++			foreach (j; 0 .. nimble) {
++				auto live = e.slabData.rawContent[j] & e.slabMetadataFlags.rawContent[j];
++				while (live != 0) {
++					auto index = countTrailingZeros(live);
++					live &= live - 1;
++
++					void* ptr = e.address + (j * 64 + index) * slotSize;
++					auto metadata = SlotMetadata.fromBlock(ptr, slotSize);
++					auto f = metadata.finalizer;
++					if (f is null) {
++						continue;
++					}
++
++					auto size = slotSize - metadata.freeSpace;
++					if (!__sd_gc_has_finalizer_in_segment(ptr, size, f, segment)) {
++						continue;
++					}
++
++					metadata.clearFinalizer();
++					__sd_gc_finalize_from_gc(ptr, size, f);
++				}
++			}
++		}
++	}
++
+ 	/**
+ 	 * Sweep the dense slabs of a block, starting at page `i`, for no longer
+ 	 * than `budget` (the sweep holds the lock, and a mutator that wants it
+diff --git a/source/d/gc/slab.d b/source/d/gc/slab.d
+index 3a05f8a..4e6dede 100644
+--- a/source/d/gc/slab.d
++++ b/source/d/gc/slab.d
+@@ -145,6 +145,15 @@ public:
+ 	bool hasFinalizer() {
+ 		return (data.freeSpaceData.freeSpace & FinalizerBit) != 0;
+ 	}
++
++	/**
++	 * The finalizer has run (`GC.runFinalizers`): forget it, so that neither
++	 * the sweep nor a later free runs it again. The free space stays.
++	 */
++	void clearFinalizer() {
++		// TODO: Currently only works on little-endian, like the rest.
++		data.finalizerData &= ~(AddressMask | (size_t(FinalizerBit) << 48));
++	}
+ }
+ 
+ static assert(SlotMetadata.sizeof == size_t.sizeof,
+diff --git a/source/d/gc/tbin.d b/source/d/gc/tbin.d
+index b57e9d9..48e57ed 100644
+--- a/source/d/gc/tbin.d
++++ b/source/d/gc/tbin.d
+@@ -199,6 +199,21 @@ public:
+ 		return flush(emap, ncached - nflush);
+ 	}
+ 
++	/**
++	 * Whether `ptr` is one of the slots in the cache: they are free, whether
++	 * they were never handed out or were freed by the thread.
++	 */
++	bool holds(const void* ptr) {
++		auto end = top;
++		for (auto p = _head; p < end; p++) {
++			if (*p is ptr) {
++				return true;
++			}
++		}
++
++		return false;
++	}
++
+ 	/**
+ 	 * This function aids in getting a current amount of data free on the
+ 	 * Returns: Number of cached allocations
+diff --git a/source/d/gc/tcache.d b/source/d/gc/tcache.d
+index 9fdd82e..3b28b6e 100644
+--- a/source/d/gc/tcache.d
++++ b/source/d/gc/tcache.d
+@@ -366,9 +366,30 @@ public:
+ 	}
+ 
+ 	void free(PageDescriptor pd, void* ptr) {
++		/**
++		 * `-version=Symgc_check_free`: stop at the call that frees a slot
++		 * twice (the second free of a slot in a thread's cache, or of a slot
++		 * the slab already got back), where the stack trace tells who frees
++		 * it. Without it the double free shows only when the cache is flushed.
++		 */
++		version(Symgc_check_free) {
++			if (pd.isSlab()) {
++				assert(!isFreeInCache(pd, ptr),
++				       "Double free: the slot is free in this thread's cache!");
++				assert(pd.extent.slabData.valueAt(SlabEntry(pd, ptr).index),
++				       "Double free: the slot is free in its slab!");
++			}
++		}
++
+ 		shadeReleasedBlock(pd, ptr);
+ 
+ 		if (likely(pd.isSlab())) {
++			// A finalizer given after the allocation dies with the slot.
++			if (unlikely(pd.extent.hasFinalizers)) {
++				import d.gc.late;
++				lateRemove(ptr);
++			}
++
+ 			freeSmall(pd, ptr);
+ 		} else {
+ 			freeLarge(pd);
+@@ -392,6 +413,12 @@ public:
+ 
+ 				import d.gc.hooks;
+ 				__sd_gc_finalize(ptr, si.usedCapacity, finalizer);
++			} else if (unlikely(e.hasFinalizers)) {
++				// A finalizer given after the allocation, see d.gc.late.
++				import d.gc.late, d.gc.hooks;
++				if (lateRemove(ptr)) {
++					__sd_gc_finalize_late(ptr);
++				}
+ 			}
+ 
+ 			shadeReleasedBlock(pd, ptr);
+@@ -407,6 +434,93 @@ public:
+ 		}
+ 	}
+ 
++	/**
++	 * `GC.setAttr(ptr, FINALIZE)`: the block is a class instance to finalize
++	 * when it dies (`finalizer` is what an allocation with FINALIZE stores for
++	 * one). A slab slot has no room for the pointer, so it goes in the table
++	 * of `d.gc.late`. Returns whether the block now has a finalizer.
++	 */
++	bool setFinalizerAttr(void* ptr, void* finalizer) {
++		auto pd = maybeGetPageDescriptor(ptr);
++		if (!isBlockStart(pd, ptr)) {
++			return false;
++		}
++
++		auto e = pd.extent;
++		if (!pd.isSlab()) {
++			if (e.finalizer is null) {
++				e.setFinalizer(finalizer);
++			}
++
++			return true;
++		}
++
++		auto si = SlabAllocInfo(pd, ptr);
++		if (si.finalizer !is null) {
++			return true;
++		}
++
++		if (!pd.extentClass.supportsMetadata) {
++			return false;
++		}
++
++		import d.gc.late;
++		if (!lateAdd(ptr)) {
++			return false;
++		}
++
++		e.setHasFinalizers();
++		return true;
++	}
++
++	/**
++	 * `GC.clrAttr(ptr, FINALIZE)`: the block is not finalized when it dies.
++	 */
++	void clearFinalizerAttr(void* ptr) {
++		auto pd = maybeGetPageDescriptor(ptr);
++		if (!isBlockStart(pd, ptr)) {
++			return;
++		}
++
++		auto e = pd.extent;
++		if (!pd.isSlab()) {
++			e.setFinalizer(null);
++			return;
++		}
++
++		import d.gc.late;
++		if (lateRemove(ptr)) {
++			return;
++		}
++
++		auto si = SlabAllocInfo(pd, ptr);
++		if (si.finalizer !is null) {
++			SlotMetadata.fromBlock(si.address, binInfos[pd.extentClass.sizeClass].slotSize).clearFinalizer();
++		}
++	}
++
++	/**
++	 * Whether the slot is free in this thread's cache: allocated as far as
++	 * the slab knows, but not in use (never handed out, or freed by this
++	 * thread). The slots of other threads' caches cannot be seen from here.
++	 */
++	bool isFreeInCache(PageDescriptor pd, const void* slot) {
++		auto bin = &bins[getBinIndex(pd.extentClass.sizeClass, pd.containsPointers)];
++		return bin.holds(slot);
++	}
++
++	/**
++	 * Whether the block has a finalizer, for `GC.getAttr`.
++	 */
++	bool hasFinalizerAttr(PageDescriptor pd, void* base) {
++		if (!pd.isSlab() || !pd.extent.hasFinalizers) {
++			return false;
++		}
++
++		import d.gc.late;
++		return lateContains(base);
++	}
++
+ 	/**
+ 	 * Releasing a block deletes every pointer it holds. While a concurrent
+ 	 * mark is running, the targets have to be logged, or a mutator that
+@@ -454,6 +568,13 @@ public:
+ 		auto ec = pd.extentClass;
+ 		auto samePointerness = containsPointers == pd.containsPointers;
+ 
++		// Whether the block has a used capacity of its own, which a plain block
++		// does not: a large one then has all its pages used. Resizing must not
++		// turn a plain block into an appendable one (see `hook_fetchAllocInfo`).
++		bool appendable = ec.isSlab()
++			? SlabAllocInfo(pd, ptr).hasMetadata
++			: pd.extent.usedCapacity != pd.extent.size;
++
+ 		if (ec.isSlab()) {
+ 			auto newSizeClass = getSizeClass(size);
+ 			auto oldSizeClass = ec.sizeClass;
+@@ -464,6 +585,13 @@ public:
+ 				}
+ 
+ 				auto si = SlabAllocInfo(pd, ptr);
++
++				// A plain block has no used capacity to update, and must not
++				// become appendable (GC.getAttr would tell).
++				if (!si.hasMetadata) {
++					return ptr;
++				}
++
+ 				if (si.setUsedCapacity(size)) {
+ 					return ptr;
+ 				}
+@@ -499,7 +627,7 @@ public:
+ 					triggerDeallocationEvent((epages - npages) * PageSize);
+ 				}
+ 
+-				e.setUsedCapacity(size);
++				e.setUsedCapacity(appendable ? size : e.size);
+ 				return ptr;
+ 			}
+ 
+@@ -512,7 +640,7 @@ public:
+ 			return null;
+ 		}
+ 
+-		if (!isSmallSize(size)) {
++		if (appendable && !isSmallSize(size)) {
+ 			auto npd = getPageDescriptor(newPtr);
+ 			npd.extent.setUsedCapacity(size);
+ 		}
+diff --git a/source/symgc/gcobj.d b/source/symgc/gcobj.d
+index adf0c2c..6b3fc7a 100644
+--- a/source/symgc/gcobj.d
++++ b/source/symgc/gcobj.d
+@@ -24,6 +24,10 @@ extern(C) nothrow {
+ 	void __sd_gc_remove_roots(void *ptr) @nogc;
+ 	uint __sd_gc_enable();
+ 	uint __sd_gc_disable();
++	void __sd_gc_run_finalizers(const void[] segment);
++	bool __sd_gc_set_finalizer_attr(void* ptr, void* finalizer);
++	void __sd_gc_clear_finalizer_attr(void* ptr);
++	void __sd_gc_profile_stats(ulong* dst);
+ 
+ 	// hook prototypes needed for druntime api (see below)
+ 	void* __sd_gc_hook_alloc(size_t size, bool containsPointers, bool zeroData);
+@@ -178,7 +182,13 @@ final class SnazzyGC : GC
+ 	 */
+ 	uint setAttr(void* p, uint mask) nothrow
+ 	{
+-		// SDC GC does not support setting attributes after allocation
++		// Only FINALIZE can be given after the allocation (the monitor of an
++		// object needs it, see rt.monitor_). The others are fixed when the
++		// block is allocated: where it is, and whether it is scanned.
++		if (mask & BlkAttr.FINALIZE) {
++			__sd_gc_set_finalizer_attr(p, TYPEINFO_IN_BLOCK);
++		}
++
+ 		return getAttr(p);
+ 	}
+ 
+@@ -187,7 +197,10 @@ final class SnazzyGC : GC
+ 	 */
+ 	uint clrAttr(void* p, uint mask) nothrow
+ 	{
+-		// SDC GC does not support setting attributes after allocation
++		if (mask & BlkAttr.FINALIZE) {
++			__sd_gc_clear_finalizer_attr(p);
++		}
++
+ 		return getAttr(p);
+ 	}
+ 
+@@ -226,7 +239,15 @@ final class SnazzyGC : GC
+ 	void* realloc(void* p, size_t size, uint bits, const TypeInfo ti) nothrow
+ 	{
+ 		checkNotInFinalizer();
+-		return __sd_gc_hook_realloc(p, size, (bits & BlkAttr.NO_SCAN) == 0);
++
++		// As in the other collectors, no attributes means to keep those of the
++		// block (the part that we have, whether it is scanned).
++		bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
++		if (bits == 0 && p !is null) {
++			noScan = (query(p).attr & BlkAttr.NO_SCAN) != 0;
++		}
++
++		return __sd_gc_hook_realloc(p, size, !noScan);
+ 	}
+ 
+ 	/**
+@@ -316,10 +337,19 @@ final class SnazzyGC : GC
+ 	 * Retrieve profile statistics about garbage collection.
+ 	 * Useful for debugging and tuning.
+ 	 */
+-	core.memory.GC.ProfileStats profileStats() @safe nothrow @nogc
++	core.memory.GC.ProfileStats profileStats() @trusted nothrow @nogc
+ 	{
+-		// TODO: add once there is a hook
+-		return core.memory.GC.ProfileStats();
++		import core.time : hnsecs;
++		ulong[5] v;
++		(cast(void function(ulong*) nothrow @nogc) &__sd_gc_profile_stats)(v.ptr);
++
++		core.memory.GC.ProfileStats ps;
++		ps.numCollections = cast(size_t) v[0];
++		ps.totalCollectionTime = hnsecs(v[1]);
++		ps.totalPauseTime = hnsecs(v[2]);
++		ps.maxPauseTime = hnsecs(v[3]);
++		ps.maxCollectionTime = hnsecs(v[4]);
++		return ps;
+ 	}
+ 
+ 	/**
+@@ -380,7 +410,7 @@ final class SnazzyGC : GC
+ 	 */
+ 	void runFinalizers(const scope void[] segment) nothrow
+ 	{
+-		// TODO: add once there is a hook
++		__sd_gc_run_finalizers(segment);
+ 	}
+ 
+ 	/*
+@@ -529,6 +559,13 @@ BlkInfo hook_fetchAllocInfo(void* ptr) {
+ 	if (pd.isSlab()) {
+ 		import d.gc.slab;
+ 		auto si = SlabAllocInfo(pd, ptr);
++
++		// A slot in this thread's cache is free: never handed out, or freed by
++		// this thread (GC.free, delete). The stock collector says so as well.
++		if (threadCache.isFreeInCache(pd, si.address)) {
++			return BlkInfo.init;
++		}
++
+ 		result.base = cast(void*) si.address;
+ 
+ 		if (si.hasMetadata) {
+@@ -538,10 +575,19 @@ BlkInfo hook_fetchAllocInfo(void* ptr) {
+ 			}
+ 		}
+ 
++		// A finalizer given after the allocation, see d.gc.late.
++		if (!(result.attr & BlkAttr.FINALIZE)
++			    && threadCache.hasFinalizerAttr(pd, si.address)) {
++			result.attr |= BlkAttr.FINALIZE;
++		}
++
+ 		result.size = si.slotCapacity;
+ 	} else {
+-		// Large blocks are always appendable.
+-		result.attr |= BlkAttr.APPENDABLE;
++		// A large block has a used capacity of its own when it was allocated
++		// to be appended to; a plain one has all its pages in use.
++		if (e.usedCapacity != e.size) {
++			result.attr |= BlkAttr.APPENDABLE;
++		}
+ 
+ 		if (e.finalizer) {
+ 			result.attr |= BlkAttr.FINALIZE;
+-- 
+2.51.0
+

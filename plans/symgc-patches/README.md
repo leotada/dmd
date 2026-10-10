@@ -855,3 +855,72 @@ Reading: upstream symgc fixes the median (it is the allocator) but pauses the wh
 which is the stop-the-world mark of the heap; the stock GC pauses as long and also loses the median to its global
 allocation lock with six job threads. Oneday keeps every frame of the 500k city under 16 ms, 8.5 ms at p99.9 with LDC.
 The exception is the RTS under dmd with the kernel tracker, above.
+
+## The four next points (2026-10-10)
+
+Four tasks run in parallel, each in its own worktree; results merged into `latency-p3` (patches 0030, 0031).
+
+### 1. Druntime interface gaps (patch 0030) and the `free_list` double free
+
+* Implemented: `GC.runFinalizers` (segment, all arenas), `setAttr`/`clrAttr`/`getAttr` with FINALIZE after allocation
+  (a slab slot has no room for a finalizer pointer, so it goes in a table outside the heap, `d.gc.late`; large blocks
+  keep it in the extent), `GC.realloc` attribute handling (NO_SCAN kept, a resize no longer makes a plain block
+  appendable), `GC.query`/`addrOf` read a slot free in this thread's cache as unallocated, `GC.profileStats`
+  (collection counts), and `-version=Symgc_check_free`, a debug check that stops at the call that frees a slot twice.
+* Test `gaps_check.d`: monitors freed 0 of 3,000 before, 2,999 of 3,000 after (the stock GC: the same).
+* Druntime unit tests: 565 of 568 pass (was 562): `core.lifetime`, `core.memory`, `rt.monitor_` and
+  `core.internal.newaa` now pass (the last one only waited for `runFinalizers`). Still failing by design:
+  `rt.lifetime` (assumes the stock page layout and that `clrAttr(NO_SCAN)` flips scanning) and
+  `core.internal.gc.impl.conservative.gc` (tests the stock collector's internals).
+* Phobos 136 of 137 and the compiler runnable tests (the same 19) are unchanged.
+* `free_list` is a Phobos bug: the test copies a `Region` by value and its destructor frees the buffer twice (a TODO in
+  `region.d`). The stock GC hides it, so symgc does not tolerate it.
+* Caveats: `getAttr` of a large block reports APPENDABLE only when its used capacity is below its size; `runFinalizers`
+  finalizes without freeing, and a slot freed in another thread's cache may still be finalized.
+
+### 2. The RTS tail with dmd and the kernel tracker: machine load, nothing to fix
+
+The 20 frames over 16 ms of the three-way run did not reproduce. Idle machine, RTS, dmd, 60 s: oneday 0 frames over
+16 ms in 5 of 5 rounds (p99.9 3.6-4.1 ms, worst 4.0-4.3 ms), with the compiler test runner looping or 6 busy processes
+also clean (4 of 4); stock 15-32 frames, upstream 15 (p99.9 34 ms). Collections off gives the same median (2.3-2.4 ms),
+so dmd's code is not the cause. With 16 busy processes: stock 69 frames, upstream 17, oneday 9 (worst 41 ms): the
+stalls are in the stop-the-world pauses, stopping descheduled threads took up to 18 ms and the mark threads needed
+5-20 ms for 1-3 MiB while competing for cores. The bad run was an oversubscribed machine. The earlier "open item" is
+closed. `plans/bench/core_bench/rts_tail_check.sh` repeats the comparison.
+
+### 3. The cost of the card barrier on the job threads (patch 0031)
+
+LDC -O3, collections off, three interleaved rounds. City 100k, p50 frame: no barrier anywhere 717-775 us; barrier in the
+program only 1,168-1,191 us (**+50%**); barrier in symgc's own code only 744-800 us (nothing measurable). RTS: 1,563-1,584
+us without, 1,637-1,842 us with (+5-15%). Stores: pointer array 0.14 to 0.84 ns, class field 0.6-1.0 to 1.7 ns.
+The big part is the pass instrumenting `memcpy` of non-pointer data (it cannot tell): copying 8 ints 2.3 to 9.1 ns, 64
+ints 3.5 to 9.3 ns. Patch 0031 makes `__sd_gc_card_range` use plain byte stores for up to 4 cards: those copies
+9.1 to 6.0 ns and 9.3 to 6.2 ns.
+Not done: a check-then-set barrier (test the card byte first) is 3x cheaper in a model but unsafe on x86 (the card load
+can pass the earlier pointer store; a dirty round could clear the card and lose the write), and a fence removes the
+gain; the multi-threaded layout runs were erratic; the remark-pause card scan cost was not measured.
+Proposals for the LDC pass (`GCCardMarking.cpp`, not applied): (1) skip `MemTransferInst` when the frontend knows the
+copy is pointer-free (the largest clear win; texture and asset buffers); (2) mark the table-base loads
+`!invariant.load` so LLVM hoists them; (3) one mark per run of stores to the same object in a basic block; (4) an
+option to skip `d.gc.*`/`symgc.*` (no measurable gain; `realloc`'s copy must stay marked).
+Benchmarks: `barrier_micro.d`, `barrier_variants.d`, `barrier_variants2.d`.
+
+### 4. Cheaper associative arrays (`plans/ldc-patches/0004`, `0005`; not applied to the trees)
+
+A change to `core/internal/newaa.d` (0004 for the LDC runtime, 0005 for this repo's druntime): the first 8 buckets live
+inside the `Impl` block (a small map is one allocation instead of two), insert does one probe walk instead of two,
+bucket arrays come straight from the GC, entries of plain data (no destructor or postblit, at most 48 bytes) come from
+chunks of 4 or 8 (removed entries are not reused; a chunk is collected once all its entries are gone), `_aaVersion` 2.
+Tested in a scratch copy with LDC and oneday (AA code is templates instantiated in the program), ns per operation, best
+of 3: small maps of 2: 70.0 to 45.9; of 8: 54.3 to 33.2; of 32: 51.0 to 34.7; insert 100k int keys 39.3 to 30.1;
+grow to 1M keys 83.5 to 63.5; clear and refill 24.3 to 15.9; churn 25.8 to 23.0; lookup hit unchanged (11.0 to 11.1);
+lookup miss +9% and update +5% (within noise). The 500k city p50 went from 2.9-3.2 ms to 2.75-2.8 ms: within noise,
+and no frame over 16 ms.
+Correctness: `aa_stress.d` against a plain model over 9 key and value types (pointer stability, rehash, dup, clear,
+literals, CTFE) on LDC with the verifier GC and on dmd with the stock GC; druntime's `test/aa` and the unit tests of
+`core.internal.newaa`, `object`, `rt.lifetime`, `core.memory` pass with the file.
+Caveats: an entry that stays alive keeps the other entries of its chunk alive (retention); the abandoned inline buckets
+are cleared when the table grows, so an iteration running while the AA grows could see them empty (modifying an AA
+during iteration was already undefined); embedding entries by value inside `Impl` broke recursive types like
+`Json[string]` and was dropped; linear probing and a lower load factor were not tried. The patches change the
+compiler-visible runtime (rebuilding the runtime is needed to use them), so they stay as patches until the owner decides.

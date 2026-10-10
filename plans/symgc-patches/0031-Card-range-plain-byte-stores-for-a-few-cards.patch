@@ -1,0 +1,62 @@
+From 3a690fd18483ec1bf48e5d6eb83b455987ddafb6 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Sat, 10 Oct 2026 09:58:48 -0300
+Subject: [PATCH 2/2] Card range: plain byte stores for a few cards instead of
+ two memset calls
+
+__sd_gc_card_range is what an instrumented memcpy of unknown element type
+calls. For up to four cards it did two slice assignments, i.e. two calls to
+memset; copying 8 ints cost 8.3 ns with the barrier against 2.3 without.
+Relaxed atomic byte stores (so the loop is not turned back into a memset).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012fMmy9fJzqrWoKLQjC8Ssf
+---
+ source/d/gc/cards.d | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/source/d/gc/cards.d b/source/d/gc/cards.d
+index a7f353e..1c8eb64 100644
+--- a/source/d/gc/cards.d
++++ b/source/d/gc/cards.d
+@@ -87,8 +87,35 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
+ 
+ 	auto first = cast(size_t) dst >> CardShift;
+ 	auto last = (cast(size_t) dst + size - 1) >> CardShift;
+-	__sd_gc_card_base[first .. last + 1] = 1;
+-	__sd_gc_card_summary_base[(first >> (SummaryShift - CardShift)) .. (last >> (SummaryShift - CardShift)) + 1] = 1;
++	auto cards = __sd_gc_card_base;
++	auto sums = __sd_gc_card_summary_base;
++
++	/**
++	 * A copy of up to a few cards is the common one (an array of a few
++	 * elements, a struct): plain byte stores. The slice assignments below
++	 * are calls to memset, which cost more than the copy itself for a small
++	 * array (copying 8 ints: 2.3 ns without the barrier, 8.3 ns with it).
++	 * The stores are atomic, relaxed, so that the compiler does not turn
++	 * the loop back into a memset.
++	 */
++	enum SmallRange = 4;
++	if (last - first < SmallRange) {
++		foreach (c; first .. last + 1) {
++			atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (cards + c), ubyte(1));
++		}
++
++		auto s = first >> (SummaryShift - CardShift);
++		atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (sums + s), ubyte(1));
++		auto e = last >> (SummaryShift - CardShift);
++		if (e != s) {
++			atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (sums + e), ubyte(1));
++		}
++
++		return;
++	}
++
++	cards[first .. last + 1] = 1;
++	sums[(first >> (SummaryShift - CardShift)) .. (last >> (SummaryShift - CardShift)) + 1] = 1;
+ }
+ 
+ /**
+-- 
+2.51.0
+
