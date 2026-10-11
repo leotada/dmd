@@ -13,8 +13,9 @@ to build instead if not. The answer is in the RFC sections "Phase 0 verdict" and
 - **Thread-local domains (Track B):** the publication barrier costs up to 26 to 75% on store-dense code and programs
   that share data escape 20 to 93% of their bytes. **Shelved.**
 - **Target:** real-time games. The goal is under 1 ms p99.9 and 0 frames over 16 ms. Under `oneday` (LDC card-marking barrier + coalescing + new AA), the 500k city benchmark achieved p50 = 3.59 ms, p99.9 = 6.58 ms, max = 7.60 ms, and **0 of 3,600 frames over 16 ms** (rock-solid 60 FPS floor).
-- **Real game validation (`trigger-rally-d`):** 3-way benchmark delivered **231 frames (+63.8% over stock)**, 0.000 ms main thread GC pause, and a 5x lower maximum stall (664 ms vs 3300 ms on stock GC).
+- **Real game validation (`trigger-rally-d`):** STW mark delivered **231 frames (+63.8% over stock)**, 0.000 ms main thread GC pause, and a 5x lower maximum stall. Concurrent mark with thread tuning (`SYMGC_MARK_THREADS=2`, `nice=10`, patch 0032) delivered **181 frames (+79.2% over stock)** with 4.47 ms mutator assist (5.4x lower than STW) and a 4.8x lower worst frame stall (1606 ms vs 7754 ms).
 - **Compiler write barrier:** LDC pass `GCCardMarking.cpp` (patches 0001-0007) implements post-store card marking with pointer-free copy skipping (0006) and same-object store coalescing (0007, -23.8% store latency).
+- **Collector tuning:** symgc patch 0032 unifies `SYMGC_MARK_THREADS` across STW and concurrent mark, and defaults background worker threads to `nice = 10` on Linux.
 - **Status details:** see `plans/symgc-patches/README.md` and `plans/symgc-patches/BUILD_AND_USE.md`.
 
 ## Where things are
