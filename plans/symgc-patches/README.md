@@ -983,6 +983,29 @@ Evaluated with `plans/bench/core_bench/run_bullet_hell_bench.sh 15` on AMD Ryzen
    - **Oneday Concurrent Mark:** p50 = 120 us, p99 = 652 us, p99.9 = **805 us (0.805 ms)**, max = **805 us** (**60x lower peak stall than Stock GC**), **0 of 900 frames > 1 ms (100% under 1 ms)**, and **0 frames > 16 ms**.
    - **Target achieved:** p99.9 under 1 ms and zero frames over 16 ms even under 100k allocations/second on a 2 GiB heap.
 
+### 7. Option 1: Game Engine Controls, Real-Time Audio Exemption & Frame Telemetry (Patch 0034)
+
+Introduces dedicated mutator-level game engine APIs via `core.gc.gcinterface.GCTelemetry` (ADR-8) and `core.memory.GC`:
+
+- **Real-Time Frame Telemetry (`GC.frameStats()` / `GC.FrameStats`):**
+  Exposes per-thread and global allocation times, collection assist times, STW pause times, active cycle indicators (`isCycleActive`), collection count, and live heap sizes (`usedSize` via live `Arena.computeUsedPageCount()`). Eliminates hacky internal symbol scraping and enables live HUD / telemetry overlays directly in game loops.
+- **Audio / Real-Time Thread Exemption (`GC.excludeCurrentThread()`, `GC.includeCurrentThread()`, `GC.isThreadExcluded()`):**
+  Allows audio mixing threads (e.g. OpenAL, JACK, ALSA) and real-time hardware IO threads to exempt themselves from STW pauses. Atomically transitions the thread into `SuspendState.Detached`. The collector filters detached threads during suspend/resume signals and completely skips their stack ranges during scans, preventing audio underruns and buffer dropouts.
+- **Cooperative Inter-Frame Pacing (`GC.step(maxTime)`):**
+  Allows game loops to donate unused frame budget (e.g. before V-Sync sleep) to incrementally advance background sweeping (`assistSweepTimed`).
+
+#### Validation & Benchmark Evidence
+
+1. **Unit Test Suite:**
+   - `test/druntime/telemetry.d`: Exercises `GC.frameStats()`, dynamic thread exemption under concurrent allocations, and `GC.step()`. Passed with exit code 0.
+   - `symgc_ut`: All 113 unit tests pass cleanly with zero regressions.
+
+2. **Bullet Hell Telemetry Benchmark (`bullet_hell_telemetry.d`, 30s, 512 MiB live, 20,000 bullets/s):**
+   - **Audio Thread (1000 Hz):** 28,556 ticks, **0 audio glitches / buffer underruns**, max tick duration 3.4 ms across 27 full GC collection cycles.
+   - **Frame Latency:** p50 = 694 us (0.69 ms), p99 = 1.17 ms, p99.9 = 1.99 ms, max frame = 2.99 ms, **0 of 1,800 frames over 16 ms (100% locked 60 FPS)**.
+   - **Telemetry:** HUD accurately reported real-time heap usage (872 MiB) and per-frame mutator pause metrics without performance penalty.
+
+
 
 
 

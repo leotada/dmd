@@ -1,0 +1,465 @@
+From e594769ad02b48bd8c704cecf26682277fba6b22 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Sun, 11 Oct 2026 19:14:25 -0300
+Subject: [PATCH] game-engine: GC.frameStats telemetry, real-time thread
+ exemption, and pacing step
+
+---
+ source/core/thread/symthread.d |  41 ++++++++++-
+ source/d/gc/capi.d             |  21 ++++++
+ source/d/gc/collector.d        |  43 +++++++++++
+ source/d/gc/tcache.d           |   2 +-
+ source/d/gc/tstate.d           |  23 +++++-
+ source/symgc/gcobj.d           |  70 +++++++++++++++++-
+ test/druntime/telemetry.d      | 129 +++++++++++++++++++++++++++++++++
+ 7 files changed, 322 insertions(+), 7 deletions(-)
+ create mode 100644 test/druntime/telemetry.d
+
+diff --git a/source/core/thread/symthread.d b/source/core/thread/symthread.d
+index 6720858..5a38e4d 100644
+--- a/source/core/thread/symthread.d
++++ b/source/core/thread/symthread.d
+@@ -84,6 +84,9 @@ bool suspendDruntimeThreads(bool alwaysSignal, ref uint suspended) {
+ 			// determine if this thread is suspended or should be suspended.
+ 			auto ss = tc.suspendState;
+ 
++			if (ss == SuspendState.Detached)
++				continue;
++
+ 			suspended += ss == SuspendState.Suspended;
+ 			retry |= ss != SuspendState.Suspended;
+ 
+@@ -97,6 +100,10 @@ bool suspendDruntimeThreads(bool alwaysSignal, ref uint suspended) {
+ 		else version(Windows)
+ 		{
+ 			// use the same states to make the code consistent.
++			auto ss = tc.suspendState;
++			if (ss == SuspendState.Detached)
++				continue;
++
+ 			tc.sendSuspendSignal();
+ 
+ 			if (core_thread_osthread_suspend(t)) {
+@@ -153,13 +160,37 @@ void scanWorldPausedData(ScanDg scan) {
+ 	// thread that is not a druntime thread has none.
+ 	auto self = Thread.getThis();
+ 	auto myStackBottom = self is null ? null : self.m_curr.bstack;
++
++	void*[2][8] detachedStacks = void;
++	size_t numDetached = 0;
++	foreach(t; ThreadIterator(ThreadBase.sm_tbeg.toThread)) {
++		import d.gc.tcache : ThreadCache;
++		import d.gc.tstate : SuspendState;
++		auto tc = cast(ThreadCache*) t.tlsGCData();
++		if (tc !is null && tc.suspendState == SuspendState.Detached && numDetached < 8) {
++			auto b = t.m_curr.bstack;
++			auto top = t.m_curr.tstack;
++			if (b !is null) {
++				detachedStacks[numDetached][0] = top < b ? top : b;
++				detachedStacks[numDetached][1] = top < b ? b : top;
++				numDetached++;
++			}
++		}
++	}
++
+ 	void scanItem(ScanType type, void* pbot, void* ptop) nothrow {
+ 		import d.gc.range;
+ 		auto r = makeRange(pbot, ptop);
+-		if (type == ScanType.stack && myStackBottom !is null && myStackBottom >= r.ptr &&
+-				myStackBottom <= r.ptr + r.length)
+-			// my stack range, no need to scan right now, this will be scanned later
+-			return;
++		if (type == ScanType.stack) {
++			if (myStackBottom !is null && myStackBottom >= r.ptr &&
++					myStackBottom <= r.ptr + r.length)
++				// my stack range, no need to scan right now, this will be scanned later
++				return;
++			foreach(i; 0 .. numDetached) {
++				if (r.ptr >= detachedStacks[i][0] && r.ptr <= detachedStacks[i][1])
++					return; // Skip stack of detached/RT audio thread
++			}
++		}
+ 		// TODO: ignore my thread's TLS data as well.
+ 		// TODO: shouldn't need this cast
+ 		alias NoThrowScanDg = void delegate(const(void*)[] range) nothrow;
+@@ -186,6 +217,8 @@ bool resumeDruntimeThreads(ref uint suspended) {
+ 		}
+ 
+ 		auto ss = tc.suspendState;
++		if (ss == SuspendState.Detached)
++			continue;
+ 
+ 		version(Posix) {
+ 			suspended += ss == SuspendState.Suspended;
+diff --git a/source/d/gc/capi.d b/source/d/gc/capi.d
+index 27e1094..fc8fe2d 100644
+--- a/source/d/gc/capi.d
++++ b/source/d/gc/capi.d
+@@ -134,3 +134,24 @@ void __sd_gc_time_total(ulong* dst) {
+ PageDescriptor __sd_gc_maybe_get_page_descriptor(void* ptr) {
+ 	return threadCache.maybeGetPageDescriptor(ptr);
+ }
++
++void __sd_gc_exclude_current_thread() {
++	threadCache.state.preventPausing();
++	threadCache.activateGC(false);
++}
++
++void __sd_gc_include_current_thread() {
++	threadCache.state.allowPausing();
++	threadCache.activateGC(true);
++}
++
++bool __sd_gc_is_thread_excluded() {
++	import d.gc.tstate : SuspendState;
++	return threadCache.state.suspendState == SuspendState.Detached;
++}
++
++void __sd_gc_step(ulong maxTimeHns) {
++	import d.gc.collector;
++	auto collector = Collector(&threadCache);
++	collector.assistSweepTimed(maxTimeHns);
++}
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 3256ece..861b935 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -169,6 +169,49 @@ struct Collector {
+ 		}
+ 	}
+ 
++	/**
++	 * Helps background sweeping up to maxTimeHns (100ns units).
++	 * If maxTimeHns is 0, performs a single pass across arenas.
++	 */
++	void assistSweepTimed(ulong maxTimeHns) {
++		import d.gc.extent : gSweepCycle;
++		import d.gc.page : AssistResult;
++		import d.gc.time : getMonotonicTime;
++
++		if (gSweepCycle.load() == 0) {
++			return;
++		}
++
++		auto start = getMonotonicTime();
++
++		threadCache.startCollection();
++		scope(exit) threadCache.endCollection();
++
++		while (gSweepCycle.load() != 0) {
++			bool worked = false;
++			bool waiting = false;
++			foreach (i; 0 .. ArenaCount) {
++				auto a = Arena.getIfInitialized(i);
++				if (a !is null) {
++					auto r = a.assistSweep(emap);
++					worked |= r == AssistResult.Worked;
++					waiting |= r == AssistResult.Waiting;
++				}
++			}
++
++			if (!worked && !waiting) {
++				break;
++			}
++
++			if (maxTimeHns > 0 && (getMonotonicTime() - start) >= maxTimeHns) {
++				break;
++			}
++			if (maxTimeHns == 0) {
++				break;
++			}
++		}
++	}
++
+ 	void runGCCycle() {
+ 		/**
+ 		 * An explicit collection is synchronous: let a running background
+diff --git a/source/d/gc/tcache.d b/source/d/gc/tcache.d
+index 839aa35..75f35b3 100644
+--- a/source/d/gc/tcache.d
++++ b/source/d/gc/tcache.d
+@@ -253,7 +253,7 @@ public:
+ 		stackBottom = getStackBottom();
+ 	}
+ 
+-	bool activateGC(bool activated = true) {
++	bool activateGC(bool activated = true) nothrow @nogc {
+ 		scope(exit) enableGC = activated;
+ 		return enableGC;
+ 	}
+diff --git a/source/d/gc/tstate.d b/source/d/gc/tstate.d
+index b99d514..1dd2a22 100644
+--- a/source/d/gc/tstate.d
++++ b/source/d/gc/tstate.d
+@@ -82,9 +82,13 @@ public:
+ 		}
+ 	}
+ 
+-	void preventPausing() {
++	void preventPausing() nothrow @nogc {
+ 		auto s = state.load();
+ 		while (true) {
++			if (status(s) == SuspendState.Detached) {
++				break;
++			}
++
+ 			auto n = s + SuspendState.Detached;
+ 
+ 			assert(status(s) == SuspendState.None);
+@@ -96,6 +100,23 @@ public:
+ 		}
+ 	}
+ 
++	void allowPausing() nothrow @nogc {
++		auto s = state.load();
++		while (true) {
++			if (status(s) == SuspendState.None) {
++				break;
++			}
++
++			assert(status(s) == SuspendState.Detached);
++			auto n = s - SuspendState.Detached;
++			assert(status(n) == SuspendState.None);
++
++			if (state.casWeak(s, n)) {
++				break;
++			}
++		}
++	}
++
+ 	bool onSuspendSignal() {
+ 		auto s = state.load();
+ 
+diff --git a/source/symgc/gcobj.d b/source/symgc/gcobj.d
+index 6b3fc7a..5a58f7a 100644
+--- a/source/symgc/gcobj.d
++++ b/source/symgc/gcobj.d
+@@ -28,6 +28,12 @@ extern(C) nothrow {
+ 	bool __sd_gc_set_finalizer_attr(void* ptr, void* finalizer);
+ 	void __sd_gc_clear_finalizer_attr(void* ptr);
+ 	void __sd_gc_profile_stats(ulong* dst);
++	void __sd_gc_exclude_current_thread();
++	void __sd_gc_include_current_thread();
++	bool __sd_gc_is_thread_excluded();
++	void __sd_gc_step(ulong maxTimeHns);
++	void __sd_gc_time_thread(ulong* dst);
++	void __sd_gc_time_total(ulong* dst);
+ 
+ 	// hook prototypes needed for druntime api (see below)
+ 	void* __sd_gc_hook_alloc(size_t size, bool containsPointers, bool zeroData);
+@@ -137,7 +143,7 @@ private GC initialize()
+ 	return initializeQuiet();
+ }
+ 
+-final class SnazzyGC : GC
++final class SnazzyGC : GC, GCTelemetry
+ {
+ 	void enable()
+ 	{
+@@ -352,6 +358,68 @@ final class SnazzyGC : GC
+ 		return ps;
+ 	}
+ 
++	/**
++	 * Retrieve real-time frame telemetry about garbage collection.
++	 * Designed for game loops, profilers, and HUDs.
++	 */
++	core.memory.GC.FrameStats frameStats() nothrow @nogc @safe
++	{
++		import core.time : nsecs;
++		import d.gc.extent : gMarkActive, gSweepCycle;
++
++		ulong[6] threadTimes = void;
++		ulong[6] totalTimes = void;
++		() @trusted nothrow @nogc {
++			(cast(void function(ulong*) nothrow @nogc)&__sd_gc_time_thread)(threadTimes.ptr);
++			(cast(void function(ulong*) nothrow @nogc)&__sd_gc_time_total)(totalTimes.ptr);
++		}();
++
++		core.memory.GC.FrameStats fs;
++		fs.threadAllocTime = nsecs(threadTimes[0]);
++		fs.threadCollectTime = nsecs(threadTimes[1]);
++		fs.threadPauseTime = nsecs(threadTimes[2]);
++
++		fs.totalAllocTime = nsecs(totalTimes[0]);
++		fs.totalCollectTime = nsecs(totalTimes[1]);
++		fs.totalPauseTime = nsecs(totalTimes[2]);
++
++		fs.isCycleActive = (gMarkActive.load() != 0) || (gSweepCycle.load() != 0);
++
++		auto s = this.stats();
++		import d.gc.arena : Arena;
++		import d.gc.spec : PageSize;
++		size_t activeUsed = () @trusted nothrow @nogc {
++			return (cast(size_t function() nothrow @nogc)&Arena.computeUsedPageCount)() * PageSize;
++		}();
++		fs.usedSize = activeUsed > 0 ? activeUsed : s.usedSize;
++		fs.freeSize = s.freeSize;
++
++		auto ps = this.profileStats();
++		fs.numCollections = ps.numCollections;
++
++		return fs;
++	}
++
++	void excludeCurrentThread() @trusted nothrow @nogc
++	{
++		(cast(void function() nothrow @nogc)&__sd_gc_exclude_current_thread)();
++	}
++
++	void includeCurrentThread() @trusted nothrow @nogc
++	{
++		(cast(void function() nothrow @nogc)&__sd_gc_include_current_thread)();
++	}
++
++	bool isThreadExcluded() @trusted nothrow @nogc
++	{
++		return (cast(bool function() nothrow @nogc)&__sd_gc_is_thread_excluded)();
++	}
++
++	void step(ulong maxTimeHns) @trusted nothrow @nogc
++	{
++		(cast(void function(ulong) nothrow @nogc)&__sd_gc_step)(maxTimeHns);
++	}
++
+ 	/**
+ 	 * add p to list of roots
+ 	 */
+diff --git a/test/druntime/telemetry.d b/test/druntime/telemetry.d
+new file mode 100644
+index 0000000..65130e3
+--- /dev/null
++++ b/test/druntime/telemetry.d
+@@ -0,0 +1,129 @@
++/+ dub.json:
++   {
++	   "name": "telemetry",
++	   "dependencies": {
++		   "symgc" : {
++			   "path" : "../../"
++		   }
++	   },
++	   "targetPath": "./bin"
++   }
+++/
++//T retval:0
++//T desc: Test game engine controls, frame telemetry, and thread exclusion
++
++import core.memory;
++import core.time;
++import core.thread;
++import core.stdc.stdio : printf;
++
++extern(C) __gshared rt_options = ["gcopt=gc:sdc"];
++
++class LargeEntity {
++	ubyte[4096] buffer;
++	int id;
++	this(int id) { this.id = id; }
++}
++
++void testFrameStats()
++{
++	printf("Testing GC.frameStats()...\n");
++	// Allocate some objects to produce telemetry activity
++	LargeEntity[] entities;
++	foreach (i; 0 .. 100) {
++		entities ~= new LargeEntity(i);
++	}
++
++	auto fs = GC.frameStats();
++	printf("  usedSize: %llu bytes, freeSize: %llu bytes\n", cast(ulong) fs.usedSize, cast(ulong) fs.freeSize);
++	printf("  threadAllocTime: %lld ns, totalAllocTime: %lld ns\n",
++		cast(long) fs.threadAllocTime.total!"nsecs", cast(long) fs.totalAllocTime.total!"nsecs");
++	printf("  threadCollectTime: %lld ns, totalCollectTime: %lld ns\n",
++		cast(long) fs.threadCollectTime.total!"nsecs", cast(long) fs.totalCollectTime.total!"nsecs");
++	printf("  threadPauseTime: %lld ns, totalPauseTime: %lld ns\n",
++		cast(long) fs.threadPauseTime.total!"nsecs", cast(long) fs.totalPauseTime.total!"nsecs");
++	printf("  numCollections: %zu, isCycleActive: %d\n", fs.numCollections, fs.isCycleActive ? 1 : 0);
++
++	assert(fs.usedSize > 0, "usedSize must be > 0");
++	assert(fs.threadAllocTime >= Duration.zero, "threadAllocTime must be >= 0");
++	assert(fs.totalAllocTime >= Duration.zero, "totalAllocTime must be >= 0");
++	printf("  GC.frameStats() PASSED.\n");
++}
++
++void testThreadExclusion()
++{
++	printf("Testing thread exclusion (audio/real-time exemption)...\n");
++	assert(!GC.isThreadExcluded(), "Main thread should not be excluded initially");
++
++	GC.excludeCurrentThread();
++	assert(GC.isThreadExcluded(), "Main thread should be excluded after excludeCurrentThread()");
++
++	GC.includeCurrentThread();
++	assert(!GC.isThreadExcluded(), "Main thread should not be excluded after includeCurrentThread()");
++
++	// Multi-threaded test: simulated audio thread
++	__gshared bool audioRunning = true;
++	__gshared uint audioTicks = 0;
++	__gshared bool audioExcludedConfirmed = false;
++
++	auto audioThread = new Thread({
++		assert(!GC.isThreadExcluded());
++		GC.excludeCurrentThread();
++		assert(GC.isThreadExcluded());
++		audioExcludedConfirmed = true;
++
++		// Real-time audio loop simulation (pure compute, zero GC allocation)
++		while (audioRunning) {
++			audioTicks++;
++			Thread.sleep(100.usecs);
++		}
++
++		GC.includeCurrentThread();
++		assert(!GC.isThreadExcluded());
++	});
++
++	audioThread.start();
++
++	// Wait for audio thread to exclude itself
++	while (!audioExcludedConfirmed) {
++		Thread.yield();
++	}
++
++	// Main thread triggers a collection cycle
++	printf("  Triggering GC collection while audio thread runs excluded...\n");
++	foreach (i; 0 .. 500) {
++		new LargeEntity(i);
++	}
++	GC.collect();
++
++	// Verify audio thread kept ticking smoothly
++	assert(audioTicks > 0, "Audio thread must continue ticking");
++	audioRunning = false;
++	audioThread.join();
++
++	printf("  Audio thread finished with %u ticks.\n", audioTicks);
++	printf("  Thread exclusion PASSED.\n");
++}
++
++void testPacingStep()
++{
++	printf("Testing cooperative inter-frame pacing GC.step()...\n");
++	// Test default step (zero duration: single sweep pass)
++	GC.step();
++
++	// Test timed step (1 millisecond)
++	GC.step(1.msecs);
++
++	// Test microsecond step
++	GC.step(500.usecs);
++
++	printf("  GC.step() PASSED.\n");
++}
++
++void main()
++{
++	testFrameStats();
++	testThreadExclusion();
++	testPacingStep();
++	printf("All Game Engine Controls & Telemetry tests passed successfully!\n");
++}
+-- 
+2.51.0
+
