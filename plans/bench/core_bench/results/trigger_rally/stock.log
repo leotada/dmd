@@ -835,40 +835,37 @@ Loading image "textures/sky/blue.jpg"
 Loading .mtl Material "/vehicles/cordo_kitcar/cordo_kitcar.mtl"
 Loading image "/vehicles/cordo_kitcar/cordo_kitcar.png"
 Loading image "/vehicles/cordo_kitcar/cordo_kitcar_emission.png"
-[SLOW FRAME 42] 467.71 ms
-[SLOW FRAME 46] 201.44 ms
-[SLOW FRAME 58] 106.03 ms
-[SLOW FRAME 64] 304.62 ms
-[SLOW FRAME 70] 2070.92 ms
-[SLOW FRAME 84] 107.13 ms
-[SLOW FRAME 89] 273.28 ms
-[SLOW FRAME 99] 100.05 ms
-[SLOW FRAME 110] 126.63 ms
-[SLOW FRAME 115] 201.05 ms
-[SLOW FRAME 119] 640.50 ms
-[SLOW FRAME 130] 3299.92 ms
+[SLOW FRAME 4] 156.14 ms
+[SLOW FRAME 6] 109.06 ms
+[SLOW FRAME 24] 104.58 ms
+[SLOW FRAME 32] 2201.55 ms
+[SLOW FRAME 50] 284.03 ms
+[SLOW FRAME 54] 299.63 ms
+[SLOW FRAME 76] 187.75 ms
+[SLOW FRAME 84] 115.95 ms
+[SLOW FRAME 104] 7754.41 ms
 
 ==================== BENCHMARK RESULTS ====================
 Collector: stock (DRuntime Default GC)
-Duration: 15.03 s | Total Frames: 141 | Average FPS: 9.38
+Duration: 16.38 s | Total Frames: 101 | Average FPS: 6.16
 Frame Latency (ms):
-  min:    33.78 ms
-  avg:   105.41 ms
-  p50:    54.07 ms
-  p90:    65.82 ms
-  p95:   201.05 ms
-  p99:   2070.92 ms
-  p99.9: 3299.92 ms
-  max:   3299.92 ms
+  min:    41.96 ms
+  avg:   160.53 ms
+  p50:    55.45 ms
+  p90:    69.69 ms
+  p95:   156.14 ms
+  p99:   2201.55 ms
+  p99.9: 7754.41 ms
+  max:   7754.41 ms
 Frame Threshold Violations:
-  frames >  5.0 ms:   141 (100.00%)
-  frames > 10.0 ms:   141 (100.00%)
-  frames > 16.6 ms (missed 60 FPS):   141 (100.00%)
-  frames > 33.3 ms (missed 30 FPS):   141 (100.00%)
+  frames >  5.0 ms:   101 (100.00%)
+  frames > 10.0 ms:   101 (100.00%)
+  frames > 16.6 ms (missed 60 FPS):   101 (100.00%)
+  frames > 33.3 ms (missed 30 FPS):   101 (100.00%)
 Memory Footprint:
-  RSS: 532.5 MiB
+  RSS: 531.5 MiB
 Stock GC Profiling Stats:
   Collections count: 22
-  Total pause time:  5.232 ms
-  Max pause time:    0.547 ms
+  Total pause time:  5.661 ms
+  Max pause time:    0.665 ms
 ===========================================================

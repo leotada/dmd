@@ -34,8 +34,8 @@ echo "=== Running Oneday (STW Mark: SYMGC_CONCURRENT_MARK=0) Benchmark ($BENCH_S
 SYMGC_CONCURRENT_MARK=0 $BIN_DIR/trigger-rally-oneday > "$OUT_DIR/oneday_stw.log" 2>&1 || true
 
 echo ""
-echo "=== Running Oneday (Concurrent Mark: SYMGC_CONCURRENT_MARK=1) Benchmark ($BENCH_SECS s) ==="
-SYMGC_CONCURRENT_MARK=1 $BIN_DIR/trigger-rally-oneday > "$OUT_DIR/oneday_concurrent.log" 2>&1 || true
+echo "=== Running Oneday (Concurrent Mark: SYMGC_CONCURRENT_MARK=1, THREADS=2) Benchmark ($BENCH_SECS s) ==="
+SYMGC_CONCURRENT_MARK=1 SYMGC_MARK_THREADS=2 SYMGC_MARK_NICE=10 $BIN_DIR/trigger-rally-oneday > "$OUT_DIR/oneday_concurrent.log" 2>&1 || true
 
 echo ""
 echo "==================== COMPARISON SUMMARY ===================="
