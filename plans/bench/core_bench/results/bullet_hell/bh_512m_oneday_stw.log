@@ -1,0 +1,2 @@
+bullet_hell: 15 s, level 512 MiB, 20000 bullets/s, peak bullets 22737, last HUD: score 64634  hits 1632  bullets 22367  particles 450  frame 899
+frame_p50_us=356 p99=915 p999=2719 max=2719 over1ms=8 over2ms=6 over5ms=0 over16ms=0 frames=900

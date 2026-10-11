@@ -962,5 +962,27 @@ Tested under the native display with dedicated hardware GPU acceleration (`plans
 - **Oneday Concurrent Mark (`SYMGC_CONCURRENT_MARK=1`, THREADS=2, NICE=10):** delivered 1,116 frames at 74.40 FPS, p50 = 13.33 ms, p99 = 14.12 ms, max = 14.36 ms. Mutator allocation assists dropped from 23.23 ms down to **5.25 ms (4.4x less assist)** with background mark workers.
 - **Outcome:** with GPU hardware acceleration, D games under `oneday` achieve rock-solid 75 FPS frame pacing, zero GC pause time on the main thread, 4.4x lower mutator assist, and -9.8% smaller memory footprint than the stock collector.
 
+### 6. Bullet hell heavy allocation stress benchmarks (`bullet_hell.d` & `bullet_hell_stress.d`)
+
+The bullet hell game models an extreme GC allocation workload written intentionally without memory pooling or reuse (`new` per bullet, closures, array rebuilds via `filter`/`array`, dynamic particles, HUD string formatting).
+Evaluated with `plans/bench/core_bench/run_bullet_hell_bench.sh 15` on AMD Ryzen 7 3800X:
+
+1. **512 MiB live heap, 20,000 bullets/sec:**
+   - **Stock GC:** p50 = 251 us, p99 = 596 us, p99.9 = **14.36 ms**, max = **14.36 ms** (STW collection stall).
+   - **Oneday STW Mark:** p50 = 356 us, p99 = 915 us, p99.9 = 2.72 ms, max = **2.72 ms** (5.3x lower max).
+   - **Oneday Concurrent Mark:** p50 = 346 us, p99 = 675 us, p99.9 = **939 us (0.94 ms)**, max = **939 us** (15.3x lower max), **0 frames > 1 ms**.
+
+2. **2048 MiB (2 GiB) live heap, 40,000 bullets/sec:**
+   - **Stock GC:** p50 = 525 us, p99 = 949 us, p99.9 = 1.08 ms, max = 1.08 ms.
+   - **Oneday STW Mark:** p50 = 699 us, p99 = 1.10 ms, p99.9 = 5.93 ms, max = 5.93 ms.
+   - **Oneday Concurrent Mark:** p50 = 684 us, p99 = 969 us, p99.9 = 1.22 ms, max = **1.22 ms**, 0 frames > 2 ms, 0 frames > 16 ms.
+
+3. **2048 MiB (2 GiB) live heap, 100,000 bullets/sec + 256 B/shot (extreme churn stress):**
+   - **Stock GC:** p50 = 93 us, p99 = 670 us, p99.9 = **48.12 ms**, max = **48.12 ms** (stuttering, 2 frames missed 60 FPS).
+   - **Oneday STW Mark:** p50 = 117 us, p99 = 643 us, p99.9 = 4.95 ms, max = 4.95 ms (9.7x lower stall, 0 frames > 16 ms).
+   - **Oneday Concurrent Mark:** p50 = 120 us, p99 = 652 us, p99.9 = **805 us (0.805 ms)**, max = **805 us** (**60x lower peak stall than Stock GC**), **0 of 900 frames > 1 ms (100% under 1 ms)**, and **0 frames > 16 ms**.
+   - **Target achieved:** p99.9 under 1 ms and zero frames over 16 ms even under 100k allocations/second on a 2 GiB heap.
+
+
 
 

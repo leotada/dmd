@@ -1,0 +1,2 @@
+bullet_hell_stress: 15 s, level 2048 MiB, 100000 bullets/s, life x0.05, +256 B/shot, nogc 0, peak bullets 6253, last HUD: score 498983  hits 0  bullets 5017  particles 0  frame 899 (17388000)
+frame_p50_us=117 p99=643 p999=4952 max=4952 over1ms=1 over2ms=1 over5ms=0 over16ms=0 frames=900
