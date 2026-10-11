@@ -835,37 +835,38 @@ Loading image "textures/sky/blue.jpg"
 Loading .mtl Material "/vehicles/cordo_kitcar/cordo_kitcar.mtl"
 Loading image "/vehicles/cordo_kitcar/cordo_kitcar.png"
 Loading image "/vehicles/cordo_kitcar/cordo_kitcar_emission.png"
-[SLOW FRAME 4] 156.14 ms
-[SLOW FRAME 6] 109.06 ms
-[SLOW FRAME 24] 104.58 ms
-[SLOW FRAME 32] 2201.55 ms
-[SLOW FRAME 50] 284.03 ms
-[SLOW FRAME 54] 299.63 ms
-[SLOW FRAME 76] 187.75 ms
-[SLOW FRAME 84] 115.95 ms
-[SLOW FRAME 104] 7754.41 ms
+[SLOW FRAME 10] 114.88 ms
+[SLOW FRAME 25] 919.21 ms
+[SLOW FRAME 35] 156.83 ms
+[SLOW FRAME 39] 107.68 ms
+[SLOW FRAME 115] 679.02 ms
+[SLOW FRAME 148] 146.59 ms
+[SLOW FRAME 161] 141.87 ms
+[SLOW FRAME 164] 150.69 ms
+[SLOW FRAME 184] 181.00 ms
+[SLOW FRAME 233] 167.92 ms
 
 ==================== BENCHMARK RESULTS ====================
 Collector: stock (DRuntime Default GC)
-Duration: 16.38 s | Total Frames: 101 | Average FPS: 6.16
+Duration: 15.02 s | Total Frames: 246 | Average FPS: 16.38
 Frame Latency (ms):
-  min:    41.96 ms
-  avg:   160.53 ms
-  p50:    55.45 ms
-  p90:    69.69 ms
-  p95:   156.14 ms
-  p99:   2201.55 ms
-  p99.9: 7754.41 ms
-  max:   7754.41 ms
+  min:    33.55 ms
+  avg:    60.32 ms
+  p50:    50.76 ms
+  p90:    66.61 ms
+  p95:    84.35 ms
+  p99:   181.00 ms
+  p99.9: 919.21 ms
+  max:   919.21 ms
 Frame Threshold Violations:
-  frames >  5.0 ms:   101 (100.00%)
-  frames > 10.0 ms:   101 (100.00%)
-  frames > 16.6 ms (missed 60 FPS):   101 (100.00%)
-  frames > 33.3 ms (missed 30 FPS):   101 (100.00%)
+  frames >  5.0 ms:   246 (100.00%)
+  frames > 10.0 ms:   246 (100.00%)
+  frames > 16.6 ms (missed 60 FPS):   246 (100.00%)
+  frames > 33.3 ms (missed 30 FPS):   246 (100.00%)
 Memory Footprint:
-  RSS: 531.5 MiB
+  RSS: 530.9 MiB
 Stock GC Profiling Stats:
   Collections count: 22
-  Total pause time:  5.661 ms
-  Max pause time:    0.665 ms
+  Total pause time:  5.762 ms
+  Max pause time:    0.602 ms
 ===========================================================

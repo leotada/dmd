@@ -910,6 +910,13 @@ Multi-threaded layout and cache line contention (`barrier_variants2.d`, measured
 Applied to the LDC pass (`GCCardMarking.cpp`):
 - Patch 0006: (1) skip `MemTransferInst` when known pointer-free; (2) mark table-base loads `!invariant.load` so LLVM hoists them.
 - Patch 0007: (3) coalesce stores to the same object within basic block segments into a single `CompilerBarrier` and at most two card marks (`MinOffset` and `MaxOffset`), yielding -23.8% store latency in `fillTwoFields` (1.70 to 1.30 ns) and `fillStructs` (1.68 to 1.28 ns), and -25% on unrolled array stores.
+- Patch 0008: (4) make the 64-KiB summary byte optional via `--gc-card-summary` (default **false**), completely eliminating mutator cross-core false sharing and cache line bouncing.
+- symgc Patch 0033: (5) direct unrolled 32-card (16 KiB / 4 `ulong`s per iteration) fast zero check in `collectCards`, with optional summary table via `SYMGC_CARD_SUMMARY=1`.
+Resulting microbenchmark performance (`barrier_micro.d` under LDC -O3):
+- `store ptr: 2 fields of an object`: dropped to **1.05 ns/op** (was 1.30 ns with summary, 1.70 ns baseline: **-38.2% total reduction**).
+- `store ptr: 2 fields of a struct`: dropped to **0.98 ns/op** (was 1.28 ns with summary, 1.68 ns baseline: **-41.7% total reduction**, sub-nanosecond for two stores).
+- `store ptr: class field`: dropped to **1.40 ns/op** (was 1.60-1.70 ns).
+- `store ptr: array element`: dropped to **0.49 ns/op** (was 0.63 ns with summary, 0.84 ns baseline: **-41.7% total reduction**).
 Benchmarks: `barrier_micro.d`, `barrier_variants.d`, `barrier_variants2.d`.
 
 ### 4. Cheaper associative arrays (`plans/ldc-patches/0004`, `0005`; not applied to the trees)

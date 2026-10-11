@@ -1,0 +1,71 @@
+From 5810c0607054fa1d102d5513caefae7d723480d3 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Sat, 10 Oct 2026 23:26:56 -0300
+Subject: [PATCH] gc-card-marking: make 64 KiB summary byte optional (default
+ false to eliminate false sharing)
+
+---
+ gen/passes/GCCardMarking.cpp | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/gen/passes/GCCardMarking.cpp b/gen/passes/GCCardMarking.cpp
+index ae577597dc..80a73ac366 100644
+--- a/gen/passes/GCCardMarking.cpp
++++ b/gen/passes/GCCardMarking.cpp
+@@ -17,9 +17,15 @@
+ #include "llvm/IR/InstIterator.h"
+ #include "llvm/IR/Instructions.h"
+ #include "llvm/IR/IntrinsicInst.h"
++#include "llvm/Support/CommandLine.h"
+ 
+ using namespace llvm;
+ 
++static cl::opt<bool>
++    EmitCardSummary("gc-card-summary", cl::ZeroOrMore,
++                    cl::init(false),
++                    cl::desc("Also emit 64 KiB summary byte marks in GC card barrier (default false)"));
++
+ namespace {
+ 
+ constexpr unsigned CardShift = 9;     // 512 byte cards
+@@ -46,7 +52,8 @@ struct Marker {
+ 
+   explicit Marker(Module &M)
+       : M(M), C(M.getContext()),
+-        IntPtrTy(M.getDataLayout().getIntPtrType(M.getContext())) {
++        IntPtrTy(M.getDataLayout().getIntPtrType(M.getContext())),
++        SummaryBase(nullptr) {
+     auto *PtrTy = PointerType::getUnqual(C);
+     CardBase = M.getGlobalVariable("__sd_gc_card_base");
+     if (!CardBase) {
+@@ -54,11 +61,13 @@ struct Marker {
+                                     GlobalValue::ExternalLinkage, nullptr,
+                                     "__sd_gc_card_base");
+     }
+-    SummaryBase = M.getGlobalVariable("__sd_gc_card_summary_base");
+-    if (!SummaryBase) {
+-      SummaryBase = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
+-                                       GlobalValue::ExternalLinkage, nullptr,
+-                                       "__sd_gc_card_summary_base");
++    if (EmitCardSummary) {
++      SummaryBase = M.getGlobalVariable("__sd_gc_card_summary_base");
++      if (!SummaryBase) {
++        SummaryBase = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
++                                         GlobalValue::ExternalLinkage, nullptr,
++                                         "__sd_gc_card_summary_base");
++      }
+     }
+     CardRange = M.getOrInsertFunction(
+         "__sd_gc_card_range", Type::getVoidTy(C), PtrTy, IntPtrTy);
+@@ -130,6 +139,8 @@ struct Marker {
+   /// One byte per 64 KiB, so that finding the dirty cards of a big heap does
+   /// not mean reading all of the card table.
+   void markSummary(IRBuilder<> &B, Value *AddrInt) {
++    if (!EmitCardSummary || !SummaryBase)
++      return;
+     auto *SIdx = B.CreateLShr(AddrInt, ConstantInt::get(IntPtrTy, SummaryShift));
+     auto *SBase = B.CreateLoad(PointerType::getUnqual(C), SummaryBase);
+     SBase->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(C, {}));
+-- 
+2.51.0
+

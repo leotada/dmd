@@ -1,6 +1,6 @@
 [BENCH] Benchmark enabled via TRIGGER_BENCH_SECS=15
 Trigger Rally init
-Build: 0.6.7 on Oct 10 2026 at 21:03:59
+Build: 0.6.7 on Oct 10 2026 at 23:27:17
 Initialising virtual file system
 Setting writable user directory to "/home/leonardo/.local/share/trigger-rally-team/trigger-rally/"
 Failed to create directory "/players"
@@ -835,41 +835,32 @@ Loading image "textures/sky/blue.jpg"
 Loading .mtl Material "/vehicles/cordo_kitcar/cordo_kitcar.mtl"
 Loading image "/vehicles/cordo_kitcar/cordo_kitcar.png"
 Loading image "/vehicles/cordo_kitcar/cordo_kitcar_emission.png"
-[SLOW FRAME 35] 712.09 ms
-[SLOW FRAME 38] 151.17 ms
-[SLOW FRAME 42] 480.74 ms
-[SLOW FRAME 43] 111.39 ms
-[SLOW FRAME 53] 1606.71 ms
-[SLOW FRAME 62] 310.52 ms
-[SLOW FRAME 87] 130.61 ms
-[SLOW FRAME 109] 461.02 ms
-[SLOW FRAME 135] 182.76 ms
-[SLOW FRAME 150] 330.32 ms
-[SLOW FRAME 155] 1037.22 ms
-[SLOW FRAME 172] 274.37 ms
+[SLOW FRAME 13] 335.54 ms
+[SLOW FRAME 37] 11172.46 ms
+[SLOW FRAME 53] 182.44 ms
 
 ==================== BENCHMARK RESULTS ====================
 Collector: oneday (SymGC Concurrent Mark [SYMGC_CONCURRENT_MARK=1] + Coalesced Cards)
-Duration: 15.08 s | Total Frames: 181 | Average FPS: 12.00
+Duration: 15.05 s | Total Frames: 61 | Average FPS: 4.05
 Frame Latency (ms):
-  min:    31.45 ms
-  avg:    82.54 ms
-  p50:    54.28 ms
-  p90:    73.57 ms
-  p95:   151.17 ms
-  p99:   1037.22 ms
-  p99.9: 1606.71 ms
-  max:   1606.71 ms
+  min:    31.84 ms
+  avg:   244.21 ms
+  p50:    57.91 ms
+  p90:    62.05 ms
+  p95:    71.04 ms
+  p99:   11172.46 ms
+  p99.9: 11172.46 ms
+  max:   11172.46 ms
 Frame Threshold Violations:
-  frames >  5.0 ms:   181 (100.00%)
-  frames > 10.0 ms:   181 (100.00%)
-  frames > 16.6 ms (missed 60 FPS):   181 (100.00%)
-  frames > 33.3 ms (missed 30 FPS):   180 (99.45%)
+  frames >  5.0 ms:    61 (100.00%)
+  frames > 10.0 ms:    61 (100.00%)
+  frames > 16.6 ms (missed 60 FPS):    61 (100.00%)
+  frames > 33.3 ms (missed 30 FPS):    60 (98.36%)
 Memory Footprint:
-  RSS: 512.6 MiB
+  RSS: 512.1 MiB
 SymGC Profiling Stats:
-  Main thread GC pause time:      4.979 ms
-  Main thread GC alloc slow path: 15.994 ms
-  Main thread GC collect/assist:  4.470 ms
-  All threads GC pause time:      4.979 ms
+  Main thread GC pause time:      8.436 ms
+  Main thread GC alloc slow path: 15.183 ms
+  Main thread GC collect/assist:  7.421 ms
+  All threads GC pause time:      8.436 ms
 ===========================================================
