@@ -1744,3 +1744,31 @@ The deliverable is the **oneday** collector toolchain:
 
 Phase 0 discovery is officially **closed**.
 
+---
+
+## 15. Post-Phase 0 Implementation Roadmap: Game Engine APIs, Precision, Upstream & Soak
+
+With Phase 0 discovery concluded and the empirical goals verified, this section establishes the productionization and game engine roadmap for the **oneday** collector toolchain.
+
+### 15.1 Roadmap Overview
+
+The subsequent phases build upon the validated SymGC + LDC Card-Marking architecture to provide full game engine lifecycle controls, hardware optimization, upstream integration, and endurance guarantees:
+
+1. **Step 1 (Active): Game Engine Controls & Frame Telemetry (Profiler APIs)**
+   - Expose first-class game engine telemetry via `core.memory.GC.frameStats()` and `core.memory.GC.FrameStats`, reporting per-frame thread pause time, mutator allocation assist duration, and cycle state directly without scraping internal symbols.
+   - Implement real-time audio/simulation thread exemption (`GC.excludeCurrentThread()` / `GC.includeCurrentThread()`) so dedicated audio mixing threads (e.g. OpenAL, JACK, audio callbacks) never receive STW signals or undergo stack inspection, eliminating audio dropouts/underruns.
+   - Expose frame pacing budget hook (`GC.step(Duration maxTime)`) allowing game engines to donate leftover V-Sync inter-frame idle time to advance background sweeping or concurrent mark stages.
+
+2. **Step 2 (Planned): Precise Heap Scanning (`scanner.d`)**
+   - Integrate D type bitmaps (`RTInfo`) and block `usedCapacity` tracking into `symgc/source/d/gc/scanner.d`.
+   - Restrict pointer scanning to actually live allocated slots and pointer-bearing fields instead of entire blocks, reducing RAM/L3 memory bandwidth consumption during concurrent marking by up to 50%.
+
+3. **Step 3 (Planned): Upstream Preparation & Packaging (LDC & SymGC PRs)**
+   - Prepare clean patch series and LLVM FileCheck test suites for upstream submission:
+     - PR to `ldc-developers/ldc` introducing the `-gc-card-marking` pass with coalescing and optional summary byte configuration.
+     - PR to `symmetryinvestments/symgc` upstreaming `latency-p3` concurrency, sweep duty cycle pacing, thread priority tuning, and unrolled 32-card scan.
+
+4. **Step 4 (Planned): 4–8 GiB Long-Running Soak & Marathon Verification**
+   - Conduct 30–60 minute continuous soak runs of `bullet_hell_stress` and `trigger-rally-d` on 4–8 GiB live heaps with `-version=Symgc_verify` enabled to prove asymptotic zero memory leaks, zero fragmentation decay, and long-session stability.
+
+
