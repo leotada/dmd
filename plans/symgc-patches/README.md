@@ -898,7 +898,15 @@ ints 3.5 to 9.3 ns. Patch 0031 makes `__sd_gc_card_range` use plain byte stores 
 9.1 to 6.0 ns and 9.3 to 6.2 ns.
 Not done: a check-then-set barrier (test the card byte first) is 3x cheaper in a model but unsafe on x86 (the card load
 can pass the earlier pointer store; a dirty round could clear the card and lose the write), and a fence removes the
-gain; the multi-threaded layout runs were erratic; the remark-pause card scan cost was not measured.
+gain; the remark-pause card scan cost was not measured.
+
+Multi-threaded layout and cache line contention (`barrier_variants2.d`, measured across 1, 2, 4, 8 threads on Ryzen 7 3800X):
+- At 1 thread: card-byte-only is 1.40 ns vs 1.70 ns with both card and summary bytes (+21% penalty for the summary byte).
+- At 4 threads (shared/interleaved layout): updating the 64-KiB summary byte triggers severe cross-core false sharing on the shared L1 cache line, inflating latency from **24.3 ns (card byte only) to 61.3 ns (2.5x slower)**.
+- At 8 threads (private slices): card-byte-only is **44.7 ns vs 151.2 ns with summary byte (3.4x slower)**.
+- Base address hoisting (`__sd_gc_card_base`) has negligible latency impact (stays hot in L1 cache) but reduces instruction overhead.
+- Takeaway: maintaining a 64-KiB summary byte per mutator store is harmful under high thread counts; scanning raw cards with AVX2 SIMD during the remark pause is vastly more scalable for multi-threaded mutators.
+
 Applied to the LDC pass (`GCCardMarking.cpp`):
 - Patch 0006: (1) skip `MemTransferInst` when known pointer-free; (2) mark table-base loads `!invariant.load` so LLVM hoists them.
 - Patch 0007: (3) coalesce stores to the same object within basic block segments into a single `CompilerBarrier` and at most two card marks (`MinOffset` and `MaxOffset`), yielding -23.8% store latency in `fillTwoFields` (1.70 to 1.30 ns) and `fillStructs` (1.68 to 1.28 ns), and -25% on unrolled array stores.
