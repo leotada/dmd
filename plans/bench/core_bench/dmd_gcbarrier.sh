@@ -13,7 +13,7 @@
 set -u
 REPO=${REPO:-/home/leonardo/Projetos/dmd}
 PHOBOS=${PHOBOS:-/home/leonardo/Projetos/phobos}
-DMD=$REPO/generated/linux/release/64/dmd
+DMD=${DMD:-$REPO/generated/linux/release/64/dmd}
 GCB_DRT=$REPO/generated/gcb/linux/release/64
 GCB_PHO=$PHOBOS/generated/gcb/linux/release/64
 
