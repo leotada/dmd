@@ -1125,3 +1125,26 @@ The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not de
   half-target rule); unit tests 113/113, `mark_race`, `mark_race_glue`, `finalizer_order`, `thread_exit_race` pass.
 - **Not done**: the first mark after a burst of allocation still waits (no history); the other models were not re-run
   after the half-target rule; the unexplained growth.
+
+## 14. The unexplained growth was the mark's work list (patch 0048); the documentation kit (0049-0050)
+
+- **0048**: the scanner's work list is mapped directly (Posix), grown by doubling and unmapped when the mark ends,
+  instead of being allocated from the collector's heap and grown by realloc. A concurrent mark frees nothing in the
+  heap, so every step of the old list's growth stayed until the next cycle: 17 reallocations, 50,432 pages (197 MiB) of
+  garbage per cycle for a final list of 32 MiB. The trace `gcgrowth` line now splits the growth into extents added (and
+  how many as slabs), grown in place and freed.
+- **Found by** counting where the pages came from during a mark: of 56,559 pages, 6,127 were extents and 50,432 were
+  "grown" (the realloc chain of the list: 512, 640, ..., 8,192 pages).
+- **Evidence** (Linux x86-64, DMD with the barrier, entity_init 1 GiB, 60 s, 60 fps, two runs each): 115 MB/s: 8-10 frames
+  over 16 ms and a worst frame of 1.5-1.9 s became none and 12-15 ms, RSS 6.9-7.1 GB became 6.2-6.4 GB; 11 MB/s: the
+  0.64 s stall at the first mark became a worst frame of 5-9 ms. With the fix `SYMGC_ADAPTIVE_LIMIT=0` and `=1` give the
+  same result: the adaptive limit (patch 0047) was compensating for this and no longer has a measured benefit. City 500k
+  against the collector without the fix, same session: worst 10.3 / 11.2 ms before, 11.7 / 10.4 ms after. Unit tests,
+  `mark_race`, `mark_race_glue`, `finalizer_order`, `thread_exit_race` pass; the collector still compiles for
+  aarch64-linux-android, x86_64-windows-msvc and aarch64-linux-gnu (not run).
+- **0049**: `bench/` in symgc: the benchmark programs and correctness tests with scripts that need no other checkout
+  (`build.sh`, `compare.sh`, `correctness.sh`, `dmd_gcbarrier.sh`). **0050**: the README as a front page,
+  `guide/usage.md`, `BENCHMARKS.md`, `CONTRIBUTING.md`, and updates to `guide/benchmarks.md` and `guide/how-it-works.md`.
+- **Not done**: the unpaced overload still stalls (worst 3.8 s against 5.4 s before, one run each); the 8 GiB stress, RTS
+  and open world were not re-run; no Windows list change was tested; recipes for stock DMD 2.112, stock LDC and GDC in
+  `usage.md` were not run (only the project's DMD).

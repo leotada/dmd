@@ -1,0 +1,3094 @@
+From 0c05288a2bcfceb4de78af58abd28c20f344c0b7 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 20:42:53 -0300
+Subject: [PATCH 49/50] bench: a self-contained benchmark kit and correctness
+ battery
+
+The programs of plans/bench/core_bench that the guide cites, with scripts that
+need no other checkout: build.sh (DMD, LDC or GDC), compare.sh (one binary under
+druntime's GC, oneday with a stop-the-world mark, oneday with the concurrent
+mark), correctness.sh (mark_race, mark_race_glue, finalizer_order,
+thread_exit_race) and dmd_gcbarrier.sh (DMD with -preview=gcbarrier).
+
+Run with the project's DMD on 2026-10-12: correctness.sh passes (11.6M moves in
+mark_race), compare.sh reproduces the published stress and city results,
+dmd_gcbarrier.sh builds and passes mark_race and mark_race_glue with cards.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ bench/README.md            |  68 ++++
+ bench/aaa_sim.d            | 757 +++++++++++++++++++++++++++++++++++++
+ bench/build.sh             |  37 ++
+ bench/bullet_hell.d        | 166 ++++++++
+ bench/bullet_hell_stress.d | 181 +++++++++
+ bench/cards_precision.d    | 153 ++++++++
+ bench/cards_window.d       | 195 ++++++++++
+ bench/compare.sh           |  33 ++
+ bench/correctness.sh       |  32 ++
+ bench/dmd_gcbarrier.sh     |  44 +++
+ bench/entity_init.d        | 164 ++++++++
+ bench/finalizer_order.d    |  69 ++++
+ bench/gcb.d                | 378 ++++++++++++++++++
+ bench/mark_race.d          | 165 ++++++++
+ bench/mark_race_glue.d     | 292 ++++++++++++++
+ bench/mark_race_glue_ext.d |  31 ++
+ bench/perfcount.d          | 110 ++++++
+ bench/thread_exit_race.d   |  51 +++
+ 18 files changed, 2926 insertions(+)
+ create mode 100644 bench/README.md
+ create mode 100644 bench/aaa_sim.d
+ create mode 100755 bench/build.sh
+ create mode 100644 bench/bullet_hell.d
+ create mode 100644 bench/bullet_hell_stress.d
+ create mode 100644 bench/cards_precision.d
+ create mode 100644 bench/cards_window.d
+ create mode 100755 bench/compare.sh
+ create mode 100755 bench/correctness.sh
+ create mode 100755 bench/dmd_gcbarrier.sh
+ create mode 100644 bench/entity_init.d
+ create mode 100644 bench/finalizer_order.d
+ create mode 100644 bench/gcb.d
+ create mode 100644 bench/mark_race.d
+ create mode 100644 bench/mark_race_glue.d
+ create mode 100644 bench/mark_race_glue_ext.d
+ create mode 100644 bench/perfcount.d
+ create mode 100644 bench/thread_exit_race.d
+
+diff --git a/bench/README.md b/bench/README.md
+new file mode 100644
+index 0000000..e6fb4f6
+--- /dev/null
++++ b/bench/README.md
+@@ -0,0 +1,68 @@
++# Benchmarks and correctness tests
++
++Self-contained: everything here builds against the collector in `../source` and needs only a D compiler.
++`BENCHMARKS.md` (one level up) has the results; this page says how to produce them.
++
++## Quick start
++
++```sh
++# One program, three collectors (druntime's GC, oneday with a stop-the-world mark, oneday with a concurrent mark)
++bench/compare.sh bullet_hell_stress.d 30 2048 100000 0.05 256
++
++# The correctness battery (about two minutes)
++bench/correctness.sh
++```
++
++`compare.sh` prints one line per collector with the frame statistics and the peak memory. The number to read first is
++`max`: the longest frame of the run, the one that was missed. `DC=ldc2` (or `gdc`) selects the compiler, `SYMGC=`
++another source directory, `EXTRA=` more flags.
++
++Needs: Linux, a D compiler with a druntime of 2.112 or newer (`platforms.md` in the guide), and `/usr/bin/time`.
++The concurrent mark needs Linux 6.7+ in this setup (the kernel tracker); on an older kernel the "concurrent" line
++falls back to the stop-the-world mark, which `compare.sh` does not tell you. Run on an idle machine, plugged in, and
++note the CPU frequency setting: it moves frame times a lot.
++
++## The programs
++
++All run headless and paced at 60 frames per second, and are written the careless way on purpose: `new` everywhere,
++closures, rebuilt arrays, formatted strings, no pools.
++
++| Program | What it models | Arguments of the published numbers |
++|---|---|---|
++| `bullet_hell_stress.d` | A shooter that churns garbage with few live objects | `30 2048 100000 0.05 256 0`: seconds, level MiB, bullets per second, bullet life scale, extra bytes per shot, `1` to disable the collector (the game's own cost) |
++| `bullet_hell.d` | The same game with a heavy per-frame cost | `30 2048 40000` |
++| `aaa_sim.d` | City builder, RTS, open world with six job threads | `city 60 2048 6 0 500000`, `rts 60 2048 6 0 100000`, `openworld 60 2048 6 0 100000`: mode, seconds, asset MiB, job threads, no-GC flag, population |
++| `entity_init.d` | A scene of 10 million linked entities with eight pointers each, rewritten every frame | `60 1024 20000 2000 60`: seconds, live MiB, entities relinked per frame, entities created per frame, frames per second (`0` is unpaced, which no collector keeps up with) |
++| `gcb.d` | Allocation throughput and fragmentation (no frames) | `alloc 1 8000000`, `alloc 8 4000000`, `frag 3000000 100000` |
++
++## The correctness battery
++
++| Test | Passes when |
++|---|---|
++| `mark_race.d` | Pointers moved through locals during collections are never lost. Crashes when write tracking is missing: the canary for any port of the barrier or tracker |
++| `mark_race_glue.d` | Eight ways of storing a pointer into a node (field, array literal, struct literal, closure, append, associative array, atomic store, compare-and-swap) lose nothing. The test for a compiler's barrier pass |
++| `finalizer_order.d` | A destructor never sees another dead object's memory reused |
++| `thread_exit_race.d` | Threads exiting during a concurrent mark do not crash it |
++| `cards_window.d`, `cards_precision.d` | With the card barrier only: the window exists before `main`, a store marks exactly its card, nothing outside the window is marked. Run them first on a new platform (`../guide/testing.md`) |
++
++## With the card barrier
++
++`dmd_gcbarrier.sh` builds a program with this project's DMD and `-preview=gcbarrier` (druntime and Phobos are built
++with the flag by its `libs` command):
++
++```sh
++export DMD_REPO=<this project's dmd checkout> PHOBOS=<phobos checkout>
++bench/dmd_gcbarrier.sh libs
++bench/dmd_gcbarrier.sh build /tmp/mark_race bench/mark_race.d
++/tmp/mark_race 20 --DRT-gcopt=gc:sdcq
++```
++
++For LDC, `guide/usage.md` (recipe E) has the command line.
++
++## Reading the numbers
++
++* Compare the same binary under different options, not different binaries: linking a collector changes what the
++  other collector scans as roots.
++* "Frames over 16 ms" is the count of dropped frames at 60 fps; p99.9 and the worst frame are what a player notices.
++* A run with the collector disabled (`bullet_hell_stress.d`'s last argument, `aaa_sim.d`'s no-GC flag) is the game's
++  own cost: the collector cannot be better than that.
+diff --git a/bench/aaa_sim.d b/bench/aaa_sim.d
+new file mode 100644
+index 0000000..63fe429
+--- /dev/null
++++ b/bench/aaa_sim.d
+@@ -0,0 +1,757 @@
++// Game-shaped workloads modelled on three kinds of big games, written the way a
++// programmer writes them with a GC and no care for memory: classes, closures,
++// arrays rebuilt every frame, associative arrays, strings, no pools, no
++// GC.collect. 60 fps, a main thread plus a job pool (fork-join per frame, like a
++// real engine's job system), and a streaming thread where the genre has one.
++//
++//   aaa_sim <rts|openworld|city> [seconds=60] [assetMiB=2048] [jobs=6] [nogc=0] [population=100000]
++//
++//   rts        4,000 units in two armies on a 256x256 grid: spatial hash rebuilt per
++//              frame, target search, A* paths on the job pool, projectiles, an AI
++//              commander, kills and respawns, an event log, the selection UI.
++//   openworld  a player driving through a 64x64-cell world: a streaming thread loads
++//              the cells ahead (mesh and collision data, ~400 props, ~15 NPCs each) and
++//              the far ones are dropped; NPC AI, traffic, physics contacts, HUD, a mission
++//              script with string variables.
++//   city       100,000 citizens, 15,000 buildings, a 200x200 road graph: a slice of the
++//              citizens updated per frame on the job pool, routes searched on the road
++//              graph, an economy tick, traffic counts, births and deaths, info panels.
++//
++// assetMiB is the rest of a game's resident CPU-side data (audio banks, animation,
++// navmeshes, collision, scripts, metadata): mostly pointer-free buffers plus their
++// small metadata objects. nogc=1 runs the same frames with GC.disable(): the frame
++// times are then the game's own cost, and the heap growth is the allocation rate.
++import core.stdc.stdio : printf;
++import core.stdc.stdlib : qsort;
++import core.thread : Thread;
++import core.sync.mutex : Mutex;
++import core.atomic : atomicLoad, atomicStore, atomicOp;
++import core.memory : GC;
++import core.time;
++import std.parallelism : TaskPool;
++import std.algorithm : filter, sort, min, max;
++import std.array : array;
++import std.range : take;
++import std.format : format;
++import std.conv : to;
++import std.math : sqrt;
++
++struct V2 { float x = 0, y = 0; }
++float dist2(V2 a, V2 b) { auto dx = a.x - b.x, dy = a.y - b.y; return dx * dx + dy * dy; }
++
++uint rngState = 12345;  // thread-local
++uint rnd() { rngState = rngState * 1664525 + 1013904223; return rngState >> 8; }
++float frand() { return (rnd() & 0xFFFF) / 65536.0f; }
++
++TaskPool pool;
++enum frameUs = 16_666;
++
++// ---------------------------------------------------------------- assets
++class Asset {
++	string name;
++	ubyte[] data;      // pointer-free payload
++	Asset[] deps;
++	string[string] meta;
++}
++__gshared Asset[] assets;
++
++void loadAssets(size_t mib) {
++	size_t bytes = 0;
++	size_t i = 0;
++	while (bytes < mib * 1024 * 1024) {
++		auto a = new Asset;
++		auto sz = 4096 + (rnd() % 64) * 4096;   // 4 KiB .. 260 KiB
++		a.data = new ubyte[](sz);
++		a.data[0] = cast(ubyte) i;
++		a.name = "asset/" ~ i.to!string ~ ".bin";
++		a.meta["kind"] = (i % 3 == 0) ? "anim" : (i % 3 == 1) ? "audio" : "collision";
++		a.meta["lod"] = (i % 4).to!string;
++		if (i > 0) a.deps = [assets[rnd() % i]];
++		assets ~= a;
++		bytes += sz + 256;
++		i++;
++	}
++}
++
++// ---------------------------------------------------------------- RTS
++enum G = 256;
++
++class Order { int kind; V2 target; Unit targetUnit; }
++class Projectile { V2 pos, vel; Unit target; float life; int dmg; }
++class Unit {
++	int id, team;
++	V2 pos;
++	float hp = 100, cooldown = 0;
++	Unit target;
++	V2[] path;
++	size_t pathIdx;
++	Order[] orders;
++	string name;
++	Projectile fired;
++	bool wantsPath;
++}
++
++struct Rts {
++	ubyte[] walk;
++	Unit[] units;
++	Projectile[] shots;
++	string[] log;
++	int nextId;
++	size_t kills, paths;
++
++	Unit spawn(int team) {
++		auto u = new Unit;
++		u.id = nextId++;
++		u.team = team;
++		u.pos = V2(team == 0 ? frand() * 60 : G - 1 - frand() * 60, frand() * (G - 1));
++		u.name = (team == 0 ? "blue-" : "red-") ~ u.id.to!string;
++		u.orders ~= new Order;
++		u.orders[0].kind = 1;
++		u.orders[0].target = V2(G / 2 + (frand() - 0.5f) * 80, frand() * (G - 1));
++		u.wantsPath = true;
++		return u;
++	}
++
++	void init() {
++		walk = new ubyte[](G * G);
++		foreach (i; 0 .. G * G / 8) walk[rnd() % (G * G)] = 1;   // rocks
++		foreach (i; 0 .. 4000) units ~= spawn(i & 1);
++	}
++
++	static V2[] astar(const(ubyte)[] walk, V2 from, V2 to) {
++		static struct N { float f; uint id; }
++		uint start = cast(uint) from.y * G + cast(uint) from.x;
++		uint goal = cast(uint) to.y * G + cast(uint) to.x;
++		float[uint] g;
++		uint[uint] came;
++		// open list: a binary heap in a growing array
++		N[] heap = new N[](64);
++		size_t n;
++		void push(N x) {
++			if (n == heap.length) heap.length = heap.length * 2;
++			size_t i = n++;
++			heap[i] = x;
++			while (i && heap[(i - 1) / 2].f > heap[i].f) { auto t = heap[i]; heap[i] = heap[(i - 1) / 2]; heap[(i - 1) / 2] = t; i = (i - 1) / 2; }
++		}
++		N pop() {
++			auto top = heap[0];
++			heap[0] = heap[--n];
++			size_t i = 0;
++			for (;;) {
++				size_t l = 2 * i + 1, r = l + 1, s = i;
++				if (l < n && heap[l].f < heap[s].f) s = l;
++				if (r < n && heap[r].f < heap[s].f) s = r;
++				if (s == i) break;
++				auto t = heap[i]; heap[i] = heap[s]; heap[s] = t; i = s;
++			}
++			return top;
++		}
++		g[start] = 0;
++		push(N(0, start));
++		size_t expanded;
++		while (n && expanded < 1500) {
++			auto cur = pop();
++			if (cur.id == goal) break;
++			expanded++;
++			int cx = cur.id % G, cy = cur.id / G;
++			static immutable int[2][8] dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
++			foreach (d; dirs) {
++				int nx = cx + d[0], ny = cy + d[1];
++				if (nx < 0 || ny < 0 || nx >= G || ny >= G) continue;
++				uint nid = ny * G + nx;
++				if (walk[nid]) continue;
++				float ng = g[cur.id] + (d[0] && d[1] ? 1.414f : 1.0f);
++				if (auto p = nid in g) if (*p <= ng) continue;
++				g[nid] = ng;
++				came[nid] = cur.id;
++				float h = sqrt(cast(float) ((nx - to.x) * (nx - to.x) + (ny - to.y) * (ny - to.y)));
++				push(N(ng + h, nid));
++			}
++		}
++		V2[] path;
++		uint c = goal;
++		if (c !in came) c = start;
++		while (c != start) {
++			path ~= V2(c % G + 0.5f, c / G + 0.5f);
++			c = came[c];
++		}
++		return path;
++	}
++
++	void frame(size_t f) {
++		// spatial hash, rebuilt every frame
++		Unit[][uint] cells;
++		foreach (u; units) cells[(cast(uint) u.pos.y / 16) * 64 + cast(uint) u.pos.x / 16] ~= u;
++
++		// unit logic on the job pool
++		foreach (u; pool.parallel(units, 64)) {
++			rngState = cast(uint) (u.id * 2654435761 + f);
++			u.cooldown -= 1.0f / 60;
++			if (u.target is null || u.target.hp <= 0) {
++				Unit[] near;
++				int cx = cast(int) u.pos.x / 16, cy = cast(int) u.pos.y / 16;
++				foreach (dy; -1 .. 2) foreach (dx; -1 .. 2) {
++					if (auto p = cast(uint) ((cy + dy) * 64 + cx + dx) in cells)
++						foreach (o; *p) if (o.team != u.team && o.hp > 0) near ~= o;
++				}
++				u.target = null;
++				float bd = float.max;
++				foreach (o; near) { auto d = dist2(o.pos, u.pos); if (d < bd) { bd = d; u.target = o; } }
++			}
++			if (u.target !is null && dist2(u.target.pos, u.pos) < 64 && u.cooldown <= 0) {
++				u.cooldown = 1.0f + frand();
++				auto p = new Projectile;
++				p.pos = u.pos;
++				auto d = V2(u.target.pos.x - u.pos.x, u.target.pos.y - u.pos.y);
++				p.vel = V2(d.x * 2, d.y * 2);
++				p.target = u.target;
++				p.life = 0.5f;
++				p.dmg = 8 + rnd() % 8;
++				u.fired = p;
++			} else if (u.pathIdx < u.path.length) {
++				auto w = u.path[$ - 1 - u.pathIdx];
++				auto d = V2(w.x - u.pos.x, w.y - u.pos.y);
++				auto l = sqrt(d.x * d.x + d.y * d.y);
++				if (l < 0.3f) u.pathIdx++;
++				else { u.pos.x += d.x / l * 0.1f; u.pos.y += d.y / l * 0.1f; }
++			}
++		}
++
++		// paths: up to 10 requests a frame (600/s, time-sliced as RTS engines do), searched on the job pool
++		Unit[] req = units.filter!(u => u.wantsPath).take(10).array;
++		foreach (u; pool.parallel(req, 1)) {
++			auto o = u.orders[$ - 1];
++			u.path = astar(walk, u.pos, o.target);
++			u.pathIdx = 0;
++			u.wantsPath = false;
++		}
++		paths += req.length;
++
++		// projectiles
++		foreach (u; units) if (u.fired !is null) { shots ~= u.fired; u.fired = null; }
++		foreach (p; shots) {
++			p.pos.x += p.vel.x / 60;
++			p.pos.y += p.vel.y / 60;
++			p.life -= 1.0f / 60;
++			if (p.life <= 0 && p.target.hp > 0) {
++				p.target.hp -= p.dmg;
++				if (p.target.hp <= 0) {
++					kills++;
++					log ~= format("%s destroyed at (%.0f, %.0f)", p.target.name, p.target.pos.x, p.target.pos.y);
++					if (log.length > 200) log = log[$ - 200 .. $];
++				}
++			}
++		}
++		shots = shots.filter!(p => p.life > 0).array;
++
++		// the dead are replaced by reinforcements
++		foreach (ref u; units) if (u.hp <= 0) u = spawn(u.team);
++
++		// AI commander: new orders for a tenth of an army twice a second
++		if (f % 30 == 0) {
++			foreach (u; units) if (u.team == (f / 30) % 2 && rnd() % 10 == 0) {
++				auto o = new Order;
++				o.kind = 1;
++				o.target = V2(frand() * (G - 1), frand() * (G - 1));
++				u.orders ~= o;
++				if (u.orders.length > 8) u.orders = u.orders[$ - 8 .. $];
++				u.wantsPath = true;
++			}
++		}
++
++		// selection UI
++		auto sel = units.filter!(u => u.team == 0 && u.pos.x < 80).take(60).array;
++		string panel;
++		foreach (u; sel.take(12)) panel ~= format("%s hp %.0f\n", u.name, u.hp);
++		hud = format("kills %d paths %d shots %d selected %d", kills, paths, shots.length, sel.length) ~ "\n" ~ panel;
++	}
++	string hud;
++}
++
++// ---------------------------------------------------------------- open world
++enum W = 64;
++enum cellSize = 200.0f;
++
++class Component { int kind; float[4] params; Prop owner; }
++class Prop { V2 pos; float[16] xf; string model; Component[] comps; }
++class Npc { V2 pos, goal; int state; float timer = 0; Npc[] near; string name; V2[] route; }
++class Car { V2 pos, vel; V2[] route; size_t idx; Npc driver; }
++class Cell {
++	int cx, cy;
++	ubyte[] mesh;
++	float[] collision;
++	Prop[] props;
++	Npc[] npcs;
++	string[string] meta;
++}
++
++__gshared Mutex streamLock;
++__gshared ulong[] streamWant;
++__gshared Cell[] streamReady;
++shared bool streamStop;
++
++Cell buildCell(int cx, int cy) {
++	auto c = new Cell;
++	c.cx = cx; c.cy = cy;
++	c.mesh = new ubyte[]((1 + rnd() % 3) * 1024 * 1024);
++	c.mesh[0] = 1;
++	c.collision = new float[](64 * 1024);
++	c.collision[0] = 1;
++	foreach (i; 0 .. 400) {
++		auto p = new Prop;
++		p.pos = V2(cx * cellSize + frand() * cellSize, cy * cellSize + frand() * cellSize);
++		p.model = "props/" ~ (rnd() % 300).to!string ~ ".mdl";
++		foreach (k; 0 .. 1 + rnd() % 3) { auto co = new Component; co.kind = k; co.owner = p; p.comps ~= co; }
++		c.props ~= p;
++	}
++	foreach (i; 0 .. 15) {
++		auto n = new Npc;
++		n.pos = V2(cx * cellSize + frand() * cellSize, cy * cellSize + frand() * cellSize);
++		n.goal = n.pos;
++		n.name = format("ped-%d-%d-%d", cx, cy, i);
++		c.npcs ~= n;
++	}
++	c.meta["district"] = format("district-%d", (cx / 8) * 8 + cy / 8);
++	c.meta["weather"] = (rnd() & 1) ? "clear" : "rain";
++	return c;
++}
++
++void streamThread() {
++	rngState = 777;
++	while (!atomicLoad(streamStop)) {
++		ulong key = ulong.max;
++		synchronized (streamLock) if (streamWant.length) { key = streamWant[0]; streamWant = streamWant[1 .. $]; }
++		if (key == ulong.max) { Thread.sleep(2.msecs); continue; }
++		auto c = buildCell(cast(int) (key >> 32), cast(int) (key & 0xFFFF_FFFF));
++		synchronized (streamLock) streamReady ~= c;
++	}
++}
++
++struct OpenWorld {
++	Cell[ulong] world;
++	bool[ulong] requested;
++	Car[] cars;
++	V2 player;
++	string[string] mission;
++	string hud;
++	size_t loaded, dropped;
++
++	static ulong key(int x, int y) { return (cast(ulong) x << 32) | cast(uint) y; }
++
++	void init() {
++		streamLock = new Mutex;
++		player = V2(8 * cellSize, 8 * cellSize);
++		foreach (y; 5 .. 12) foreach (x; 5 .. 12) world[key(x, y)] = buildCell(x, y);
++		foreach (i; 0 .. 250) {
++			auto c = new Car;
++			c.pos = V2(player.x + (frand() - 0.5f) * 1200, player.y + (frand() - 0.5f) * 1200);
++			cars ~= c;
++		}
++		mission["stage"] = "1";
++	}
++
++	void frame(size_t f) {
++		// drive: 30 m/s along a slow curve
++		player.x += 0.5f;
++		player.y += 0.25f + 0.25f * ((f / 600) % 2);
++		int pcx = cast(int) (player.x / cellSize), pcy = cast(int) (player.y / cellSize);
++
++		// stream: request the 7x7 window around the player, drop what is beyond 4 cells
++		foreach (y; pcy - 3 .. pcy + 4) foreach (x; pcx - 3 .. pcx + 4) {
++			auto k = key(x % W, y % W);
++			if (k !in world && k !in requested) { requested[k] = true; synchronized (streamLock) streamWant ~= k; }
++		}
++		Cell[] ready;
++		synchronized (streamLock) { ready = streamReady; streamReady = null; }
++		foreach (c; ready) { world[key(c.cx, c.cy)] = c; requested.remove(key(c.cx, c.cy)); loaded++; }
++		ulong[] far;
++		foreach (k, c; world) if (abs(c.cx - pcx % W) > 4 || abs(c.cy - pcy % W) > 4) far ~= k;
++		foreach (k; far) { world.remove(k); dropped++; }
++
++		// NPCs of the loaded cells
++		Npc[] active;
++		foreach (c; world) active ~= c.npcs;
++		Npc[][uint] buckets;
++		foreach (n; active) buckets[(cast(uint) (n.pos.y / 20) & 0xFFF) << 12 | (cast(uint) (n.pos.x / 20) & 0xFFF)] ~= n;
++		foreach (n; pool.parallel(active, 32)) {
++			rngState = cast(uint) (cast(size_t) cast(void*) n + f);
++			n.timer -= 1.0f / 60;
++			if (n.timer <= 0) {
++				n.timer = 2 + frand() * 4;
++				n.goal = V2(n.pos.x + (frand() - 0.5f) * 60, n.pos.y + (frand() - 0.5f) * 60);
++				V2[] r;
++				foreach (k; 0 .. 8 + rnd() % 8) r ~= V2(n.pos.x + (n.goal.x - n.pos.x) * k / 16, n.pos.y + (n.goal.y - n.pos.y) * k / 16);
++				n.route = r;
++				Npc[] near;
++				if (auto b = ((cast(uint) (n.pos.y / 20) & 0xFFF) << 12 | (cast(uint) (n.pos.x / 20) & 0xFFF)) in buckets)
++					foreach (o; *b) if (o !is n) near ~= o;
++				n.near = near;
++				n.state = near.length > 3 ? 2 : 1;
++			}
++			n.pos.x += (n.goal.x - n.pos.x) * 0.01f;
++			n.pos.y += (n.goal.y - n.pos.y) * 0.01f;
++		}
++
++		// traffic around the player
++		foreach (c; pool.parallel(cars, 16)) {
++			if (c.idx >= c.route.length) {
++				V2[] r;
++				foreach (k; 0 .. 20) r ~= V2(player.x + (frand() - 0.5f) * 1200, player.y + (frand() - 0.5f) * 1200);
++				c.route = r;
++				c.idx = 0;
++			}
++			auto w = c.route[c.idx];
++			c.pos.x += (w.x - c.pos.x) * 0.02f;
++			c.pos.y += (w.y - c.pos.y) * 0.02f;
++			if (dist2(c.pos, w) < 25) c.idx++;
++		}
++
++		// physics contacts of the props near the player (rebuilt per frame)
++		static struct Contact { Prop a; Car b; V2 n; }
++		Contact[] contacts;
++		if (auto c = key(pcx % W, pcy % W) in world)
++			foreach (p; (*c).props) foreach (car; cars[0 .. 40])
++				if (dist2(p.pos, car.pos) < 400) contacts ~= Contact(p, car, V2(p.pos.x - car.pos.x, p.pos.y - car.pos.y));
++
++		// mission script and HUD
++		if (f % 120 == 0) {
++			mission["stage"] = (mission["stage"].to!int + 1).to!string;
++			mission["objective"] = format("reach (%.0f, %.0f)", player.x + 500, player.y + 300);
++		}
++		V2[] blips;
++		foreach (n; active.take(200)) blips ~= n.pos;
++		hud = format("speed %.0f km/h  cells %d  npcs %d  contacts %d  blips %d  %s",
++			108.0, world.length, active.length, contacts.length, blips.length, mission["objective"]);
++	}
++}
++int abs(int x) { return x < 0 ? -x : x; }
++
++// ---------------------------------------------------------------- city
++__gshared int R = 200;   // road grid side; grows with the population
++
++class RoadNode { int id; V2 pos; RoadNode[] edges; }
++class Building { int id, kind; V2 pos; RoadNode access; float[6] stock; Citizen[] occupants; string name; }
++class Citizen {
++	int id, state;
++	Building home, work;
++	RoadNode[] route;
++	size_t routeIdx;
++	float[8] needs;
++	string name;
++}
++
++struct City {
++	RoadNode[] roads;
++	Building[] buildings;
++	Citizen[] citizens;
++	double[string] districtIncome;
++	float[] history;
++	string[] panels;
++	string hud;
++	int nextId;
++	size_t trips;
++
++	Citizen born() {
++		auto c = new Citizen;
++		c.id = nextId++;
++		c.home = buildings[rnd() % buildings.length];
++		c.work = buildings[rnd() % buildings.length];
++		c.needs[] = 0.5f;
++		c.name = "citizen-" ~ c.id.to!string;
++		c.home.occupants ~= c;
++		return c;
++	}
++
++	size_t population = 100_000;
++
++	void init() {
++		// 100k citizens: a 200x200 road grid and 15,000 buildings; scaled with the population
++		R = max(200, cast(int) sqrt(population * 0.4));
++		roads = new RoadNode[](R * R);
++		foreach (i, ref n; roads) { n = new RoadNode; n.id = cast(int) i; n.pos = V2(i % R, i / R); }
++		foreach (i, n; roads) {
++			int x = cast(int) (i % R), y = cast(int) (i / R);
++			if (x + 1 < R) { n.edges ~= roads[i + 1]; roads[i + 1].edges ~= n; }
++			if (y + 1 < R) { n.edges ~= roads[i + R]; roads[i + R].edges ~= n; }
++		}
++		foreach (int i; 0 .. cast(int) (population * 15 / 100)) {
++			auto b = new Building;
++			b.id = i;
++			b.kind = i % 4;
++			b.access = roads[rnd() % roads.length];
++			b.pos = b.access.pos;
++			b.name = format("%s #%d", ["House", "Shop", "Factory", "Office"][i % 4], i);
++			buildings ~= b;
++		}
++		foreach (i; 0 .. population) citizens ~= born();
++	}
++
++	static RoadNode[] route(RoadNode from, RoadNode to) {
++		RoadNode[RoadNode] came;
++		RoadNode[] frontier = [from];
++		came[from] = null;
++		size_t expanded;
++		while (frontier.length && expanded < 600) {
++			RoadNode[] next;
++			foreach (n; frontier) {
++				if (n is to) { frontier = null; break; }
++				expanded++;
++				foreach (e; n.edges) if (e !in came) { came[e] = n; next ~= e; }
++			}
++			if (frontier is null) break;
++			// greedy towards the goal: keep the closest half
++			next.sort!((a, b) => dist2(a.pos, to.pos) < dist2(b.pos, to.pos));
++			frontier = next[0 .. min(next.length, 24)];
++		}
++		RoadNode[] path;
++		auto c = to in came ? to : from;
++		while (c !is null && c !is from) { path ~= c; c = came[c]; }
++		return path;
++	}
++
++	void frame(size_t f) {
++		// a thirtieth of the citizens per frame
++		immutable slice = citizens.length / 30;
++		auto part = citizens[(f % 30) * slice .. (f % 30 + 1) * slice];
++		foreach (c; pool.parallel(part, 64)) {
++			rngState = cast(uint) (c.id * 2654435761 + f);
++			foreach (ref n; c.needs) n = max(0.0f, n - 0.01f);
++			if (c.routeIdx < c.route.length) { c.routeIdx++; continue; }
++			if (rnd() % 200 == 0) {   // about 1,000 trips started per second
++				auto dest = c.state == 0 ? c.work : c.home;
++				c.route = route(c.state == 0 ? c.home.access : c.work.access, dest.access);
++				c.routeIdx = 0;
++				c.state ^= 1;
++			}
++		}
++		trips += part.length / 200;
++
++		// economy every 10 frames
++		if (f % 10 == 0) {
++			double[int] income;
++			foreach (b; buildings) {
++				b.stock[b.kind] += 0.1f * b.occupants.length;
++				income[cast(int) (b.pos.x / 25) * 8 + cast(int) (b.pos.y / 25)] += b.stock[b.kind];
++			}
++			double[string] named;
++			foreach (k, v; income) named[format("district-%d", k)] = v;
++			districtIncome = named;
++			history ~= cast(float) income.length;
++			if (history.length > 300) history = history[$ - 300 .. $].dup;
++		}
++
++		// traffic load per road node: rebuilt every frame from the moving citizens
++		int[int] load;
++		foreach (c; part) if (c.routeIdx < c.route.length) load[c.route[c.routeIdx].id]++;
++
++		// births and deaths
++		foreach (k; 0 .. 5) {
++			auto i = rnd() % citizens.length;
++			auto old = citizens[i];
++			old.home.occupants = old.home.occupants.filter!(o => o !is old).array;
++			citizens[i] = born();
++		}
++
++		// info panels for what the mouse hovers, and the chart
++		panels = null;
++		foreach (k; 0 .. 20) {
++			auto b = buildings[(f * 7 + k * 131) % buildings.length];
++			panels ~= format("%s: %d people, stock %.1f", b.name, b.occupants.length, b.stock[b.kind]);
++		}
++		auto chart = history.dup;
++		hud = format("population %d  trips %d  congested %d  districts %d  chart %d",
++			citizens.length, trips, load.length, districtIncome.length, chart.length);
++	}
++}
++
++// ---------------------------------------------------------------- main
++// symgc reports the time threads lose to memory management (ns: alloc slow paths,
++// collection start/assist, stopped by the collector); read around every frame.
++// Build with -d-version=Symgc_gctime for our symgc: upstream symgc does not have the counters.
++version(Symgc_gctime) {
++	extern(C) void __sd_gc_time_thread(ulong* dst);
++	extern(C) void __sd_gc_time_total(ulong* dst);
++	version(Symgc_lock_hist) {
++		extern(C) void __sd_gc_lock_hist(ulong* count, ulong* time);
++		extern(C) void __sd_gc_holder_hist(ulong* count, ulong* time);
++		extern(C) void __sd_gc_seg_hist(ulong* count, ulong* time);
++	}
++	enum haveGcTime = true;
++} else {
++	enum haveGcTime = false;
++}
++
++struct GcClock {
++	// alloc, collect, pause, bin lock, fresh slab, filler lock
++	enum kinds = 6;
++	ulong[kinds] thread, total;
++	void read() {
++		static if (haveGcTime) {
++			__sd_gc_time_thread(thread.ptr);
++			__sd_gc_time_total(total.ptr);
++		}
++	}
++}
++
++extern(C) int cmpLong(const void* a, const void* b) {
++	auto x = *cast(const long*) a, y = *cast(const long*) b;
++	return x < y ? -1 : (x > y);
++}
++
++void main(string[] args) {
++	auto mode = args.length > 1 ? args[1] : "rts";
++	auto seconds = args.length > 2 ? args[2].to!int : 60;
++	auto assetMiB = args.length > 3 ? args[3].to!size_t : 2048;
++	auto jobs = args.length > 4 ? args[4].to!uint : 6;
++	auto nogc = args.length > 5 ? args[5].to!int : 0;
++	auto population = args.length > 6 ? args[6].to!size_t : 100_000;   // city only
++
++	pool = new TaskPool(jobs);
++	pool.isDaemon = true;
++
++	loadAssets(assetMiB);
++	Rts rts;
++	OpenWorld ow;
++	City city;
++	Thread streamer;
++	final switch (mode) {
++		case "rts": rts.init(); break;
++		case "openworld": ow.init(); streamer = new Thread(&streamThread); streamer.start(); break;
++		case "city": city.population = population; city.init(); break;
++	}
++
++	if (nogc) GC.disable();
++	immutable used0 = GC.stats().usedSize;
++	immutable total = seconds * 60;
++	auto ft = new long[](total);
++	auto gcMain = new long[](total);   // us the main thread lost to memory management
++	auto gcAll = new long[](total);    // us all threads lost, summed (job threads run in parallel)
++	ulong[GcClock.kinds] kindMain, kindAll;   // ns per kind over the run
++	string hud;
++	foreach (f; 0 .. total) {
++		GcClock c0, c1;
++		c0.read();
++		immutable t0 = MonoTime.currTime;
++		final switch (mode) {
++			case "rts": rts.frame(f); hud = rts.hud; break;
++			case "openworld": ow.frame(f); hud = ow.hud; break;
++			case "city": city.frame(f); hud = city.hud; break;
++		}
++		ft[f] = (MonoTime.currTime - t0).total!"usecs";
++		c1.read();
++		ulong m = 0, a = 0;
++		foreach (k; 0 .. GcClock.kinds) {
++			m += c1.thread[k] - c0.thread[k];
++			a += c1.total[k] - c0.total[k];
++			kindMain[k] += c1.thread[k] - c0.thread[k];
++			kindAll[k] += c1.total[k] - c0.total[k];
++		}
++		gcMain[f] = m / 1000;
++		gcAll[f] = a / 1000;
++		long spent = ft[f];
++		while (spent < frameUs && spent >= 0) {
++			Thread.sleep(dur!"usecs"(frameUs - spent < 500 ? frameUs - spent : 500));
++			spent = (MonoTime.currTime - t0).total!"usecs";
++		}
++	}
++	immutable used1 = GC.stats().usedSize;
++	if (streamer !is null) { atomicStore(streamStop, true); streamer.join(); }
++
++	auto sorted = ft.dup;
++	qsort(sorted.ptr, sorted.length, long.sizeof, &cmpLong);
++	long over(long us) { long n = 0; foreach (v; ft) if (v > us) n++; return n; }
++	auto line = hud.length > 90 ? hud[0 .. 90] : hud;
++	printf("aaa_sim %.*s: %d s, assets %lu MiB, jobs %u, nogc %d | %.*s\n", cast(int) mode.length, mode.ptr,
++		seconds, cast(ulong) assetMiB, jobs, nogc, cast(int) line.length, line.ptr);
++	if (nogc)
++		printf("allocated_MiB_per_s=%.1f (heap growth with the collector off)\n",
++			(cast(double) used1 - used0) / (1024.0 * 1024) / seconds);
++	printf("frame_p50_us=%lld p99=%lld p999=%lld max=%lld over1ms=%lld over2ms=%lld over5ms=%lld over16ms=%lld frames=%lld\n",
++		sorted[total / 2], sorted[total * 99 / 100], sorted[total * 999 / 1000], sorted[$ - 1],
++		over(1000), over(2000), over(5000), over(16000), cast(long) total);
++	static if (haveGcTime) {
++		// The collector's share of each frame, and the game's own time without it.
++		auto own = new long[](total);
++		foreach (i; 0 .. total) own[i] = ft[i] - gcMain[i];
++		void dist(string name, long[] v) {
++			auto s = v.dup;
++			qsort(s.ptr, s.length, long.sizeof, &cmpLong);
++			printf("%-28s p50=%lld p99=%lld p999=%lld max=%lld (us)\n", name.ptr,
++				s[total / 2], s[total * 99 / 100], s[total * 999 / 1000], s[$ - 1]);
++		}
++		dist("gc_main (main thread)", gcMain);
++		dist("gc_all (all threads, sum)", gcAll);
++		dist("frame minus gc_main", own);
++		static immutable kindNames = ["alloc", "collect", "pause", "binlock", "freshslab", "fillerlock"];
++		foreach (who, arr; [kindMain, kindAll]) {
++			printf("gc time over the run, ms, %s:", who == 0 ? "main".ptr : "all ".ptr);
++			foreach (k; 0 .. GcClock.kinds) printf(" %s=%.1f", kindNames[k].ptr, arr[k] / 1e6);
++			printf("\n");
++		}
++		// the ten slowest frames, split
++		auto idx = new size_t[](total);
++		foreach (i; 0 .. total) idx[i] = i;
++		import std.algorithm : sort;
++		idx.sort!((x, y) => ft[x] > ft[y]);
++		printf("slowest frames (frame us / gc_main us / gc_all us):");
++		foreach (i; idx[0 .. 10]) printf(" %lld/%lld/%lld", ft[i], gcMain[i], gcAll[i]);
++		printf("\n");
++
++		// A build with -d-version=Symgc_lock_hist counts every wait of each
++		// kind by power of two of 100 ns: how many there were, and their time.
++		version(Symgc_lock_hist) {
++			ulong[24 * GcClock.kinds] hc, ht;
++			__sd_gc_lock_hist(hc.ptr, ht.ptr);
++			foreach (k; 0 .. GcClock.kinds) {
++				ulong n, t;
++				foreach (b; 0 .. 24) { n += hc[k * 24 + b]; t += ht[k * 24 + b]; }
++				printf("waits %s: %llu, %.1f ms; by 2^b x 100ns (count/ms):", kindNames[k].ptr, n, t / 1e6);
++				foreach (b; 0 .. 24)
++					if (hc[k * 24 + b]) printf(" %d:%llu/%.1f", b, hc[k * 24 + b], ht[k * 24 + b] / 1e6);
++				printf("\n");
++			}
++
++			// How long an allocation holds the page filler's lock, by part.
++			{
++				ulong[24 * 8] sc, st;
++				__sd_gc_seg_hist(sc.ptr, st.ptr);
++				static immutable segNames = ["whole", "extent", "block", "newblock", "reserve"];
++				foreach (s; 0 .. 5) {
++					ulong n, t, longN, longT;
++					foreach (b; 0 .. 24) {
++						n += sc[s * 24 + b]; t += st[s * 24 + b];
++						if (b >= 10) { longN += sc[s * 24 + b]; longT += st[s * 24 + b]; }
++					}
++					printf("filler hold %-8s: %llu, %.1f ms; >=100us: %llu, %.1f ms;", segNames[s].ptr, n, t / 1e6, longN, longT / 1e6);
++					foreach (b; 8 .. 24)
++						if (sc[s * 24 + b]) printf(" %d:%llu", b, sc[s * 24 + b]);
++					printf("\n");
++				}
++			}
++
++			// The page filler's lock waits by who held the lock before.
++			ulong[24 * 8] oc, ot;
++			__sd_gc_holder_hist(oc.ptr, ot.ptr);
++			static immutable holderNames = ["other", "alloc", "free", "prepare", "finalize", "sweep", "assist", "-"];
++			foreach (h; 0 .. 7) {
++				ulong n, t, longN, longT;
++				foreach (b; 0 .. 24) {
++					n += oc[h * 24 + b]; t += ot[h * 24 + b];
++					if (b >= 10) { longN += oc[h * 24 + b]; longT += ot[h * 24 + b]; }
++				}
++				printf("filler waits after %-8s: %llu, %.1f ms; of those >=100us: %llu, %.1f ms\n",
++					holderNames[h].ptr, n, t / 1e6, longN, longT / 1e6);
++			}
++		}
++	}
++	{
++		import std.file : readText;
++		import std.string : splitLines, startsWith, strip;
++		string rss, hwm;
++		foreach (l; readText("/proc/self/status").splitLines) {
++			if (l.startsWith("VmRSS:")) rss = l[6 .. $].strip;
++			if (l.startsWith("VmHWM:")) hwm = l[6 .. $].strip;
++		}
++		printf("rss=%.*s peak_rss=%.*s\n", cast(int) rss.length, rss.ptr, cast(int) hwm.length, hwm.ptr);
++	}
++}
+diff --git a/bench/build.sh b/bench/build.sh
+new file mode 100755
+index 0000000..961728c
+--- /dev/null
++++ b/bench/build.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++# Build one benchmark with the collector compiled in (no card barrier: the concurrent mark uses the kernel
++# tracker on Linux 6.7+; see ../guide/usage.md for the card barrier builds).
++#
++#   bench/build.sh PROGRAM.d [OUT]
++#
++#   DC=dmd|ldc2   compiler (default dmd)
++#   SYMGC=DIR     the collector's source directory (default ../source)
++#   EXTRA="..."   extra compiler flags
++#
++# The same binary runs with druntime's GC (no option) and with oneday (--DRT-gcopt=gc:sdcq): see compare.sh.
++set -eu
++HERE=$(cd "$(dirname "$0")" && pwd)
++DC=${DC:-dmd}
++SYMGC=${SYMGC:-$HERE/../source}
++prog=$1
++out=${2:-${prog%.d}}
++[ -f "$prog" ] || prog=$HERE/$prog
++
++extra_files=()
++[ "$(basename "$prog")" = gcb.d ] && extra_files+=("$HERE/perfcount.d")
++ext=${prog%.d}_ext.d
++[ -f "$ext" ] && extra_files+=("$ext")
++
++case $(basename "$DC") in
++	ldc2|ldmd2*)
++		$DC -O3 -release -d-version=Symgc_druntime_hooks -d-version=SymGC -I"$SYMGC" -I"$HERE" ${EXTRA:-} \
++			-of="$out" "$prog" "${extra_files[@]}" $(find "$SYMGC" -name '*.d') ;;
++	gdc*)
++		$DC -O2 -frelease -fversion=Symgc_druntime_hooks -fversion=SymGC -I"$SYMGC" -I"$HERE" ${EXTRA:-} \
++			-o "$out" "$prog" "${extra_files[@]}" $(find "$SYMGC" -name '*.d') ;;
++	*)
++		$DC -O -release -inline -version=Symgc_druntime_hooks -version=SymGC -I"$SYMGC" -I"$HERE" ${EXTRA:-} \
++			-of="$out" "$prog" "${extra_files[@]}" $(find "$SYMGC" -name '*.d') ;;
++esac
++rm -f "$out.o"
++echo "built $out"
+diff --git a/bench/bullet_hell.d b/bench/bullet_hell.d
+new file mode 100644
+index 0000000..35043fc
+--- /dev/null
++++ b/bench/bullet_hell.d
+@@ -0,0 +1,166 @@
++// A bullet-hell game written the way a game programmer would write it with a
++// GC and no care for memory: `new` everywhere, no pools, no reuse, no
++// GC.collect, garbage every frame (classes, closures, arrays rebuilt with
++// filter/array, strings formatted for the HUD). It runs headless (no window:
++// nothing to download) with a deterministic "player" and measures the cost of
++// every frame, paced at 60 fps like a real game.
++//
++//   bullet_hell [seconds=60] [levelMiB=512] [bulletsPerSecond=20000]
++//
++// levelMiB is the live data a real game keeps around (map, entities, assets).
++import core.stdc.stdio : printf, fprintf, stderr;
++import core.stdc.stdlib : qsort;
++import core.thread : Thread;
++import core.time;
++import std.algorithm : filter, remove;
++import std.array : array, appender;
++import std.format : format;
++import std.conv : to;
++
++struct Vec { float x = 0, y = 0; }
++
++class Bullet {
++	Vec pos, vel;
++	int owner;
++	float life;
++	void delegate(Bullet) onExpire; // a closure per bullet, as people write it
++	this(Vec p, Vec v, int o, float l, void delegate(Bullet) cb) {
++		pos = p; vel = v; owner = o; life = l; onExpire = cb;
++	}
++}
++
++class Particle {
++	Vec pos, vel;
++	float life;
++	string tag;
++	this(Vec p, Vec v, float l, string t) { pos = p; vel = v; life = l; tag = t; }
++}
++
++class Enemy {
++	Vec pos;
++	int id, hp = 50;
++	float cooldown = 0;
++	string name;
++	this(int i, Vec p) { id = i; pos = p; name = "enemy-" ~ i.to!string; }
++}
++
++class Tile { // the level: lots of small linked objects, like a real map
++	Tile[] neighbours;
++	ubyte[] pixels;
++	string name;
++}
++
++__gshared Tile[] level;
++__gshared uint rngState = 12345;
++uint rnd() { rngState = rngState * 1664525 + 1013904223; return rngState >> 8; }
++float frand() { return (rnd() & 0xFFFF) / 65536.0f; }
++
++extern(C) int cmpLong(const void* a, const void* b) {
++	auto x = *cast(const long*) a, y = *cast(const long*) b;
++	return x < y ? -1 : (x > y);
++}
++
++void main(string[] args) {
++	auto seconds = args.length > 1 ? args[1].to!int : 60;
++	auto levelMiB = args.length > 2 ? args[2].to!size_t : 512;
++	auto perSecond = args.length > 3 ? args[3].to!int : 20000;
++
++	// Build the level.
++	enum tileBytes = 4096;
++	level = new Tile[](levelMiB * 1024 * 1024 / (tileBytes + 128));
++	foreach (i, ref t; level) {
++		t = new Tile;
++		t.pixels = new ubyte[](tileBytes);
++		t.name = "tile-" ~ i.to!string;
++		if (i) t.neighbours = [level[i - 1]];
++	}
++
++	Bullet[] bullets;
++	Particle[] particles;
++	Enemy[] enemies;
++	foreach (i; 0 .. 24)
++		enemies ~= new Enemy(i, Vec(40.0f + i * 30, 30));
++
++	enum frames60 = 60;
++	immutable total = seconds * frames60;
++	auto ft = new long[](total);
++	int score = 0, hits = 0;
++	size_t peakBullets = 0;
++	string hud;
++	immutable perFrame = perSecond / frames60;
++
++	foreach (f; 0 .. total) {
++		immutable t0 = MonoTime.currTime;
++
++		// Enemies fire patterns: a fresh Bullet and a fresh closure per shot.
++		foreach (e; enemies) {
++			e.cooldown -= 1.0f / 60;
++			if (e.cooldown > 0) continue;
++			e.cooldown = 0.05f;
++			foreach (k; 0 .. perFrame / cast(int) enemies.length + 1) {
++				auto ang = frand() * 6.2831853f;
++				auto id = e.id;
++				bullets ~= new Bullet(e.pos, Vec(cast(float) (200 * (frand() - 0.5f)), 60 + 120 * frand()),
++					id, 2.0f + frand() * 3, (Bullet b) { score += id & 1; });
++			}
++		}
++
++		// Move everything, then rebuild the lists the way people do.
++		foreach (b; bullets) {
++			b.pos.x += b.vel.x / 60;
++			b.pos.y += b.vel.y / 60;
++			b.life -= 1.0f / 60;
++		}
++		auto alive = bullets.filter!(b => b.life > 0 && b.pos.y < 600).array;
++		foreach (b; bullets)
++			if (b.life <= 0) b.onExpire(b);
++		bullets = alive;
++		if (bullets.length > peakBullets) peakBullets = bullets.length;
++
++		// "Collision" with a player in the middle: a spark when near it.
++		foreach (b; bullets) {
++			immutable dx = b.pos.x - 320, dy = b.pos.y - 500;
++			if (dx * dx + dy * dy < 400) {
++				hits++;
++				b.life = 0;
++				foreach (k; 0 .. 6)
++					particles ~= new Particle(b.pos, Vec(frand() * 80 - 40, frand() * 80 - 40), 0.5f, "spark" ~ k.to!string);
++			}
++		}
++		foreach (p; particles) {
++			p.pos.x += p.vel.x / 60;
++			p.pos.y += p.vel.y / 60;
++			p.life -= 1.0f / 60;
++		}
++		particles = particles.filter!(p => p.life > 0).array;
++
++		// The level streams: replace a few tiles each frame.
++		foreach (k; 0 .. 8) {
++			auto i = rnd() % level.length;
++			auto t = new Tile;
++			t.pixels = new ubyte[](tileBytes);
++			t.name = "tile-" ~ i.to!string;
++			t.neighbours = [level[(i + 1) % level.length]];
++			level[i] = t;
++		}
++
++		// HUD text, rebuilt every frame.
++		hud = format("score %d  hits %d  bullets %d  particles %d  frame %d", score, hits, bullets.length, particles.length, f);
++
++		ft[f] = (MonoTime.currTime - t0).total!"usecs";
++		long spent = ft[f];
++		while (spent < 16_666 && spent >= 0) {
++			Thread.sleep(dur!"usecs"(16_666 - spent < 500 ? 16_666 - spent : 500));
++			spent = (MonoTime.currTime - t0).total!"usecs";
++		}
++	}
++
++	auto sorted = ft.dup;
++	qsort(sorted.ptr, sorted.length, long.sizeof, &cmpLong);
++	long over(long us) { long n = 0; foreach (v; ft) if (v > us) n++; return n; }
++	printf("bullet_hell: %d s, level %lu MiB, %d bullets/s, peak bullets %lu, last HUD: %.*s\n",
++		seconds, cast(ulong) levelMiB, perSecond, cast(ulong) peakBullets, cast(int) hud.length, hud.ptr);
++	printf("frame_p50_us=%lld p99=%lld p999=%lld max=%lld over1ms=%lld over2ms=%lld over5ms=%lld over16ms=%lld frames=%lld\n",
++		sorted[total / 2], sorted[total * 99 / 100], sorted[total * 999 / 1000], sorted[$ - 1],
++		over(1000), over(2000), over(5000), over(16000), cast(long) total);
++}
+diff --git a/bench/bullet_hell_stress.d b/bench/bullet_hell_stress.d
+new file mode 100644
+index 0000000..b8abfbc
+--- /dev/null
++++ b/bench/bullet_hell_stress.d
+@@ -0,0 +1,181 @@
++// A bullet-hell game written the way a game programmer would write it with a
++// GC and no care for memory: `new` everywhere, no pools, no reuse, no
++// GC.collect, garbage every frame (classes, closures, arrays rebuilt with
++// filter/array, strings formatted for the HUD). It runs headless (no window:
++// nothing to download) with a deterministic "player" and measures the cost of
++// every frame, paced at 60 fps like a real game.
++//
++//   bullet_hell_stress [seconds=60] [levelMiB=512] [bulletsPerSecond=20000] [lifeScale=1.0] [garbageBytes=0] [nogc=0]
++//
++// levelMiB is the live data a real game keeps around (map, entities, assets).
++// The stress variant turns the game's own cost down and the allocation churn up, so the
++// frame time is mostly the collector's:
++//   lifeScale     multiplies bullet lifetimes (0.05 = bullets live ~0.1-0.4 s: few live objects, much garbage);
++//   garbageBytes  extra short-lived array allocated per shot (a temporary buffer, a formatted string...);
++//   nogc=1        GC.disable() after the level is built: the same game with no collector in the frame loop
++//                 (only for short runs, the heap grows), the reference for "the game's own cost".
++import core.stdc.stdio : printf, fprintf, stderr;
++import core.stdc.stdlib : qsort;
++import core.thread : Thread;
++import core.time;
++import std.algorithm : filter, remove;
++import std.array : array, appender;
++import std.format : format;
++import std.conv : to;
++
++struct Vec { float x = 0, y = 0; }
++
++class Bullet {
++	Vec pos, vel;
++	int owner;
++	float life;
++	void delegate(Bullet) onExpire; // a closure per bullet, as people write it
++	this(Vec p, Vec v, int o, float l, void delegate(Bullet) cb) {
++		pos = p; vel = v; owner = o; life = l; onExpire = cb;
++	}
++}
++
++class Particle {
++	Vec pos, vel;
++	float life;
++	string tag;
++	this(Vec p, Vec v, float l, string t) { pos = p; vel = v; life = l; tag = t; }
++}
++
++class Enemy {
++	Vec pos;
++	int id, hp = 50;
++	float cooldown = 0;
++	string name;
++	this(int i, Vec p) { id = i; pos = p; name = "enemy-" ~ i.to!string; }
++}
++
++class Tile { // the level: lots of small linked objects, like a real map
++	Tile[] neighbours;
++	ubyte[] pixels;
++	string name;
++}
++
++__gshared Tile[] level;
++__gshared uint rngState = 12345;
++uint rnd() { rngState = rngState * 1664525 + 1013904223; return rngState >> 8; }
++float frand() { return (rnd() & 0xFFFF) / 65536.0f; }
++
++extern(C) int cmpLong(const void* a, const void* b) {
++	auto x = *cast(const long*) a, y = *cast(const long*) b;
++	return x < y ? -1 : (x > y);
++}
++
++void main(string[] args) {
++	auto seconds = args.length > 1 ? args[1].to!int : 60;
++	auto levelMiB = args.length > 2 ? args[2].to!size_t : 512;
++	auto perSecond = args.length > 3 ? args[3].to!int : 20000;
++	auto lifeScale = args.length > 4 ? args[4].to!float : 1.0f;
++	auto garbageBytes = args.length > 5 ? args[5].to!size_t : 0;
++	auto nogc = args.length > 6 ? args[6].to!int : 0;
++	size_t sink;
++
++	// Build the level.
++	enum tileBytes = 4096;
++	level = new Tile[](levelMiB * 1024 * 1024 / (tileBytes + 128));
++	foreach (i, ref t; level) {
++		t = new Tile;
++		t.pixels = new ubyte[](tileBytes);
++		t.name = "tile-" ~ i.to!string;
++		if (i) t.neighbours = [level[i - 1]];
++	}
++
++	import core.memory : GC;
++	if (nogc) GC.disable();
++
++	Bullet[] bullets;
++	Particle[] particles;
++	Enemy[] enemies;
++	foreach (i; 0 .. 24)
++		enemies ~= new Enemy(i, Vec(40.0f + i * 30, 30));
++
++	enum frames60 = 60;
++	immutable total = seconds * frames60;
++	auto ft = new long[](total);
++	int score = 0, hits = 0;
++	size_t peakBullets = 0;
++	string hud;
++	immutable perFrame = perSecond / frames60;
++
++	foreach (f; 0 .. total) {
++		immutable t0 = MonoTime.currTime;
++
++		// Enemies fire patterns: a fresh Bullet and a fresh closure per shot.
++		foreach (e; enemies) {
++			e.cooldown -= 1.0f / 60;
++			if (e.cooldown > 0) continue;
++			e.cooldown = 0.05f;
++			foreach (k; 0 .. perFrame / cast(int) enemies.length + 1) {
++				auto ang = frand() * 6.2831853f;
++				auto id = e.id;
++				bullets ~= new Bullet(e.pos, Vec(cast(float) (200 * (frand() - 0.5f)), 60 + 120 * frand()),
++					id, (2.0f + frand() * 3) * lifeScale, (Bullet b) { score += id & 1; });
++				if (garbageBytes) { auto tmp = new ubyte[](garbageBytes); tmp[0] = cast(ubyte) k; sink += tmp[0]; }
++			}
++		}
++
++		// Move everything, then rebuild the lists the way people do.
++		foreach (b; bullets) {
++			b.pos.x += b.vel.x / 60;
++			b.pos.y += b.vel.y / 60;
++			b.life -= 1.0f / 60;
++		}
++		auto alive = bullets.filter!(b => b.life > 0 && b.pos.y < 600).array;
++		foreach (b; bullets)
++			if (b.life <= 0) b.onExpire(b);
++		bullets = alive;
++		if (bullets.length > peakBullets) peakBullets = bullets.length;
++
++		// "Collision" with a player in the middle: a spark when near it.
++		foreach (b; bullets) {
++			immutable dx = b.pos.x - 320, dy = b.pos.y - 500;
++			if (dx * dx + dy * dy < 400) {
++				hits++;
++				b.life = 0;
++				foreach (k; 0 .. 6)
++					particles ~= new Particle(b.pos, Vec(frand() * 80 - 40, frand() * 80 - 40), 0.5f, "spark" ~ k.to!string);
++			}
++		}
++		foreach (p; particles) {
++			p.pos.x += p.vel.x / 60;
++			p.pos.y += p.vel.y / 60;
++			p.life -= 1.0f / 60;
++		}
++		particles = particles.filter!(p => p.life > 0).array;
++
++		// The level streams: replace a few tiles each frame.
++		foreach (k; 0 .. 8) {
++			auto i = rnd() % level.length;
++			auto t = new Tile;
++			t.pixels = new ubyte[](tileBytes);
++			t.name = "tile-" ~ i.to!string;
++			t.neighbours = [level[(i + 1) % level.length]];
++			level[i] = t;
++		}
++
++		// HUD text, rebuilt every frame.
++		hud = format("score %d  hits %d  bullets %d  particles %d  frame %d", score, hits, bullets.length, particles.length, f);
++
++		ft[f] = (MonoTime.currTime - t0).total!"usecs";
++		long spent = ft[f];
++		while (spent < 16_666 && spent >= 0) {
++			Thread.sleep(dur!"usecs"(16_666 - spent < 500 ? 16_666 - spent : 500));
++			spent = (MonoTime.currTime - t0).total!"usecs";
++		}
++	}
++
++	auto sorted = ft.dup;
++	qsort(sorted.ptr, sorted.length, long.sizeof, &cmpLong);
++	long over(long us) { long n = 0; foreach (v; ft) if (v > us) n++; return n; }
++	printf("bullet_hell_stress: %d s, level %lu MiB, %d bullets/s, life x%.2f, +%lu B/shot, nogc %d, peak bullets %lu, last HUD: %.*s (%lu)\n",
++		seconds, cast(ulong) levelMiB, perSecond, lifeScale, cast(ulong) garbageBytes, nogc, cast(ulong) peakBullets,
++		cast(int) hud.length, hud.ptr, cast(ulong) sink);
++	printf("frame_p50_us=%lld p99=%lld p999=%lld max=%lld over1ms=%lld over2ms=%lld over5ms=%lld over16ms=%lld frames=%lld\n",
++		sorted[total / 2], sorted[total * 99 / 100], sorted[total * 999 / 1000], sorted[$ - 1],
++		over(1000), over(2000), over(5000), over(16000), cast(long) total);
++}
+diff --git a/bench/cards_precision.d b/bench/cards_precision.d
+new file mode 100644
+index 0000000..32dcd42
+--- /dev/null
++++ b/bench/cards_precision.d
+@@ -0,0 +1,153 @@
++// How many cards does the barrier mark, compared to the memory the program
++// wrote? A barrier that marks cards that were not written makes a concurrent
++// collector rescan memory for nothing, and in a program that writes pointers
++// all the time the rescans never catch up with the writes.
++//
++// Each case clears the cards, performs stores that touch a known footprint, and
++// counts the marked cards. "exact" is the footprint in cards; "max" is the
++// number the barrier is allowed to mark (the footprint plus a little for the
++// objects around it).
++//
++// Build like mark_race.d (DMD with -preview=gcbarrier and the instrumented
++// libraries, or LDC with -gc-card-marking), run with --DRT-gcopt=gc:sdcq.
++import core.memory : GC;
++import core.stdc.stdio : printf;
++
++extern(C) extern __gshared size_t __sd_gc_card_lo;
++extern(C) extern __gshared size_t __sd_gc_card_n;
++extern(C) extern __gshared ubyte* __sd_gc_card_base;
++
++enum CardShift = 9;
++
++size_t marked(const(void)* start, size_t bytes)
++{
++    const first = (cast(size_t) start - __sd_gc_card_lo) >> CardShift;
++    const last = (cast(size_t) start + bytes - 1 - __sd_gc_card_lo) >> CardShift;
++    size_t n;
++    foreach (c; first .. last + 1)
++        n += __sd_gc_card_base[c];
++    return n;
++}
++
++void clear(const(void)* start, size_t bytes)
++{
++    const first = (cast(size_t) start - __sd_gc_card_lo) >> CardShift;
++    const last = (cast(size_t) start + bytes - 1 - __sd_gc_card_lo) >> CardShift;
++    foreach (c; first .. last + 1)
++        __sd_gc_card_base[c] = 0;
++}
++
++int failures;
++
++void report(const(char)* what, size_t got, size_t exact, size_t max)
++{
++    const ok = got >= exact && got <= max;
++    printf("%s %-44s marked %7zu  (footprint %zu, at most %zu)\n", (ok ? "ok  " : "FAIL").ptr, what, got, exact, max);
++    if (!ok) failures++;
++}
++
++final class Obj { Obj next; Obj other; ubyte[40] pad; }
++struct Rec { void* a; void* b; long c; }
++
++// the stores, each in a function of its own
++pragma(inline, false) void fillArray(void*[] a, void* p) { foreach (i; 0 .. a.length) a[i] = p; }
++pragma(inline, false) void fillFields(Obj[] os, Obj p) { foreach (o; os) o.next = p; }
++pragma(inline, false) void fillFieldsEvery(Obj[] os, Obj p, size_t step) { for (size_t i = 0; i < os.length; i += step) os[i].next = p; }
++pragma(inline, false) void fillStructs(Rec[] rs, void* p) { foreach (ref r; rs) r.a = p; }
++pragma(inline, false) void copyPtrs(void*[] d, void*[] s) { d[] = s[]; }
++final class Quad { Obj a, b, c, d; }
++pragma(inline, false) void fillQuads(Quad[] qs, Obj p) { foreach (q; qs) { q.a = p; q.b = p; q.c = p; q.d = p; } }
++pragma(inline, false) void sameCard(Obj o, Obj p) { foreach (i; 0 .. 100_000) o.next = p; }
++
++int main()
++{
++    GC.disable();
++
++    enum N = 100_000;
++    const bytesArray = N * (void*).sizeof;
++
++    // 1. a pointer array, every element
++    auto arr = new void*[N];
++    auto probe = new Obj;
++    clear(arr.ptr, bytesArray);
++    fillArray(arr, cast(void*) probe);
++    report("array of 100k pointers, every element", marked(arr.ptr, bytesArray), bytesArray / 512, bytesArray / 512 + 2);
++
++    // 2. one field of each of 100k objects (each object is 64 bytes: 8 per card)
++    auto objs = new Obj[N];
++    foreach (ref o; objs) o = new Obj;
++    const objBytes = Obj.classinfo.initializer.length;
++    // objects are allocated one after the other, so they are contiguous
++    auto lo = cast(void*) objs[0];
++    auto hi = cast(void*) objs[N - 1] + objBytes;
++    const span = cast(size_t) (hi - lo);
++    clear(lo, span);
++    fillFields(objs, probe);
++    // the footprint is the distinct cards that hold a `next` field (the
++    // allocator's size class decides how far apart the objects are)
++    size_t distinct, lastCard = size_t.max;
++    foreach (o; objs)
++    {
++        const c = (cast(size_t) cast(void*) o + Obj.next.offsetof - __sd_gc_card_lo) >> CardShift;
++        if (c != lastCard) { distinct++; lastCard = c; }
++    }
++    report("field of 100k objects, every object", marked(lo, span), distinct, distinct);
++
++    // 3. one object in 64: very few cards
++    clear(lo, span);
++    fillFieldsEvery(objs, probe, 64);
++    // 100k / 64 = 1562 objects, each in a card of its own or sharing one with up
++    // to 7 neighbours that are not written, so between 1562 / 8 cards and 1562.
++    report("field of every 64th object", marked(lo, span), N / 64 / 8, N / 64 + 4);
++
++    // 4. a struct array, one field
++    auto recs = new Rec[N];
++    const recBytes = N * Rec.sizeof;
++    clear(recs.ptr, recBytes);
++    fillStructs(recs, cast(void*) probe);
++    report("field a of 100k 24-byte structs", marked(recs.ptr, recBytes), recBytes / 512, recBytes / 512 + 2);
++
++    // 5. a pointer copy
++    auto dst = new void*[N];
++    clear(dst.ptr, bytesArray);
++    copyPtrs(dst, arr);
++    report("copy of 100k pointers", marked(dst.ptr, bytesArray), bytesArray / 512, bytesArray / 512 + 2);
++
++    // 6. the same field, 100k times: one card
++    auto one = new Obj;
++    clear(cast(void*) one, objBytes);
++    sameCard(one, probe);
++    report("the same field 100k times", marked(cast(void*) one, objBytes), 1, 2);
++
++    // 7. cards outside what was written must stay clear: the arrays above are
++    // clean beyond their ends, so check a quiet array that nothing wrote to
++    auto quiet = new void*[N];
++    clear(quiet.ptr, bytesArray);
++    fillArray(arr, cast(void*) probe);       // writes elsewhere
++    report("a neighbour nobody wrote to", marked(quiet.ptr, bytesArray), 0, 0);
++
++    // 8. four stores in a row to one object share a barrier (two cards: the
++    // lowest and the highest address): the cards must be exactly those of the fields
++    auto quads = new Quad[N];
++    foreach (ref q; quads) q = new Quad;
++    auto qlo = cast(void*) quads[0];
++    const qspan = cast(size_t) (cast(void*) quads[N - 1] + Quad.classinfo.initializer.length) - cast(size_t) qlo;
++    clear(qlo, qspan);
++    fillQuads(quads, probe);
++    const qmarked = marked(qlo, qspan);     // before the bookkeeping below allocates
++    size_t qdistinct;
++    bool[size_t] seen;
++    foreach (q; quads)
++        foreach (off; [Quad.a.offsetof, Quad.b.offsetof, Quad.c.offsetof, Quad.d.offsetof])
++        {
++            const c = (cast(size_t) cast(void*) q + off - __sd_gc_card_lo) >> CardShift;
++            if (c !in seen) { seen[c] = true; qdistinct++; }
++        }
++    report("four fields in a row of 100k objects", qmarked, qdistinct, qdistinct);
++
++    if (failures == 0)
++        printf("CARD PRECISION OK\n");
++    else
++        printf("CARD PRECISION: %d failures\n", failures);
++    return failures == 0 ? 0 : 1;
++}
+diff --git a/bench/cards_window.d b/bench/cards_window.d
+new file mode 100644
+index 0000000..0a9cf4f
+--- /dev/null
++++ b/bench/cards_window.d
+@@ -0,0 +1,195 @@
++// The card window: where the collector's memory is, and what the barrier does
++// outside it. Build with the card barrier (ldc2 -gc-card-marking
++// -d-version=Symgc_cards) against the fork's symgc, run with
++// --DRT-gcopt=gc:sdcq. See cards_window.sh.
++//
++//   cards_window [checksum]
++//
++// With `checksum` the whole card table is summed before and after the checks
++// that must not mark anything (that reads every page of it: use a small window,
++// SYMGC_HEAP_RESERVE_GIB=4).
++//
++// What it checks:
++//  * the window exists before main, is block aligned, and holds the memory
++//    that has pointers (small objects, a large one);
++//  * a store of a pointer into that memory marks its card, and only that one;
++//  * a store into malloc memory, and a copy of pointers to it, mark nothing;
++//  * a range outside the window marks nothing, whatever it looks like: low
++//    addresses, just below or above the window, and addresses with a tag in
++//    the top byte (what Android's allocator hands out);
++//  * a range that starts inside and ends past the window's end is cut there
++//    (a write past the table would fault).
++import core.memory : GC;
++import core.stdc.stdio : printf;
++import core.stdc.stdlib : malloc, free, getenv, atoi;
++import core.stdc.string : memcpy;
++
++// Declared, not defined: symgc defines them (LDC's barrier) or druntime does
++// (DMD's, -version=Symgc_druntime_cards).
++extern(C) extern __gshared size_t __sd_gc_card_lo;
++extern(C) extern __gshared size_t __sd_gc_card_n;
++extern(C) extern __gshared ubyte* __sd_gc_card_base;
++// The range function of the barrier in use: symgc's for LDC, druntime's for DMD.
++version(Symgc_druntime_cards) {
++	extern(C) void _d_gcBarrierRange(void* dst, size_t size);
++	alias __sd_gc_card_range = _d_gcBarrierRange;
++} else {
++	extern(C) void __sd_gc_card_range(void* dst, size_t size);
++}
++
++enum CardShift = 9;
++enum Block = size_t(2) << 20;
++
++final class Obj {
++	Obj next;
++	Obj other;
++	ubyte[200] pad;
++}
++
++int failures;
++
++void check(bool ok, const(char)* what) {
++	if (!ok) {
++		printf("FAIL: %s\n", what);
++		failures++;
++	}
++}
++
++size_t sumTable() {
++	size_t s = 0;
++	foreach (i; 0 .. __sd_gc_card_n) {
++		s += __sd_gc_card_base[i];
++	}
++	return s;
++}
++
++bool inWindow(const(void)* p) {
++	return cast(size_t) p - __sd_gc_card_lo < (__sd_gc_card_n << CardShift);
++}
++
++size_t cardOf(const(void)* p) {
++	return (cast(size_t) p - __sd_gc_card_lo) >> CardShift;
++}
++
++int main(string[] args) {
++	GC.disable();
++
++	immutable doSum = args.length > 1 && args[1] == "checksum";
++	immutable lo = __sd_gc_card_lo;
++	immutable n = __sd_gc_card_n;
++	immutable size = n << CardShift;
++
++	check(n != 0 && __sd_gc_card_base !is null, "the card table exists before main");
++	check(lo % Block == 0, "the window starts on a block boundary");
++	check(size >= (size_t(2) << 30), "the window holds at least 2 GiB");
++
++	if (auto want = getenv("SYMGC_HEAP_RESERVE_GIB")) {
++		auto gib = size_t(atoi(want));
++		check(size <= gib << 30, "the window is not larger than asked for");
++	}
++
++	printf("window: [%p, +%llu MiB), %llu cards, table %llu MiB\n",
++	       cast(void*) lo, cast(ulong) (size >> 20), cast(ulong) n, cast(ulong) (n >> 20));
++
++	// The memory with pointers is in the window.
++	auto a = new Obj;
++	auto b = new Obj;
++	auto big = cast(void**) GC.malloc(48 << 20);
++	auto src = new void*[256];
++	src[] = cast(void*) a;
++	auto m = cast(void**) malloc(8192);
++	check(inWindow(cast(void*) a) && inWindow(cast(void*) b), "small objects are in the window");
++	check(inWindow(big), "a large allocation with pointers is in the window");
++	check(!inWindow(m), "malloc memory is outside the window");
++
++	// Memory without pointers is allowed to be anywhere, and the barrier does
++	// not care: nothing to check there.
++
++	// Allocating marked cards too (the runtime copies the class initializer
++	// with the barrier). Start from clear ones around what is tested.
++	auto mid = big + (24 << 20) / (void*).sizeof;
++	foreach (o; [a, b]) {
++		auto p = cast(void*) o;
++		foreach (c; cardOf(p) .. cardOf(p + Obj.classinfo.initializer.length) + 1) {
++			__sd_gc_card_base[c] = 0;
++		}
++	}
++	__sd_gc_card_base[cardOf(mid)] = 0;
++	const sumStart = doSum ? sumTable() : 0;
++
++	// A store of a pointer into the window marks its card.
++	auto cardA = cardOf(&a.next);
++	a.next = b;
++	check(__sd_gc_card_base[cardA] == 1, "a pointer store marks its card");
++
++	// ... only that one (two fields of one object share it or its neighbour).
++	a.other = b;
++	if (doSum) {
++		auto marked = sumTable() - sumStart;
++		check(marked >= 1 && marked <= 2, "two stores to an object mark one or two cards");
++	}
++
++	// A store into the middle of the large allocation marks the card there.
++	auto cardMid = cardOf(mid);
++	*mid = cast(void*) a;
++	check(__sd_gc_card_base[cardMid] == 1, "a store into a large allocation marks its card");
++
++	// From here on nothing may be marked.
++	const before = doSum ? sumTable() : 0;
++
++	// Stores and copies into malloc memory.
++	*m = cast(void*) a;
++	m[1000] = cast(void*) b;
++	memcpy(m, src.ptr, 256 * (void*).sizeof);
++	m[0 .. 256] = src[];
++
++	// Ranges that must be ignored.
++	immutable tag = size_t(0xB4) << 56;
++	__sd_gc_card_range(cast(void*) 0x1000, 4096);
++	__sd_gc_card_range(m, 8192);
++	__sd_gc_card_range(cast(void*) (cast(size_t) m | tag), 8192);
++	__sd_gc_card_range(cast(void*) (lo | tag), 1 << 20);
++	__sd_gc_card_range(cast(void*) (lo - 4096), 4096);
++	__sd_gc_card_range(cast(void*) (lo + size), 4096);
++	__sd_gc_card_range(cast(void*) (lo + size + (1 << 20)), 1 << 20);
++	__sd_gc_card_range(cast(void*) size_t.max, 4096);
++
++	// A zero size marks nothing, even inside.
++	__sd_gc_card_range(cast(void*) lo, 0);
++
++	// A range that starts below the window and reaches into it is not an
++	// object's: it is ignored too.
++	__sd_gc_card_range(cast(void*) (lo - 4096), 8192);
++
++	if (doSum) {
++		check(sumTable() == before, "stores and ranges outside the window mark nothing");
++	}
++
++	// A range that starts in the last card and runs past the end is cut.
++	__sd_gc_card_range(cast(void*) (lo + size - 100), 1 << 20);
++	check(__sd_gc_card_base[n - 1] == 1, "a range running past the end marks the last card");
++
++	// A range inside marks exactly the cards it covers.
++	immutable start = cast(size_t) big + 1000;
++	auto first = cardOf(cast(void*) start);
++	auto last = cardOf(cast(void*) (start + 3000 - 1));
++	foreach (c; first .. last + 1) {
++		__sd_gc_card_base[c] = 0;
++	}
++	__sd_gc_card_range(cast(void*) start, 3000);
++	foreach (c; first .. last + 1) {
++		check(__sd_gc_card_base[c] == 1, "a range marks every card it covers");
++	}
++	check(__sd_gc_card_base[first - 1] == 0 && __sd_gc_card_base[last + 1] == 0,
++	      "a range marks no card it does not cover");
++
++	free(m);
++
++	if (failures == 0) {
++		printf("CARD WINDOW OK\n");
++		return 0;
++	}
++
++	printf("CARD WINDOW: %d failures\n", failures);
++	return 1;
++}
+diff --git a/bench/compare.sh b/bench/compare.sh
+new file mode 100755
+index 0000000..45cb4c4
+--- /dev/null
++++ b/bench/compare.sh
+@@ -0,0 +1,33 @@
++#!/bin/bash
++# Build a benchmark once and run it under three collectors, printing its statistics line and the peak memory.
++#
++#   bench/compare.sh PROGRAM.d [ARGS...]
++#
++#   bench/compare.sh bullet_hell_stress.d 30 2048 100000 0.05 256     # a shooter with a lot of garbage
++#   bench/compare.sh aaa_sim.d city 60 2048 6 0 500000                # a city builder, six job threads
++#   bench/compare.sh entity_init.d 30 1024 20000 2000 60              # a scene of 10 million linked entities
++#
++# Runs: druntime's GC; oneday with a stop-the-world mark; oneday with the concurrent mark. A frame-based program
++# prints frame_p50_us=... p99=... p999=... max=... over16ms=...: compare "max" first, it is the frame that was
++# missed. Environment: DC, SYMGC, EXTRA as for build.sh; WORK is the directory for the binary.
++set -eu
++HERE=$(cd "$(dirname "$0")" && pwd)
++prog=$1; shift
++WORK=${WORK:-$(mktemp -d)}
++bin=$WORK/$(basename "${prog%.d}")
++
++"$HERE/build.sh" "$prog" "$bin" >/dev/null
++
++run() {
++	local label=$1; shift
++	local err; err=$(mktemp)
++	local line
++	line=$( { /usr/bin/time -f "peak_rss_mb=%M" "$@" 2>"$err" ; } | grep -E "frame_p50|RESULT|OK|ok" | tail -1 || true)
++	local rss; rss=$(grep -o 'peak_rss_mb=[0-9]*' "$err" | tail -1 | cut -d= -f2)
++	printf '%-28s %s  peak_rss=%s MB\n' "$label" "$line" "$((${rss:-0} / 1024))"
++	rm -f "$err"
++}
++
++run "druntime GC"        "$bin" "$@"
++run "oneday, STW mark"   env SYMGC_CONCURRENT_MARK=0 "$bin" "$@" --DRT-gcopt=gc:sdcq
++run "oneday, concurrent" "$bin" "$@" --DRT-gcopt=gc:sdcq
+diff --git a/bench/correctness.sh b/bench/correctness.sh
+new file mode 100755
+index 0000000..0d80f9b
+--- /dev/null
++++ b/bench/correctness.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++# Build and run the correctness battery against oneday (the setup without a card barrier).
++#
++#   bench/correctness.sh [SECONDS=20]
++#
++# Environment: DC, SYMGC, EXTRA as for build.sh. Exit status is 0 only if every test prints its OK line.
++# The tests that need the card barrier (cards_window.d, cards_precision.d) are described in ../guide/testing.md.
++set -u
++HERE=$(cd "$(dirname "$0")" && pwd)
++secs=${1:-20}
++WORK=${WORK:-$(mktemp -d)}
++fail=0
++
++check() {
++	local name=$1; shift
++	"$HERE/build.sh" "$name.d" "$WORK/$name" >/dev/null 2>"$WORK/$name.build" || {
++		echo "FAIL  $name: does not build (see $WORK/$name.build)"; fail=1; return; }
++	local out
++	out=$(timeout 600 "$WORK/$name" "$@" --DRT-gcopt=gc:sdcq 2>&1); local rc=$?
++	if [ $rc -eq 0 ] && echo "$out" | grep -q " OK"; then
++		echo "ok    $name: $(echo "$out" | tail -1 | cut -c1-110)"
++	else
++		echo "FAIL  $name (exit $rc): $(echo "$out" | tail -3 | cut -c1-110)"; fail=1
++	fi
++}
++
++check mark_race "$secs"
++check mark_race_glue "$secs"
++check finalizer_order "$secs"
++check thread_exit_race
++
++exit $fail
+diff --git a/bench/dmd_gcbarrier.sh b/bench/dmd_gcbarrier.sh
+new file mode 100755
+index 0000000..05f4007
+--- /dev/null
++++ b/bench/dmd_gcbarrier.sh
+@@ -0,0 +1,44 @@
++#!/bin/bash
++# Build and run a D program with DMD's GC write barrier (-preview=gcbarrier) and oneday in card mode.
++#
++#   DMD_REPO=<dmd checkout> PHOBOS=<phobos checkout> bench/dmd_gcbarrier.sh libs
++#   DMD_REPO=<dmd checkout> PHOBOS=<phobos checkout> bench/dmd_gcbarrier.sh build OUT FILE.d [extra dmd flags]
++#
++# DMD_REPO is a checkout of this project's dmd (the one with -preview=gcbarrier), already built
++# (generated/linux/release/64/dmd and libdruntime.a); PHOBOS is a Phobos checkout built against it.
++# `libs` builds an instrumented druntime and Phobos into generated/gcb of each, leaving the normal ones alone.
++#
++# The barrier has to be in everything that stores pointers into the GC heap, so druntime and Phobos are built with the
++# flag too. Programs built without it lose memory under a concurrent mark: mark_race.d shows it.
++# Run the result with --DRT-gcopt=gc:sdcq.
++set -u
++HERE=$(cd "$(dirname "$0")" && pwd)
++: "${DMD_REPO:?set DMD_REPO to the checkout of the dmd of this project}"
++: "${PHOBOS:?set PHOBOS to a Phobos checkout}"
++SYMGC_SRC=${SYMGC_SRC:-$HERE/../source}
++DMD=${DMD:-$DMD_REPO/generated/linux/release/64/dmd}
++GCB_DRT=$DMD_REPO/generated/gcb/linux/release/64
++GCB_PHO=$PHOBOS/generated/gcb/linux/release/64
++
++libs() {
++	make -C "$DMD_REPO/druntime" -j"$(nproc)" ROOT_OF_THEM_ALL=../generated/gcb OBJDIR=obj/gcb \
++		DFLAGS="-conf= -Isrc -Iimport -w -de -preview=dip1000 -preview=fieldwise -m64 -fPIC -preview=dtorfields -O -release -inline -preview=gcbarrier" \
++		../generated/gcb/linux/release/64/libdruntime.a || return 1
++	make -C "$PHOBOS" -j"$(nproc)" BUILD=release ROOT_OF_THEM_ALL=generated/gcb DMDEXTRAFLAGS=-preview=gcbarrier \
++		generated/gcb/linux/release/64/libphobos2.a
++}
++
++build() {
++	local out=$1 file=$2; shift 2
++	$DMD -conf= -I"$DMD_REPO/druntime/import" -I"$PHOBOS" -fPIC -O -release -inline -preview=gcbarrier \
++		-version=Symgc_druntime_hooks -version=Symgc_cards -version=Symgc_druntime_cards \
++		-I"$SYMGC_SRC" -I"$HERE" -defaultlib= "$@" \
++		-of="$out" "$file" $(find "$SYMGC_SRC" -name '*.d') \
++		"$GCB_PHO/libphobos2.a" -L-L"$GCB_DRT" -L-ldruntime -L-lpthread -L-lm -L-ldl -L-lz
++}
++
++case "${1:-}" in
++	libs) libs ;;
++	build) shift; build "$@" ;;
++	*) sed -n 2,5p "$0"; exit 2 ;;
++esac
+diff --git a/bench/entity_init.d b/bench/entity_init.d
+new file mode 100644
+index 0000000..280c6d5
+--- /dev/null
++++ b/bench/entity_init.d
+@@ -0,0 +1,164 @@
++// A benchmark for runs of pointer stores to one object: a scene of linked
++// entities, each with eight pointer fields, whose links are rewritten every
++// frame (the way a game re-parents nodes, rebuilds neighbour lists or resets a
++// pooled object), with a little allocation churn so that the collector runs
++// beside it. The stores `e.a = x; e.b = y; ...` are what the barrier
++// clustering of `-preview=gcbarrier` shares one barrier for.
++//
++//   entity_init SECONDS LIVE_MIB [RELINKS_PER_FRAME=200000] [CHURN_PER_FRAME=20000] [FPS=60, 0 = unpaced]
++//
++// LIVE_MIB is the size of the scene (do not go past 2048 for this machine).
++// Prints the frame times, and the time per relink in a phase with the
++// collector idle (GC.disable), which is the cost of the stores alone.
++import core.memory : GC;
++import core.stdc.stdio : printf;
++import std.conv : to;
++import core.thread : Thread;
++import core.time : dur, Duration, MonoTime;
++import std.algorithm : sort;
++
++final class Entity
++{
++    Entity parent, firstChild, nextSibling, prevSibling;
++    Entity target, owner, left, right;
++    ulong id;
++}
++
++struct Rng
++{
++    ulong s;
++    ulong next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
++}
++
++Entity[] scene;
++Rng rng = Rng(0x9e3779b97f4a7c15UL);
++
++// Each in a function of its own, so the stores are not mixed with the loop.
++pragma(inline, false) void relink(Entity e, Entity p, Entity c, Entity n, Entity pr,
++                                  Entity t, Entity o, Entity l, Entity r)
++{
++    e.parent = p;
++    e.firstChild = c;
++    e.nextSibling = n;
++    e.prevSibling = pr;
++    e.target = t;
++    e.owner = o;
++    e.left = l;
++    e.right = r;
++}
++
++// Entities are updated in order, a window that slides through the scene each
++// frame, and link to entities close to them (a scene graph, a neighbour list):
++// like a game, the writes are local, not spread over the whole heap.
++size_t cursor;
++enum Reach = 64;
++
++pragma(inline, false) Entity near(size_t i)
++{
++    return scene[(i + rng.next() % Reach) % scene.length];
++}
++
++pragma(inline, false) void relinkBatch(size_t count)
++{
++    const m = scene.length;
++    foreach (_; 0 .. count)
++    {
++        const i = cursor++ % m;
++        relink(scene[i], near(i), near(i), near(i), near(i), near(i), near(i), near(i), near(i));
++    }
++}
++
++pragma(inline, false) void churn(size_t count)
++{
++    const m = scene.length;
++    foreach (_; 0 .. count)
++    {
++        const i = (cursor + rng.next() % 50_000) % m;       // near the window
++        auto e = new Entity;
++        e.id = rng.next();
++        relink(e, near(i), near(i), near(i), near(i), near(i), near(i), near(i), near(i));
++        scene[i] = e;                   // the old one becomes garbage
++    }
++}
++
++int main(string[] args)
++{
++    const secs = args.length > 1 ? args[1].to!int : 20;
++    const liveMiB = args.length > 2 ? args[2].to!int : 1024;
++    const relinks = args.length > 3 ? args[3].to!int : 200_000;
++    const churnN = args.length > 4 ? args[4].to!int : 20_000;
++    const fps = args.length > 5 ? args[5].to!int : 60;      // 0: as fast as it goes
++    // (not computed inside the loop: with fps == 0 and -O, a build of dmd divided by zero there
++    // before testing fps > 0, which looks like a division hoisted out of its condition)
++    const frameUs = fps > 0 ? 1_000_000 / fps : 0;
++
++    const entityBytes = Entity.classinfo.initializer.length;
++    const n = cast(size_t) liveMiB * 1024 * 1024 / (entityBytes + 16);   // + the slot's rounding
++    scene = new Entity[n];
++    foreach (ref e; scene)
++        e = new Entity;
++    foreach (i, e; scene)
++        e.id = i;
++    printf("scene: %zu entities of %zu bytes (about %d MiB)\n", n, entityBytes, liveMiB);
++
++    // Building the scene allocated 1 GiB at full speed, which no collector
++    // keeps up with; settle before measuring the steady state.
++    GC.collect();
++
++    // 1. the cost of the stores alone: the collector is off
++    GC.disable();
++    relinkBatch(200_000);                               // warm up
++    enum Reps = 20;
++    double[Reps] per;
++    foreach (r; 0 .. Reps)
++    {
++        auto t0 = MonoTime.currTime;
++        relinkBatch(500_000);
++        per[r] = cast(double) (MonoTime.currTime - t0).total!"nsecs" / 500_000;
++    }
++    per[].sort();
++    printf("relink of 8 fields, collector off: median %.1f ns per entity (%.2f ns per store), best %.1f\n",
++           per[Reps / 2], per[Reps / 2] / 8, per[0]);
++    GC.enable();
++
++    // 2. frames with the collector running beside the program
++    enum MaxFrames = 20 * 60 * 10;
++    auto times = new long[MaxFrames];
++    size_t frames;
++    const t00 = MonoTime.currTime;
++    while ((MonoTime.currTime - t00).total!"seconds" < secs && frames < MaxFrames)
++    {
++        const f0 = MonoTime.currTime;
++        relinkBatch(relinks);
++        churn(churnN);
++        times[frames++] = (MonoTime.currTime - f0).total!"usecs";
++        version (EntityInitTrace)
++        {
++            // what the program allocates, to compare with the heap's growth in the collector's trace
++            import core.stdc.stdio : fprintf, stderr;
++            if (frames % 100 == 0)
++                fprintf(stderr, "prog t=%.2f s frames=%zu allocated=%zu MiB\n",
++                        (MonoTime.currTime - t00).total!"msecs" / 1000.0, frames,
++                        frames * churnN * entityBytes / (1024 * 1024));
++        }
++        if (times[frames - 1] > 16_000)
++            printf("slow frame %zu at %.1f s: %ld us\n", frames, (f0 - t00).total!"msecs" / 1000.0, times[frames - 1]);
++
++        // A game waits for the next frame; a loop that does not runs the program
++        // several times faster than any game would, writes the heap that much
++        // faster, and no collector can keep up with it.
++        if (fps > 0)
++        {
++            const left = (f0 + dur!"usecs"(frameUs)) - MonoTime.currTime;
++            if (left > Duration.zero)
++                Thread.sleep(left);
++        }
++    }
++    auto ts = times[0 .. frames];
++    ts.sort();
++    size_t over(long us) { size_t c; foreach (t; ts) if (t > us) c++; return c; }
++    printf("frame_p50_us=%ld p99=%ld p999=%ld max=%ld over1ms=%zu over5ms=%zu over16ms=%zu frames=%zu\n",
++           ts[frames / 2], ts[frames * 99 / 100], ts[frames * 999 / 1000], ts[frames - 1],
++           over(1000), over(5000), over(16000), frames);
++    return 0;
++}
+diff --git a/bench/finalizer_order.d b/bench/finalizer_order.d
+new file mode 100644
+index 0000000..eabe30d
+--- /dev/null
++++ b/bench/finalizer_order.d
+@@ -0,0 +1,69 @@
++// A destructor that reads another dead object (the D spec says it must not, but it works with a collector that
++// releases nothing before all finalizers ran, and programs rely on it). Other threads allocate heavily while the
++// collector sweeps, so a slot released early is reused and overwritten, or poisoned with -version=Symgc_verify.
++//
++// Prints "FINALIZER ORDER OK" if no destructor found its partner damaged.
++import core.atomic : atomicOp, atomicLoad, atomicStore;
++import core.memory : GC;
++import core.thread : Thread;
++import core.stdc.stdio : printf;
++
++shared size_t violations, finalized;
++shared bool stop;
++
++class B
++{
++    ulong marker;
++    ubyte[200] pad;       // another size class than A, so another slab
++    this(ulong m) { marker = m; }
++}
++
++class A
++{
++    B partner;
++    ulong expected;
++    ubyte[40] pad;
++    this(B b, ulong e) { partner = b; expected = e; }
++    ~this()
++    {
++        // Reads memory of an object that may be dead too.
++        if (partner.marker != expected)
++            atomicOp!"+="(violations, 1);
++        atomicOp!"+="(finalized, 1);
++    }
++}
++
++void churn()
++{
++    // Garbage of the size of B, to take the slots released by a sweep.
++    ulong sink;
++    while (!atomicLoad(stop))
++    {
++        auto b = new B(sink++);
++        sink += b.marker & 1;
++    }
++}
++
++int main()
++{
++    Thread[] ts;
++    foreach (i; 0 .. 4) { auto t = new Thread(&churn); t.start(); ts ~= t; }
++
++    enum Pairs = 400_000;
++    foreach (i; 0 .. Pairs)
++    {
++        auto b = new B(0x1234_5678_0000_0000UL + i);
++        auto a = new A(b, 0x1234_5678_0000_0000UL + i);
++        // keep a few alive, drop the rest
++        if (i % 1000 == 0) GC.addRoot(cast(void*) a);
++    }
++
++    atomicStore(stop, true);
++    foreach (t; ts) t.join();
++    GC.collect();
++
++    printf("finalized=%zu violations=%zu\n", atomicLoad(finalized), atomicLoad(violations));
++    if (atomicLoad(violations) == 0 && atomicLoad(finalized) > 0)
++        printf("FINALIZER ORDER OK\n");
++    return atomicLoad(violations) == 0 ? 0 : 1;
++}
+diff --git a/bench/gcb.d b/bench/gcb.d
+new file mode 100644
+index 0000000..89c144c
+--- /dev/null
++++ b/bench/gcb.d
+@@ -0,0 +1,378 @@
++/**
++ * Phobos-free GC workloads, so one binary built with the repo's dmd and druntime can be run
++ * under any collector linked in: --DRT-gcopt=gc:conservative, gc:sdc (symgc, with the banner
++ * suppressed by gc:sdcq), and later gc:immix.
++ *
++ *   gcb alloc <threads> <allocs-per-thread>
++ *   gcb frag <steps> <slots> [max-size]      (max-size 2032 keeps objects out of large-object space)
++ *   gcb trav <nodes> <traversals>            (user-space cache misses via perf_event_open)
++ *   gcb tree <depth>
++ *   gcb latency <live-MiB> <requests>
++ *   gcb mixed <threads> <seconds>            (threads allocating, one holding a big live set)
++ *
++ * Prints one "RESULT key=value ..." line.
++ */
++import core.memory;
++import core.stdc.stdio;
++import core.stdc.stdlib : atoi, atol, qsort;
++import core.thread;
++import core.time;
++
++version (SymGC) import symgc.gcobj;
++
++extern (C) __gshared string[] rt_options = []; // gc chosen on the command line
++
++size_t statusKiB(const(char)* key)
++{
++    auto f = fopen("/proc/self/status", "r");
++    if (!f) return 0;
++    char[256] line;
++    size_t v;
++    size_t n = 0;
++    while (fgets(line.ptr, 256, f))
++    {
++        // match "<key>: <n> kB"
++        size_t k;
++        while (key[k] && line[k] == key[k]) ++k;
++        if (!key[k] && sscanf(line.ptr + k, ": %zu kB", &v) == 1) { n = v; break; }
++    }
++    fclose(f);
++    return n;
++}
++
++void result(const(char)* name, double secs, double ops, const(char)* extra = "")
++{
++    auto ps = GC.profileStats();
++    printf("RESULT workload=%s seconds=%.4f mops=%.3f rss_kib=%zu peak_kib=%zu gcs=%zu gc_ms=%.1f maxpause_ms=%.2f %s\n",
++        name, secs, ops / secs / 1e6, statusKiB("VmRSS"), statusKiB("VmHWM"),
++        cast(size_t) ps.numCollections, ps.totalCollectionTime.total!"usecs" / 1000.0,
++        ps.maxPauseTime.total!"usecs" / 1000.0, extra);
++}
++
++double now() { return MonoTime.currTime.ticks / cast(double) MonoTime.ticksPerSecond; }
++
++ulong nextRng(ref ulong r) { r = r * 6364136223846793005UL + 1442695040888963407UL; return r >> 33; }
++
++// ----------------------------------------------------------------------------- alloc
++
++final class Node { Node next; size_t payload; }
++__gshared size_t allocN = 1_000_000;
++void* gcSinkShared;
++
++void allocWorker()
++{
++    enum window = 64;
++    Node[window] ring;
++    void* sink;
++    foreach (i; 0 .. allocN)
++    {
++        auto n = new Node;
++        n.payload = i;
++        n.next = (i & 1) ? ring[(i + 1) % window] : null;
++        ring[i % window] = n;
++        if ((i & 15) == 0)
++        {
++            auto a = new ubyte[](16 + (i & 0x3F0));
++            a[0] = cast(ubyte) i;
++            sink = a.ptr;
++        }
++    }
++    if (sink is null && ring[0] is null) printf("x");
++    foreach (s; 0 .. window)
++        if (ring[s] is null || ring[s].payload % window != s) { printf("FAILED ring\n"); }
++}
++
++void runAlloc(int threads)
++{
++    immutable t0 = now();
++    Thread[] ts;
++    foreach (i; 0 .. threads)
++    {
++        auto t = new Thread(&allocWorker);
++        t.start();
++        ts ~= t;
++    }
++    foreach (t; ts) t.join();
++    result("alloc", now() - t0, cast(double) allocN * threads * 1.0625);
++}
++
++// ----------------------------------------------------------------------------- frag
++
++size_t pickSize(ref ulong rng)
++{
++    immutable r = nextRng(rng);
++    switch (r % 10)
++    {
++        case 0: .. case 5: return 16 + (r >> 4) % 240;
++        case 6: .. case 8: return 256 + (r >> 4) % 3840;
++        default:           return 4096 + (r >> 4) % 61440;
++    }
++}
++
++void runFrag(size_t steps, size_t slotCount, size_t maxSize)
++{
++    auto slots = new ubyte[][](slotCount);
++    ulong rng = 42;
++    size_t[1024] samples;
++    size_t ns;
++    immutable every = steps / 512 + 1;
++    immutable t0 = now();
++    foreach (step; 0 .. steps)
++    {
++        immutable i = nextRng(rng) % slotCount;
++        auto n = pickSize(rng);
++        if (n > maxSize) n = 16 + n % (maxSize - 16);
++        slots[i] = new ubyte[](n);
++        slots[i][0] = 1;
++        if (step % every == 0 && ns < 1024) samples[ns++] = statusKiB("VmRSS");
++    }
++    immutable secs = now() - t0;
++    size_t sum, cnt;
++    foreach (i; ns / 2 .. ns) { sum += samples[i]; ++cnt; }
++    char[96] extra;
++    snprintf(extra.ptr, 96, "steady_rss_kib=%zu", cnt ? sum / cnt : 0);
++    foreach (s; slots) if (s.length && s[0] != 1) printf("FAILED slot\n");
++    result("frag", secs, steps, extra.ptr);
++}
++
++// ----------------------------------------------------------------------------- trav
++
++final class Small { Small left, right; size_t v; }
++final class Medium { Medium left, right; size_t v; ubyte[96] pad; }
++final class Large { Large left, right; size_t v; ubyte[400] pad; }
++final class ListNode { ListNode next; size_t v; ubyte[24] pad; }
++void* travSink;
++
++Small buildSmall(size_t n)
++{
++    if (!n) return null;
++    auto s = new Small;
++    s.v = n;
++    travSink = cast(void*) new Medium;
++    if (n % 4 == 0) travSink = cast(void*) new Large;
++    s.left = buildSmall(n / 2);
++    s.right = buildSmall(n - n / 2 - 1);
++    return s;
++}
++size_t sumT(Small s) { return s is null ? 0 : s.v + sumT(s.left) + sumT(s.right); }
++size_t sumL(ListNode n) { size_t t; for (; n; n = n.next) t += n.v; return t; }
++
++import perfcount;
++
++void runTrav(size_t nodes, size_t traversals)
++{
++    auto tree = buildSmall(nodes);
++    ListNode head;
++    foreach (i; 0 .. nodes)
++    {
++        auto n = new ListNode;
++        n.v = i;
++        n.next = head;
++        head = n;
++        if (i % 3 == 0) travSink = (new ubyte[](200 + i % 600)).ptr;
++    }
++    GC.collect();
++    immutable e1 = sumT(tree), e2 = sumL(head);
++    auto cm = PerfCounter.open(PERF_COUNT_HW_CACHE_MISSES);
++    size_t total;
++    immutable t0 = now();
++    cm.start();
++    foreach (_; 0 .. traversals) total += sumT(tree) + sumL(head);
++    immutable misses = cm.stop();
++    immutable secs = now() - t0;
++    if (total != traversals * (e1 + e2)) printf("FAILED trav\n");
++    char[128] extra;
++    snprintf(extra.ptr, 128, "traversal_ms=%.3f misses_per_traversal=%.0f", secs * 1000 / traversals, cast(double) misses / traversals);
++    result("trav", secs, cast(double) traversals * nodes * 2, extra.ptr);
++}
++
++// ----------------------------------------------------------------------------- tree
++
++final class TreeNode { TreeNode left, right; int item; }
++TreeNode bottomUp(int item, int depth)
++{
++    auto n = new TreeNode;
++    n.item = item;
++    if (depth > 0) { n.left = bottomUp(2 * item - 1, depth - 1); n.right = bottomUp(2 * item, depth - 1); }
++    return n;
++}
++long check(TreeNode n) { return n.left is null ? n.item : n.item + check(n.left) - check(n.right); }
++
++void runTree(int n)
++{
++    enum minDepth = 4;
++    immutable maxDepth = minDepth + 2 > n ? minDepth + 2 : n;
++    immutable t0 = now();
++    long total = check(bottomUp(0, maxDepth + 1));
++    auto longLived = bottomUp(0, maxDepth);
++    size_t nodes;
++    for (int depth = minDepth; depth <= maxDepth; depth += 2)
++    {
++        immutable iterations = 1 << (maxDepth - depth + minDepth);
++        foreach (i; 1 .. iterations + 1)
++        {
++            total += check(bottomUp(i, depth)) + check(bottomUp(-i, depth));
++        }
++        nodes += cast(size_t) iterations * 2 * ((2UL << depth) - 1);
++    }
++    total += check(longLived);
++    printf("tree checksum %lld\n", total);
++    result("tree", now() - t0, nodes);
++}
++
++// ----------------------------------------------------------------------------- latency
++
++extern (C) int cmpLong(const(void)* a, const(void)* b) nothrow @nogc
++{
++    immutable x = *cast(const(long)*) a, y = *cast(const(long)*) b;
++    return x < y ? -1 : x > y;
++}
++
++final class Entry { Entry next; ubyte[] data; }
++void* latSink;
++
++void runLatency(size_t liveMiB, size_t requests)
++{
++    enum entrySize = 512;
++    immutable count = liveMiB * 1024 * 1024 / entrySize;
++    auto live = new Entry[](count);
++    foreach (i, ref e; live)
++    {
++        e = new Entry;
++        e.data = new ubyte[](entrySize - 64);
++        if (i) e.next = live[i - 1];
++    }
++    auto samples = new long[](requests);
++    ulong seed = 12345;
++    immutable t0 = now();
++    foreach (r; 0 .. requests)
++    {
++        immutable a = MonoTime.currTime;
++        foreach (k; 0 .. 8)
++        {
++            auto tmp = new ubyte[](128 + k * 64);
++            tmp[0] = cast(ubyte) r;
++            latSink = tmp.ptr;
++        }
++        auto e = new Entry;
++        e.data = new ubyte[](entrySize - 64);
++        live[nextRng(seed) % count] = e;
++        samples[r] = (MonoTime.currTime - a).total!"usecs";
++    }
++    immutable secs = now() - t0;
++    qsort(samples.ptr, requests, long.sizeof, &cmpLong);
++    char[160] extra;
++    snprintf(extra.ptr, 160, "p50_us=%lld p99_us=%lld p999_us=%lld max_us=%lld", samples[requests / 2],
++        samples[requests * 99 / 100], samples[requests * 999 / 1000], samples[$ - 1]);
++    result("latency", secs, requests, extra.ptr);
++}
++
++// ----------------------------------------------------------------------------- main
++
++int main(string[] args)
++{
++    if (args.length < 2) { fprintf(stderr, "usage: gcb <alloc|frag|trav|tree|latency> ...\n"); return 2; }
++    // D strings from argv are slices, not guaranteed NUL-terminated: parse by length.
++    size_t arg(size_t i, size_t d)
++    {
++        if (args.length <= i) return d;
++        size_t v;
++        foreach (c; args[i]) v = v * 10 + (c - '0');
++        return v;
++    }
++    switch (args[1])
++    {
++        case "alloc": allocN = arg(3, 1_000_000); runAlloc(cast(int) arg(2, 4)); break;
++        case "frag": runFrag(arg(2, 10_000_000), arg(3, 100_000), arg(4, 65535)); break;
++        case "trav": runTrav(arg(2, 1_000_000), arg(3, 10)); break;
++        case "tree": runTree(cast(int) arg(2, 16)); break;
++        case "latency": runLatency(arg(2, 256), arg(3, 200_000)); break;
++        case "frames": runFrames(arg(2, 512), arg(3, 1200), arg(4, 5000)); break;
++        default: fprintf(stderr, "unknown workload\n"); return 2;
++    }
++    return 0;
++}
++
++// ----------------------------------------------------------------------------- frames
++// A game-shaped loop: a large live world, and every frame does a fixed amount of allocation
++// work (temporaries, a few retained objects). Reports the distribution of the per-frame work
++// time and how many frames the collector pushed over 1, 2 and 5 ms.
++
++final class Ent { Ent link; ubyte[] data; size_t id; }
++__gshared Ent[] world;
++void* frameSink;
++
++// With -version=GcbLockStats (and a symgc built with -version=Symgc_phase_trace): per slow frame, how many
++// times this thread took a lock the slow way and for how long.
++version (GcbLockStats) extern(C) void symgc_lockstats(ulong* count, ulong* time);
++
++void runFrames(size_t liveMiB, size_t frames, size_t allocsPerFrame)
++{
++    enum entrySize = 512;
++    immutable count = liveMiB * 1024 * 1024 / entrySize;
++    world = new Ent[](count);
++    foreach (i, ref e; world)
++    {
++        e = new Ent;
++        e.data = new ubyte[](entrySize - 64);
++        e.id = i;
++        if (i) e.link = world[i - 1];
++    }
++    auto ft = new long[](frames);
++    ulong seed = 99;
++    immutable t0 = now();
++    foreach (f; 0 .. frames)
++    {
++        version (GcbLockStats) { ulong lc0, lt0; symgc_lockstats(&lc0, &lt0); }
++        immutable a = MonoTime.currTime;
++        foreach (k; 0 .. allocsPerFrame)
++        {
++            auto tmp = new ubyte[](32 + (k & 7) * 32);
++            tmp[0] = cast(ubyte) k;
++            frameSink = tmp.ptr;
++            if ((k & 63) == 0)
++            {
++                auto e = new Ent;
++                e.data = new ubyte[](entrySize - 64);
++                world[nextRng(seed) % count] = e;
++            }
++        }
++        ft[f] = (MonoTime.currTime - a).total!"usecs";
++        version (GcbLockStats)
++        {
++            ulong lc1, lt1;
++            symgc_lockstats(&lc1, &lt1);
++            if (ft[f] > 1100)
++                fprintf(stderr, "frame %zu %lld us: slow lock entries %llu, waited %.0f us\n", f, ft[f], lc1 - lc0, (lt1 - lt0) / 10.0);
++        }
++        // pace to 60 fps so the collector has idle time, as in a real game
++        immutable target = cast(long) 16_666;
++        long spent = ft[f];
++        while (spent < target && spent >= 0)
++        {
++            Thread.sleep(dur!"usecs"(target - spent < 500 ? target - spent : 500));
++            spent = (MonoTime.currTime - a).total!"usecs";
++        }
++    }
++    immutable secs = now() - t0;
++    import core.stdc.stdlib : getenv;
++    if (getenv("FRAMES_DUMP"))   // list the frames over 2 ms: index and duration, to correlate with GC activity
++        foreach (i, v; ft)
++            if (v > 2000) fprintf(stderr, "slowframe %zu %lld us\n", i, v);
++    size_t o1, o2, o5, o16;
++    long worst, over;
++    foreach (v; ft)
++    {
++        if (v > 1000) { ++o1; over += v; }
++        if (v > 2000) ++o2;
++        if (v > 5000) ++o5;
++        if (v > 16666) ++o16;
++        if (v > worst) worst = v;
++    }
++    auto sorted = ft.dup;
++    qsort(sorted.ptr, frames, long.sizeof, &cmpLong);
++    char[224] extra;
++    snprintf(extra.ptr, 224, "frame_p50_us=%lld frame_p99_us=%lld frame_p999_us=%lld frame_max_us=%lld over1ms=%zu over2ms=%zu over5ms=%zu over16ms=%zu frames=%zu",
++        sorted[frames / 2], sorted[frames * 99 / 100], sorted[frames * 999 / 1000], worst, o1, o2, o5, o16, frames);
++    result("frames", secs, frames, extra.ptr);
++}
+diff --git a/bench/mark_race.d b/bench/mark_race.d
+new file mode 100644
+index 0000000..59ade94
+--- /dev/null
++++ b/bench/mark_race.d
+@@ -0,0 +1,165 @@
++// Stress test for a collector that marks while the program runs.
++//
++// The hazard: a thread takes a pointer out of the graph (into a local), the collector scans the place it came from
++// and the place it is going to, and the thread stores the pointer into an object the collector already scanned.
++// A mark that misses it frees a live object. Here every node carries its identity twice, so a node that was freed
++// (and poisoned or reused) is noticed the next time a thread looks at it.
++//
++//   dmd ... mark_race.d <symgc sources> && SYMGC_CONCURRENT_MARK=1 ./mark_race [seconds] --DRT-gcopt=gc:sdcq
++//
++// Prints "MARK RACE OK <moves>" when no node was damaged.
++import core.atomic : atomicOp, atomicLoad, atomicStore;
++import core.thread : Thread;
++import core.stdc.stdio : printf;
++import core.stdc.stdlib : atoi;
++import core.time : MonoTime, seconds;
++
++enum Nodes = 4000;
++enum Threads = 4;
++
++shared size_t violations, moves;
++shared bool stop;
++
++struct Node
++{
++    ulong id;
++    Node* a;
++    Node* b;
++    ulong check;       // id ^ Magic
++    ubyte[40] pad;
++}
++
++enum ulong Magic = 0x9e3779b97f4a7c15UL;
++
++Node* make(ulong id)
++{
++    auto n = new Node;
++    n.id = id;
++    n.check = id ^ Magic;
++    return n;
++}
++
++bool intact(Node* n, ulong expected)
++{
++    return n.id == expected && n.check == (expected ^ Magic);
++}
++
++__gshared Node*[] roots;   // the graph hangs off these, in the GC heap
++
++void worker(uint seed)
++{
++    ulong x = 88172645463325252UL ^ seed;
++    ulong next() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; }
++
++    size_t myMoves;
++    ulong sink;
++    while (!atomicLoad(stop))
++    {
++        auto i = next() % Nodes;
++        auto j = next() % Nodes;
++
++        // Take a subtree out of the graph into a local...
++        auto from = roots[i];
++        auto held = (next() & 1) ? from.a : from.b;
++        if (held is null)
++            continue;
++        auto heldId = held.id;
++        if (!intact(held, heldId))
++        {
++            atomicOp!"+="(violations, 1);
++            continue;
++        }
++
++        if (next() & 1) from.a = null; else from.b = null;
++
++        // ...let the collector run while it only lives on our stack...
++        foreach (_; 0 .. next() % 64)
++        {
++            auto g = new Node;      // garbage, drives the collections
++            sink += cast(size_t) g;
++        }
++
++        // ...and store it into another object (which may have been scanned already).
++        auto to = roots[j];
++        if (next() & 1) to.a = held; else to.b = held;
++
++        // The node we held must still be what it was, and so must what hangs off it.
++        if (!intact(held, heldId))
++            atomicOp!"+="(violations, 1);
++        foreach (child; [held.a, held.b])
++            if (child !is null && !intact(child, child.id))
++                atomicOp!"+="(violations, 1);
++
++        // Sometimes grow the graph: a new node that points to an old one.
++        if ((next() & 7) == 0)
++        {
++            auto n = make(heldId + 1_000_000);
++            n.a = held;
++            roots[i].a = n;
++        }
++
++        myMoves++;
++    }
++    atomicOp!"+="(moves, myMoves);
++    if (sink == 1) printf("");
++}
++
++int main(string[] args)
++{
++    uint secs = 10;
++
++    // The digits of the first numeric argument.
++    foreach (a; args[1 .. $])
++    {
++        if (a.length && a[0] >= '0' && a[0] <= '9')
++        {
++            secs = 0;
++            foreach (c; a) secs = secs * 10 + (c - '0');
++            break;
++        }
++    }
++
++    roots = new Node*[](Nodes);
++    foreach (i, ref r; roots)
++        r = make(i);
++    foreach (i, r; roots)
++    {
++        r.a = roots[(i * 7 + 1) % Nodes];
++        r.b = roots[(i * 13 + 5) % Nodes];
++    }
++
++    Thread[] ts;
++    foreach (i; 0 .. Threads)
++    {
++        auto seed = cast(uint) (i + 1);
++        auto t = new Thread({ worker(seed); });
++        t.start();
++        ts ~= t;
++    }
++
++    auto end = MonoTime.currTime + seconds(secs);
++    while (MonoTime.currTime < end)
++        Thread.sleep(dur!"msecs"(50));
++
++    atomicStore(stop, true);
++    foreach (t; ts) t.join();
++
++    // Everything still reachable must be intact.
++    size_t checked, bad;
++    foreach (r; roots)
++    {
++        foreach (n; [r, r.a, r.b])
++        {
++            if (n is null) continue;
++            checked++;
++            if (!intact(n, n.id)) bad++;
++        }
++    }
++
++    printf("moves=%zu violations=%zu final_check=%zu/%zu bad\n", atomicLoad(moves), atomicLoad(violations), bad, checked);
++    if (atomicLoad(violations) == 0 && bad == 0)
++        printf("MARK RACE OK %zu\n", atomicLoad(moves));
++    return atomicLoad(violations) == 0 && bad == 0 ? 0 : 1;
++}
++
++import core.time : dur;
+diff --git a/bench/mark_race_glue.d b/bench/mark_race_glue.d
+new file mode 100644
+index 0000000..d24d4f5
+--- /dev/null
++++ b/bench/mark_race_glue.d
+@@ -0,0 +1,292 @@
++// Stress test for a collector that marks while the program runs, aimed at the
++// stores the code generator makes by itself.
++//
++// mark_race.d moves nodes with plain assignments of fields. A barrier that
++// rewrites assignments in the frontend would pass it. This one stores the node
++// through forms in which the compiler writes the pointer without an assignment
++// expression existing:
++//
++//   0  an array literal           h.arr = [n, o]      (the elements are stored by
++//                                                      the code generator into the
++//                                                      memory the runtime allocated)
++//   1  a heap struct              h.pp = new Pair(n, o)
++//   2  a struct literal           h.ps = Pair(n, o)
++//   3  a closure                  h.dg = () => n      (the frame holds n)
++//   4  an append                  h.list ~= n         (druntime)
++//   5  an associative array       h.map[id] = n       (druntime)
++//   6  an atomic store            atomicStore(h.sp, n)  (assembly or an intrinsic)
++//   7  a compare-and-swap         cas(&h.cp, null, n)
++//
++// After the store the only way to the node is through the holder, a collection
++// runs, and the node is read back from the holder and checked. A barrier that
++// misses one of these forms lets the collector free the node, and the check
++// finds it reused or poisoned.
++//
++//   build with the card barrier, run with --DRT-gcopt=gc:sdcq [seconds]
++//   prints "MARK RACE GLUE OK <moves>" when no node was damaged.
++import core.atomic : atomicOp, atomicLoad, atomicStore, cas;
++import core.thread : Thread;
++import core.stdc.stdio : printf;
++import core.time : MonoTime, seconds, dur;
++
++enum Nodes = 4000;
++enum Threads = 4;
++enum Forms = 9;
++
++shared size_t violations, moves;
++shared size_t[Forms] perForm;
++shared bool stop;
++
++version (GlueUnmarked)
++{
++    // The values are created in mark_race_glue_ext.d, built without the barrier.
++    import mark_race_glue_ext;
++}
++else
++{
++    struct Node
++    {
++        ulong id;
++        Node* a;
++        Node* b;
++        ulong check;       // id ^ Magic
++        ubyte[40] pad;
++    }
++
++    struct Pair
++    {
++        Node* x;
++        Node* y;
++    }
++}
++
++enum ulong Magic = 0x9e3779b97f4a7c15UL;
++
++Node* make(ulong id)
++{
++    auto n = new Node;
++    n.id = id;
++    n.check = id ^ Magic;
++    return n;
++}
++
++bool intact(Node* n, ulong expected)
++{
++    return n !is null && n.id == expected && n.check == (expected ^ Magic);
++}
++
++/// One per thread: the places the node is stored into. Old objects, scanned by
++/// the collector many times, like the objects of a long-running program.
++final class Holder
++{
++    Node*[] arr;
++    Pair* pp;
++    Pair ps;
++    Node* delegate() dg;
++    Node*[] list;
++    Node*[ulong] map;
++    shared(Node)* sp;           // form 6
++    shared(Node)* cp;           // form 7
++    Node* t1, t2, t3;           // form 8: three stores in a row to one object share a barrier
++}
++
++__gshared Node*[] roots;
++
++// Each form in its own function, so that nothing of the node stays in the
++// caller's frame.
++version (GlueUnmarked)
++{
++    // The assignment into the holder has the barrier; the creation of the value does not.
++    pragma(inline, false) void put0(Holder h, Node* n, Node* o) { h.arr = mk0(n, o); }
++    pragma(inline, false) void put1(Holder h, Node* n, Node* o) { h.pp = mk1(n, o); }
++    pragma(inline, false) void put3(Holder h, Node* n) { h.dg = mk3(n); }
++}
++else
++{
++    pragma(inline, false) void put0(Holder h, Node* n, Node* o) { h.arr = [n, o, o, o, o, o, o, o, o, o, o, o, o, o, o, o]; }
++    pragma(inline, false) void put1(Holder h, Node* n, Node* o) { h.pp = new Pair(n, o); }
++    pragma(inline, false) void put3(Holder h, Node* n) { h.dg = () => n; }
++}
++pragma(inline, false) void put2(Holder h, Node* n, Node* o) { h.ps = Pair(n, o); }
++pragma(inline, false) void put4(Holder h, Node* n) { h.list = null; h.list ~= n; }
++pragma(inline, false) void put5(Holder h, Node* n) { h.map = null; h.map[n.id] = n; }
++// Atomic operations store through assembly or intrinsics: invisible to a barrier
++// that looks at the stores the compiler makes. core.atomic reports them itself.
++pragma(inline, false) void put6(Holder h, Node* n) { atomicStore(h.sp, cast(shared(Node)*) n); }
++pragma(inline, false) void put7(Holder h, Node* n) { h.cp = null; cas(&h.cp, cast(shared(Node)*) null, cast(shared(Node)*) n); }
++
++pragma(inline, false) void put8(Holder h, Node* n) { h.t1 = n; h.t2 = n; h.t3 = n; }
++
++pragma(inline, false) Node* get(Holder h, uint form, ulong id)
++{
++    switch (form)
++    {
++        case 0: return h.arr.length ? h.arr[0] : null;
++        case 1: return h.pp ? h.pp.x : null;
++        case 2: return h.ps.x;
++        case 3: return h.dg ? h.dg() : null;
++        case 4: return h.list.length ? h.list[0] : null;
++        case 5: auto p = id in h.map; return p ? *p : null;
++        case 6: return cast(Node*) atomicLoad(h.sp);
++        case 7: return cast(Node*) atomicLoad(h.cp);
++        default: return h.t2;       // form 8 (t1 and t3 hold it too, but only one need survive)
++    }
++}
++
++/// Take a node out of the graph and store it into the holder, by `form`.
++/// Returns its id, or 0 if there was nothing to take.
++pragma(inline, false) ulong takeAndPut(Holder h, size_t i, bool slotA, uint form, size_t k)
++{
++    auto from = roots[i];
++    auto held = slotA ? from.a : from.b;
++    if (held is null)
++        return 0;
++
++    auto id = held.id;
++    if (!intact(held, id))
++    {
++        atomicOp!"+="(violations, 1);
++        return 0;
++    }
++
++    if (slotA) from.a = null; else from.b = null;
++
++    auto other = roots[k].a;
++    switch (form)
++    {
++        case 0: put0(h, held, other); break;
++        case 1: put1(h, held, other); break;
++        case 2: put2(h, held, other); break;
++        case 3: put3(h, held); break;
++        case 4: put4(h, held); break;
++        case 5: put5(h, held); break;
++        case 6: put6(h, held); break;
++        case 7: put7(h, held); break;
++        default: put8(h, held); break;
++    }
++
++    return id;
++}
++
++pragma(inline, false) void burn(ulong n)
++{
++    ulong sink;
++    foreach (_; 0 .. n)
++    {
++        auto g = new Node;      // garbage of the node's size: drives the collections and reuses freed slots
++        sink += cast(size_t) g;
++    }
++    if (sink == 1) printf("");
++}
++
++void worker(uint seed)
++{
++    ulong x = 88172645463325252UL ^ seed;
++    ulong next() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; }
++
++    auto h = new Holder;
++    size_t myMoves;
++    size_t[Forms] mine;
++
++    while (!atomicLoad(stop))
++    {
++        auto i = next() % Nodes;
++        auto slotA = (next() & 1) != 0;
++        auto form = cast(uint) (next() % Forms);
++
++        auto id = takeAndPut(h, i, slotA, form, next() % Nodes);
++        if (id == 0)
++            continue;
++
++        // The node is reachable only through the holder now.
++        burn(next() % 256);
++
++        auto back = get(h, form, id);
++        if (!intact(back, id))
++        {
++            atomicOp!"+="(violations, 1);
++            continue;
++        }
++
++        // Put it back so that the graph does not run dry.
++        if (slotA) roots[i].a = back; else roots[i].b = back;
++
++        // Grow the graph: a new node that points to it. The nodes of `roots`
++        // are alive whatever the collector does; these are alive only if the
++        // collector finds them through the graph, which is what is tested.
++        if ((next() & 3) == 0)
++        {
++            auto n = make(id + 1_000_000);
++            n.a = back;
++            roots[i].a = n;
++        }
++
++        myMoves++;
++        mine[form]++;
++    }
++
++    atomicOp!"+="(moves, myMoves);
++    foreach (f; 0 .. Forms)
++        atomicOp!"+="(perForm[f], mine[f]);
++}
++
++int main(string[] args)
++{
++    uint secs = 10;
++
++    foreach (a; args[1 .. $])
++    {
++        if (a.length && a[0] >= '0' && a[0] <= '9')
++        {
++            secs = 0;
++            foreach (c; a) secs = secs * 10 + (c - '0');
++            break;
++        }
++    }
++
++    roots = new Node*[](Nodes);
++    foreach (i, ref r; roots)
++        r = make(i);
++    foreach (i, r; roots)
++    {
++        r.a = roots[(i * 7 + 1) % Nodes];
++        r.b = roots[(i * 13 + 5) % Nodes];
++    }
++
++    Thread[] ts;
++    foreach (i; 0 .. Threads)
++    {
++        auto seed = cast(uint) (i + 1);
++        auto t = new Thread({ worker(seed); });
++        t.start();
++        ts ~= t;
++    }
++
++    auto end = MonoTime.currTime + seconds(secs);
++    while (MonoTime.currTime < end)
++        Thread.sleep(dur!"msecs"(50));
++
++    atomicStore(stop, true);
++    foreach (t; ts) t.join();
++
++    size_t checked, bad;
++    foreach (r; roots)
++    {
++        foreach (n; [r, r.a, r.b])
++        {
++            if (n is null) continue;
++            checked++;
++            if (!intact(n, n.id)) bad++;
++        }
++    }
++
++    printf("moves=%zu violations=%zu final_check=%zu/%zu bad  per form:", atomicLoad(moves), atomicLoad(violations), bad, checked);
++    foreach (f; 0 .. Forms)
++        printf(" %zu", atomicLoad(perForm[f]));
++    printf("\n");
++
++    const ok = atomicLoad(violations) == 0 && bad == 0;
++    if (ok)
++        printf("MARK RACE GLUE OK %zu\n", atomicLoad(moves));
++    return ok ? 0 : 1;
++}
+diff --git a/bench/mark_race_glue_ext.d b/bench/mark_race_glue_ext.d
+new file mode 100644
+index 0000000..22f7b86
+--- /dev/null
++++ b/bench/mark_race_glue_ext.d
+@@ -0,0 +1,31 @@
++// Used by mark_race_glue.d with -version=GlueUnmarked, and compiled WITHOUT
++// -preview=gcbarrier: the stores that create these values are the ones the code
++// generator makes by itself (the elements of the literal, the fields of the new
++// struct, the closure frame), and here they get no barrier. The assignment that
++// stores the result into the holder is in mark_race_glue.d, with the barrier.
++//
++// If the test fails with this module and passes without it, those stores matter:
++// a barrier that only rewrites assignment expressions in the frontend would not
++// be enough.
++module mark_race_glue_ext;
++
++struct Node
++{
++    ulong id;
++    Node* a;
++    Node* b;
++    ulong check;
++    ubyte[40] pad;
++}
++
++struct Pair
++{
++    Node* x;
++    Node* y;
++}
++
++// 16 elements: a literal that is a whole size class of its own, not a few bytes
++// sharing a 512-byte card with other objects that were marked for other reasons.
++Node*[] mk0(Node* n, Node* o) { return [n, o, o, o, o, o, o, o, o, o, o, o, o, o, o, o]; }
++Pair* mk1(Node* n, Node* o) { return new Pair(n, o); }
++Node* delegate() mk3(Node* n) { return () => n; }
+diff --git a/bench/perfcount.d b/bench/perfcount.d
+new file mode 100644
+index 0000000..c263af4
+--- /dev/null
++++ b/bench/perfcount.d
+@@ -0,0 +1,110 @@
++/**
++ * Minimal user-space hardware counters through perf_event_open (no `perf` binary needed).
++ * Counts only user-mode events, which kernel.perf_event_paranoid <= 2 allows.
++ */
++module perfcount;
++
++import core.sys.posix.unistd : read, close;
++
++extern (C) nothrow @nogc
++{
++    long syscall(long number, ...);
++    int ioctl(int fd, ulong request, ...);
++}
++
++private enum SYS_perf_event_open = 298; // x86-64 Linux
++private enum PERF_TYPE_HARDWARE = 0;
++private enum PERF_TYPE_HW_CACHE = 3;
++enum PERF_COUNT_HW_CPU_CYCLES = 0;
++enum PERF_COUNT_HW_INSTRUCTIONS = 1;
++enum PERF_COUNT_HW_CACHE_REFERENCES = 2;   // on AMD Zen: L2 requests (last-level reference)
++enum PERF_COUNT_HW_CACHE_MISSES = 3;       // on AMD Zen: L2 misses (last-level miss)
++
++struct PerfEventAttr
++{
++    uint type;
++    uint size;
++    ulong config;
++    ulong samplePeriod;
++    ulong sampleType;
++    ulong readFormat;
++    ulong flags;          // bit 0 disabled, bit 5 exclude_kernel, bit 6 exclude_hv
++    uint wakeupEvents;
++    uint bpType;
++    ulong bpAddr;
++    ulong bpLen;
++    ulong branchSampleType;
++    ulong sampleRegsUser;
++    uint sampleStackUser;
++    int clockid;
++    ulong sampleRegsIntr;
++    uint auxWatermark;
++    ushort sampleMaxStack;
++    ushort reserved2;
++}
++
++struct PerfCounter
++{
++    int fd = -1;
++
++    static PerfCounter open(ulong hwConfig)
++    {
++        PerfEventAttr a;
++        a.type = PERF_TYPE_HARDWARE;
++        a.size = PerfEventAttr.sizeof;
++        a.config = hwConfig;
++        a.flags = (1 << 0) | (1 << 5) | (1 << 6); // disabled, exclude kernel and hypervisor
++        PerfCounter c;
++        c.fd = cast(int) syscall(SYS_perf_event_open, &a, 0, -1, -1, 0);
++        return c;
++    }
++
++    bool ok() const { return fd >= 0; }
++
++    private enum PERF_EVENT_IOC_ENABLE = 0x2400;
++    private enum PERF_EVENT_IOC_DISABLE = 0x2401;
++    private enum PERF_EVENT_IOC_RESET = 0x2403;
++
++    void start()
++    {
++
++        if (fd < 0) return;
++        ioctl(fd, PERF_EVENT_IOC_RESET, 0);
++        ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
++    }
++
++    ulong stop()
++    {
++
++        if (fd < 0) return 0;
++        ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
++        ulong v;
++        read(fd, &v, v.sizeof);
++        return v;
++    }
++
++    void close_()
++    {
++        if (fd >= 0) close(fd);
++        fd = -1;
++    }
++}
++
++version (PerfCountMain)
++{
++    import std.stdio;
++    void main()
++    {
++        auto cm = PerfCounter.open(PERF_COUNT_HW_CACHE_MISSES);
++        auto ci = PerfCounter.open(PERF_COUNT_HW_INSTRUCTIONS);
++        writeln("cache-misses counter ", cm.ok ? "available" : "NOT available", ", instructions ", ci.ok ? "available" : "NOT available");
++        if (!cm.ok) return;
++        auto a = new long[](64 * 1024 * 1024 / 8);
++        cm.start(); ci.start();
++        long s;
++        foreach (i; 0 .. 20_000_000)
++            s += a[(i * 104729UL) % a.length];
++        auto m = cm.stop(); auto n = ci.stop();
++        writeln("sum ", s, " cache-misses ", m, " instructions ", n);
++    }
++}
+diff --git a/bench/thread_exit_race.d b/bench/thread_exit_race.d
+new file mode 100644
+index 0000000..90c53f6
+--- /dev/null
++++ b/bench/thread_exit_race.d
+@@ -0,0 +1,51 @@
++// Threads that start and exit while the collector marks concurrently.
++//
++// The start pause lists every thread's stack and TLS ranges and the mark
++// threads read them after the world restarts. A thread that exits in between
++// takes its stack (and its static TLS, which glibc keeps in the stack mapping)
++// with it. This test keeps collections running with a large pointer-rich live
++// heap and starts and joins short-lived threads all the time.
++//
++//   thread_exit_race [seconds=30] [liveMiB=1024]
++import core.thread : Thread;
++import core.atomic : atomicOp, atomicLoad;
++import core.time;
++import std.conv : to;
++import std.stdio : writefln;
++
++class Node { Node next; Node[] kids; long[6] pad; }
++
++shared size_t threadsRun;
++Node[] tlsData;   // thread-local: lives in the exiting thread's TLS block
++
++void shortLived(uint seed) {
++	// some stack depth and TLS data pointing at the heap
++	Node[64] onStack;
++	foreach (i, ref n; onStack) { n = new Node; n.kids = new Node[](4); }
++	tlsData = onStack[].dup;
++	foreach (k; 0 .. 200) { auto n = new Node; n.next = onStack[k % 64]; onStack[k % 64] = n; }
++	atomicOp!"+="(threadsRun, 1);
++}
++
++void main(string[] args) {
++	auto seconds = args.length > 1 ? args[1].to!int : 30;
++	auto liveMiB = args.length > 2 ? args[2].to!size_t : 1024;
++
++	// a pointer-rich live heap so each mark takes a while
++	auto live = new Node[](liveMiB * 1024 * 1024 / 96);
++	foreach (i, ref n; live) { n = new Node; if (i) n.next = live[i - 1]; }
++
++	auto end = MonoTime.currTime + seconds.seconds;
++	uint seed = 1;
++	size_t churn;
++	while (MonoTime.currTime < end) {
++		Thread[8] ts;
++		foreach (ref t; ts) { auto s = seed++; t = new Thread({ shortLived(s); }); t.start(); }
++		// garbage on the main thread keeps the collector busy
++		foreach (k; 0 .. 20_000) { auto n = new Node; n.kids = new Node[](2); churn += cast(size_t) cast(void*) n & 1; }
++		foreach (t; ts) t.join();
++		// replace part of the live heap
++		foreach (k; 0 .. 2000) live[(seed * 7919 + k) % live.length] = new Node;
++	}
++	writefln("THREAD EXIT RACE OK: %s threads, live %s MiB", atomicLoad(threadsRun), liveMiB);
++}
+-- 
+2.51.0
+

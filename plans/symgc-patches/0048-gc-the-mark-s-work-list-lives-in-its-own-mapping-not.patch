@@ -1,0 +1,216 @@
+From 79ffd5b34927c9393c9ed1b7db34fd7df9556b01 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 20:42:43 -0300
+Subject: [PATCH 48/50] gc: the mark's work list lives in its own mapping, not
+ in the heap
+
+The scanner allocated its work list from the collector's heap and grew it by
+realloc, a quarter more at a time. A concurrent mark frees nothing in the heap
+(a free during the mark is left for the next collection), so every step of the
+growth stayed: 17 reallocations from 512 to 8,192 pages, 50,432 pages (197 MiB)
+of garbage per cycle for a final list of 32 MiB, all of it counted as heap
+growth during the mark. At a 1 GiB scene that was 60,000 of the 70,000 pages the
+heap seemed to grow by, which is what the adaptive hard limit had been built to
+absorb.
+
+On Posix the list is now mapped directly, grown by doubling (a copy of the used
+part), and unmapped when the mark ends or the list is replaced. Windows keeps
+the heap list (untested there).
+
+Trace (Symgc_phase_trace): gcgrowth now also prints the pages added as extents,
+as slabs, grown in place, and freed during the mark.
+
+Measured, entity_init 1 GiB, 60 s, 60 fps: 115 MB/s went from 8-10 frames over
+16 ms and a worst frame of 1.5-1.9 s to none and 13 ms, peak RSS 6.9-7.1 GB to
+6.2-6.4 GB; 11 MB/s from a first mark that waited 0.64 s to a worst frame of
+7 ms. The adaptive limit makes no measurable difference any more.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ source/d/gc/collector.d | 16 +++++++++++++++
+ source/d/gc/page.d      | 28 +++++++++++++++++++++++++
+ source/d/gc/scanner.d   | 45 +++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 0f230ec..7a6ce7e 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -95,6 +95,8 @@ struct DirtyList {
+ version(Symgc_phase_trace) {
+ 	// When the concurrent mark started, for the trace lines.
+ 	__gshared ulong gTraceMarkStart;
++	// Pages added, freed and added as slabs when the mark started.
++	__gshared ulong gTraceAdded0, gTraceFreed0, gTraceSlab0, gTraceGrown0;
+ }
+ 
+ /**
+@@ -882,6 +884,13 @@ private:
+ 
+ 		gMarkStartUsed = usedPages;
+ 		gMarkBlockedAt.store(0);
++		version(Symgc_phase_trace) {
++			import d.gc.page : gTracePagesAdded, gTracePagesFreed, gTraceSlabPages, gTracePagesGrown;
++			gTraceGrown0 = gTracePagesGrown.load();
++			gTraceAdded0 = gTracePagesAdded.load();
++			gTraceFreed0 = gTracePagesFreed.load();
++			gTraceSlab0 = gTraceSlabPages.load();
++		}
+ 	}
+ 
+ 	/**
+@@ -911,6 +920,13 @@ private:
+ 			        cast(size_t) (used > gMarkStartUsed ? used - gMarkStartUsed : 0),
+ 			        cast(double) (now - markStart) / Microsecond,
+ 			        (blockedAt > markStart ? " (a thread waited)" : "").ptr, gMarkGrowthDemand);
++
++			import d.gc.page : gTracePagesAdded, gTracePagesFreed, gTraceSlabPages, gTracePagesGrown;
++			fprintf(stderr, "gcgrowth:   extents added %zu pages (%zu as slabs), grown %zu, freed %zu pages\n",
++			        cast(size_t) (gTracePagesAdded.load() - gTraceAdded0),
++			        cast(size_t) (gTraceSlabPages.load() - gTraceSlab0),
++			        cast(size_t) (gTracePagesGrown.load() - gTraceGrown0),
++			        cast(size_t) (gTracePagesFreed.load() - gTraceFreed0));
+ 		}
+ 	}
+ 
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 63b4266..d06fe41 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -15,6 +15,12 @@ import symgc.intrinsics;
+ import d.gc.time;
+ __gshared ulong[8] gSweepT;
+ 
++version(Symgc_phase_trace) {
++	// Pages given out and taken back since the start, for the trace
++	// (extents: allocated, freed; and how many of the allocated were slabs).
++	shared Atomic!ulong gTracePagesAdded, gTracePagesFreed, gTraceSlabPages, gTracePagesGrown;
++}
++
+ /**
+  * What a thread that helps with the sweep found: nothing to do (no sweep, or
+  * it is over), it did a step, or the work is there but it is not for it now.
+@@ -682,6 +688,12 @@ private:
+ 		version(Symgc_lock_hist) segHist(4, getMonotonicTime() - t2);
+ 
+ 		usedPageCount.fetchAdd(pages);
++		version(Symgc_phase_trace) {
++			gTracePagesAdded.fetchAdd(pages);
++			if (ec.isSlab()) {
++				gTraceSlabPages.fetchAdd(pages);
++			}
++		}
+ 
+ 		auto ptr = block.address + n * PageSize;
+ 		e.at(ptr, pages, block, ec);
+@@ -715,6 +727,13 @@ private:
+ 
+ 		auto npages = pages + extraBlocks * PagesInBlock;
+ 		usedPageCount.fetchAdd(npages);
++		version(Symgc_phase_trace) {
++			gTracePagesGrown.fetchAdd(npages);
++			if (npages >= 256) {
++				import core.stdc.stdio : fprintf, stderr;
++				fprintf(stderr, "gchuge: alloc %u pages\n", npages);
++			}
++		}
+ 
+ 		auto leadSize = extraBlocks * BlockSize;
+ 		auto ptr = block.address - leadSize;
+@@ -774,6 +793,7 @@ private:
+ 		}
+ 
+ 		usedPageCount.fetchSub(e.npages);
++		version(Symgc_phase_trace) gTracePagesFreed.fetchAdd(e.npages);
+ 		unusedExtents.insert(e);
+ 	}
+ 
+@@ -801,6 +821,7 @@ private:
+ 		}
+ 
+ 		usedPageCount.fetchAdd(delta);
++		version(Symgc_phase_trace) gTracePagesGrown.fetchAdd(delta);
+ 		e.growBy(delta);
+ 
+ 		return true;
+@@ -854,6 +875,13 @@ private:
+ 		assert(!dirty, "Huge allocations shouldn't be dirty!");
+ 
+ 		usedPageCount.fetchAdd(delta);
++		version(Symgc_phase_trace) {
++			gTracePagesGrown.fetchAdd(delta);
++			if (delta >= 256) {
++				import core.stdc.stdio : fprintf, stderr;
++				fprintf(stderr, "gchuge: grow by %u pages to %u\n", delta, e.npages + delta);
++			}
++		}
+ 		e.growBy(delta);
+ 
+ 		// Need to commit all pages that were previously uncommitted, but are
+diff --git a/source/d/gc/scanner.d b/source/d/gc/scanner.d
+index 1f57bbf..4cafff9 100644
+--- a/source/d/gc/scanner.d
++++ b/source/d/gc/scanner.d
+@@ -336,7 +336,40 @@ struct ScanningList {
+ 			}
+ 		}
+ 
+-		auto ptr = threadCache.realloc(worklist.ptr, size, false);
++		version(Posix) {
++			/**
++			 * The list does not live in the heap: the collector frees
++			 * nothing in the heap while a concurrent mark runs, so every
++			 * step of the growth (a quarter more each time) stayed until
++			 * the next collection, six times the final size (200 MiB for a
++			 * list of 32 MiB), and the heap seemed to grow by that much.
++			 * A mapping goes back at once, and doubling keeps the copies
++			 * few.
++			 */
++			import d.gc.memmap;
++			import core.stdc.string : memcpy;
++			size = alignUp(max(size, 2 * worklist.length * WorkItem.sizeof),
++			               PageSize);
++
++			auto ptr = pages_map(null, size, PageSize);
++			if (unlikely(ptr is null)) {
++				import core.stdc.stdio : fprintf, stderr;
++				import core.stdc.stdlib : abort;
++				fprintf(stderr, "symgc: cannot map %zu bytes for the mark list\n", size);
++				abort();
++			}
++
++			if (cursor > 0) {
++				memcpy(ptr, worklist.ptr, cursor * WorkItem.sizeof);
++			}
++
++			if (worklist.ptr !is null) {
++				pages_unmap(worklist.ptr, worklist.length * WorkItem.sizeof);
++			}
++		} else {
++			auto ptr = threadCache.realloc(worklist.ptr, size, false);
++		}
++
+ 		worklist = (cast(WorkItem*) ptr)[0 .. size / WorkItem.sizeof];
+ 	}
+ 
+@@ -357,7 +390,15 @@ struct ScanningList {
+ 		assert(activeThreads == 0, "Still running threads!");
+ 
+ 		// We now done, we can free the worklist.
+-		(cast(ThreadCache*)threadCache).free(cast(void*) worklist.ptr);
++		version(Posix) {
++			if (worklist.ptr !is null) {
++				import d.gc.memmap;
++				pages_unmap(cast(void*) worklist.ptr,
++				            worklist.length * WorkItem.sizeof);
++			}
++		} else {
++			(cast(ThreadCache*)threadCache).free(cast(void*) worklist.ptr);
++		}
+ 
+ 		worklist = null;
+ 		threadCache = null;
+-- 
+2.51.0
+
