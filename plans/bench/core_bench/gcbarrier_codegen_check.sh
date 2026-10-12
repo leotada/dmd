@@ -88,7 +88,7 @@ check newWithLiteral   1 0
 check globalElemIdx    0 0   # a global array, indexed
 check throughGlobalPointer 1 0   # PIC and not: the tree is the same shape as a global's address in PIC
 check throughGlobalSlice   1 0
-check closure          2 1   # the frame's fields (stored by the code generator) and the delegate
+check closure          1 1   # the frame field holding a (stored by the code generator; a null field needs none) and the delegate
 
 [ $fail -eq 0 ] && echo "ALL OK" || echo "FAILED"
 exit $fail

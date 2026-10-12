@@ -288,6 +288,9 @@ elem* store(elem* e, bool used)
         if (lhs.Eoper != OPind || isVariableAddress(lhs.E1))
             return e;
 
+        // Storing null cannot hide an object from the collector.
+        if (op == OPeq && e.E2.Eoper == OPconst && typtr(tybasic(e.Ety)) && el_tolong(e.E2) == 0)
+            return e;
 
         paddr = &lhs.E1;
         const ty = tybasic(e.Ety);

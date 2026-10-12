@@ -81,7 +81,15 @@ int main()
     const span = cast(size_t) (hi - lo);
     clear(lo, span);
     fillFields(objs, probe);
-    report("field of 100k objects, every object", marked(lo, span), span / 512, span / 512 + 4);
+    // the footprint is the distinct cards that hold a `next` field (the
+    // allocator's size class decides how far apart the objects are)
+    size_t distinct, lastCard = size_t.max;
+    foreach (o; objs)
+    {
+        const c = (cast(size_t) cast(void*) o + Obj.next.offsetof - __sd_gc_card_lo) >> CardShift;
+        if (c != lastCard) { distinct++; lastCard = c; }
+    }
+    report("field of 100k objects, every object", marked(lo, span), distinct, distinct);
 
     // 3. one object in 64: very few cards
     clear(lo, span);

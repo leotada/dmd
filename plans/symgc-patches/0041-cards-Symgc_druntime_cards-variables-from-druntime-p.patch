@@ -1,0 +1,76 @@
+From 229a8e00fe3ff50faa61f96888b864994e160f88 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 15:01:36 -0300
+Subject: [PATCH] cards: Symgc_druntime_cards (variables from druntime),
+ per-round dirty pages in the phase trace
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ source/d/gc/cards.d     | 24 ++++++++++++++++++++----
+ source/d/gc/collector.d |  6 ++++++
+ 2 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/source/d/gc/cards.d b/source/d/gc/cards.d
+index 298c026..0d83b30 100644
+--- a/source/d/gc/cards.d
++++ b/source/d/gc/cards.d
+@@ -64,11 +64,23 @@ enum CardsPerSummary = size_t(1) << (SummaryShift - CardShift);
+ 
+ /**
+  * What the code the compiler emits loads on each barrier.
++ *
++ * With `-version=Symgc_druntime_cards` the barrier is the compiler's own
++ * (`-preview=gcbarrier`, `core.internal.gc.cardbarrier` in druntime), and the
++ * variables are druntime's: defining them here too would be a duplicate symbol.
++ * druntime's barrier does not mark the summary, so the summary is off.
+  */
+-extern(C) __gshared size_t __sd_gc_card_lo;
+-extern(C) __gshared size_t __sd_gc_card_n;
+-extern(C) __gshared ubyte* __sd_gc_card_base;
+-extern(C) __gshared ubyte* __sd_gc_card_summary_base;
++version(Symgc_druntime_cards) {
++	extern(C) extern __gshared size_t __sd_gc_card_lo;
++	extern(C) extern __gshared size_t __sd_gc_card_n;
++	extern(C) extern __gshared ubyte* __sd_gc_card_base;
++	extern(C) extern __gshared ubyte* __sd_gc_card_summary_base;
++} else {
++	extern(C) __gshared size_t __sd_gc_card_lo;
++	extern(C) __gshared size_t __sd_gc_card_n;
++	extern(C) __gshared ubyte* __sd_gc_card_base;
++	extern(C) __gshared ubyte* __sd_gc_card_summary_base;
++}
+ 
+ // The window is carved in blocks of this many bytes (see d.gc.region).
+ enum WindowGranule = size_t(1) << 30;
+@@ -209,6 +221,10 @@ private __gshared bool gSummaryEnabled = false;
+ private __gshared bool gSummaryChecked = false;
+ 
+ private bool isSummaryEnabled() {
++	version(Symgc_druntime_cards) {
++		return false;
++	}
++
+ 	if (!gSummaryChecked) {
+ 		import core.stdc.stdlib : getenv;
+ 		auto env = getenv("SYMGC_CARD_SUMMARY");
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 533861f..8109246 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -576,6 +576,12 @@ private:
+ 
+ 			rounds++;
+ 
++			version(Symgc_phase_trace) {
++				import core.stdc.stdio : fprintf, stderr;
++				fprintf(stderr, "gcround %u dirty_pages=%zu at %.0f us\n", rounds, lastPages,
++				        cast(double) (getMonotonicTime() - tMark0) / Microsecond);
++			}
++
+ 			// Tracking failed: the remark will mark again from scratch.
+ 			if (!dirtyAvailable()) {
+ 				break;
+-- 
+2.51.0
+

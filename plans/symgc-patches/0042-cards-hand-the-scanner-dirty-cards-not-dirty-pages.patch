@@ -1,0 +1,255 @@
+From 493fb7a8019657f530ab6bde00b456e57d3cb85b Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 15:45:31 -0300
+Subject: [PATCH] cards: hand the scanner dirty cards, not dirty pages
+
+The city of 500k entities writes one pointer in each of very many pages
+(a hash table, pathfinding). Reporting whole pages made the collector
+rescan eight times what the program wrote: rounds took 0.15-1 s, the
+program dirtied more meanwhile, and they never converged (worst frame
+about 2 s with the DMD barrier). collectCards now returns card runs
+and addDirtyRange clips the slots to the requested range; the kernel
+tracker still returns pages. Phase trace also prints cards found and the
+seed/scan time of each round.
+
+500k city, DMD barrier: worst frame 2.05 s -> 8.3 ms, no frame over 16
+ms, rounds 4-5 -> 2-3. LDC cards: 6.9 -> 6.1 ms.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ source/d/gc/cards.d     | 44 +++++++++++++++++++++++++++--------------
+ source/d/gc/collector.d | 31 ++++++++++++++++++++++++-----
+ source/d/gc/scanner.d   | 17 ++++++++++------
+ 3 files changed, 66 insertions(+), 26 deletions(-)
+
+diff --git a/source/d/gc/cards.d b/source/d/gc/cards.d
+index 0d83b30..d51b059 100644
+--- a/source/d/gc/cards.d
++++ b/source/d/gc/cards.d
+@@ -294,10 +294,15 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
+ 	}
+ }
+ 
++version(Symgc_phase_trace) {
++	// Dirty cards found by collectCards, for the phase trace (collector thread only).
++	__gshared size_t gCardsFound;
++}
++
+ /**
+  * Read and clear the cards of [start, start + size), which lies in the window,
+- * calling `dg` with the page aligned runs that cover the dirty ones. Returns
+- * the number of pages.
++ * calling `dg` with the card aligned runs that cover the dirty ones. Returns
++ * the size of the runs in pages, rounded up.
+  */
+ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*, size_t) dg) {
+ 	enum PageSize = 4096;
+@@ -313,13 +318,13 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ 	auto hi = (start + size - windowLo) >> CardShift;
+ 	auto base = __sd_gc_card_base;
+ 
+-	size_t pages = 0;
++	size_t bytes = 0;
+ 	size_t runLo = 0;
+ 	size_t runHi = 0;
+ 
+ 	void flush() {
+ 		if (runLo < runHi) {
+-			pages += (runHi - runLo) / PageSize;
++			bytes += runHi - runLo;
+ 			if (dg !is null) {
+ 				dg(cast(const(void)*) runLo, runHi - runLo);
+ 			}
+@@ -328,16 +333,25 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ 		runLo = runHi = 0;
+ 	}
+ 
+-	void page(size_t pageIndex) {
+-		auto s = windowLo + pageIndex * PageSize;
++	/**
++	 * One dirty card. The runs handed to `dg` are cards, not pages: a program
++	 * that writes one pointer in each of many pages (a hash table, a tree)
++	 * would otherwise make the collector rescan eight times what it wrote.
++	 */
++	void card(size_t cardIndex) {
++		version(Symgc_phase_trace) {
++			gCardsFound++;
++		}
++
++		auto s = windowLo + (cardIndex << CardShift);
+ 		if (s == runHi && runHi != 0) {
+-			runHi = s + PageSize;
++			runHi = s + CardSize;
+ 			return;
+ 		}
+ 
+ 		flush();
+ 		runLo = s;
+-		runHi = s + PageSize;
++		runHi = s + CardSize;
+ 	}
+ 
+ 	// If summary byte tracking is enabled, skip 64 KiB regions via the summary table
+@@ -375,7 +389,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ 					auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
+ 					foreach (j; 0 .. 8) {
+ 						if ((v >> (8 * j)) & 0xff) {
+-							page((i + j) / CardsPerPage);
++							card(i + j);
+ 						}
+ 					}
+ 
+@@ -385,7 +399,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ 
+ 				auto b = cast(shared(ubyte)*) (base + i);
+ 				if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
+-					page(i / CardsPerPage);
++					card(i);
+ 				}
+ 
+ 				i++;
+@@ -397,7 +411,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ 		while (i < hi && (i & 7) != 0) {
+ 			auto b = cast(shared(ubyte)*) (base + i);
+ 			if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
+-				page(i / CardsPerPage);
++				card(i);
+ 			}
+ 			i++;
+ 		}
+@@ -422,7 +436,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ 					auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
+ 					foreach (j; 0 .. 8) {
+ 						if ((v >> (8 * j)) & 0xff) {
+-							page((i + chunk * 8 + j) / CardsPerPage);
++							card(i + chunk * 8 + j);
+ 						}
+ 					}
+ 				}
+@@ -436,7 +450,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ 				auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
+ 				foreach (j; 0 .. 8) {
+ 					if ((v >> (8 * j)) & 0xff) {
+-						page((i + j) / CardsPerPage);
++						card(i + j);
+ 					}
+ 				}
+ 			}
+@@ -446,14 +460,14 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ 		while (i < hi) {
+ 			auto b = cast(shared(ubyte)*) (base + i);
+ 			if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
+-				page(i / CardsPerPage);
++				card(i);
+ 			}
+ 			i++;
+ 		}
+ 	}
+ 
+ 	flush();
+-	return pages;
++	return (bytes + PageSize - 1) / PageSize;
+ }
+ 
+ /**
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 8109246..3a898ed 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -578,8 +578,15 @@ private:
+ 
+ 			version(Symgc_phase_trace) {
+ 				import core.stdc.stdio : fprintf, stderr;
+-				fprintf(stderr, "gcround %u dirty_pages=%zu at %.0f us\n", rounds, lastPages,
+-				        cast(double) (getMonotonicTime() - tMark0) / Microsecond);
++				version(Symgc_cards) {
++					import d.gc.cards : gCardsFound;
++					fprintf(stderr, "gcround %u dirty_pages=%zu cards=%zu at %.0f us\n", rounds, lastPages,
++					        gCardsFound, cast(double) (getMonotonicTime() - tMark0) / Microsecond);
++					gCardsFound = 0;
++				} else {
++					fprintf(stderr, "gcround %u dirty_pages=%zu at %.0f us\n", rounds, lastPages,
++					        cast(double) (getMonotonicTime() - tMark0) / Microsecond);
++				}
+ 			}
+ 
+ 			// Tracking failed: the remark will mark again from scratch.
+@@ -596,9 +603,23 @@ private:
+ 				break;
+ 			}
+ 
+-			markRoundGC(gcCycle, space, (shared(Scanner)* s) {
+-				list.seed(s);
+-			});
++			version(Symgc_phase_trace) {
++				import core.stdc.stdio : fprintf, stderr;
++				ulong seedTime = 0;
++				auto tRound0 = getMonotonicTime();
++				markRoundGC(gcCycle, space, (shared(Scanner)* s) {
++					auto t0 = getMonotonicTime();
++					list.seed(s);
++					seedTime = getMonotonicTime() - t0;
++				});
++				fprintf(stderr, "gcround %u scan: seed %.0f us, total %.0f us\n", rounds,
++				        cast(double) seedTime / Microsecond,
++				        cast(double) (getMonotonicTime() - tRound0) / Microsecond);
++			} else {
++				markRoundGC(gcCycle, space, (shared(Scanner)* s) {
++					list.seed(s);
++				});
++			}
+ 		}
+ 
+ 		ctx.concurrentMark = getMonotonicTime() - tMark0;
+diff --git a/source/d/gc/scanner.d b/source/d/gc/scanner.d
+index 27531ac..125d77c 100644
+--- a/source/d/gc/scanner.d
++++ b/source/d/gc/scanner.d
+@@ -570,14 +570,19 @@ public:
+ 			auto born = e.sweepTag == epoch;
+ 			auto ec = pd.extentClass;
+ 
++			// The part of this page that was asked for: all of it for a
++			// range of pages, a few cards for a range of cards.
++			auto pLo = max(p, cast(size_t) start);
++			auto pHi = min(p + PageSize, end);
++
+ 			if (ec.isLarge()) {
+ 				if (!born && !e.isMarkedLarge(cycle)) {
+ 					continue;
+ 				}
+ 
+ 				size_t eaddr = cast(size_t) e.address;
+-				auto lo = max(p, eaddr);
+-				auto hi = min(p + PageSize, eaddr + e.size);
++				auto lo = max(pLo, eaddr);
++				auto hi = min(pHi, eaddr + e.size);
+ 				if (lo < hi) {
+ 					emit(lo, hi);
+ 				}
+@@ -590,8 +595,8 @@ public:
+ 			size_t slabBase = p - pd.index * PageSize;
+ 			size_t slotSize = bi.slotSize;
+ 
+-			auto first = (p - slabBase) / slotSize;
+-			auto last = min((p + PageSize - 1 - slabBase) / slotSize, bi.nslots - 1);
++			auto first = (pLo - slabBase) / slotSize;
++			auto last = min((pHi - 1 - slabBase) / slotSize, bi.nslots - 1);
+ 
+ 			ulong sparseMarks = 0;
+ 			const(ulong)* denseMarks = null;
+@@ -618,8 +623,8 @@ public:
+ 				}
+ 
+ 				size_t slot = slabBase + index * slotSize;
+-				auto lo = max(p, slot);
+-				auto hi = min(p + PageSize, slot + slotSize);
++				auto lo = max(pLo, slot);
++				auto hi = min(pHi, slot + slotSize);
+ 				if (lo < hi) {
+ 					emit(lo, hi);
+ 				}
+-- 
+2.51.0
+

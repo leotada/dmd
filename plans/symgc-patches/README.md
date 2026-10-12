@@ -1087,3 +1087,22 @@ The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not de
   off Linux x86-64.
 - **Stock GC with a barrier runtime**: `plans/bench/core_bench/card_shim.d` is now three zero globals and an empty
   function (the zero window turns every barrier into a no-op); the shim for the first ABI is `card_shim_v1.d`.
+
+## 12. Item 6 closes: the scanner gets cards, not pages (patches 0041-0042)
+
+- **0041**: `Symgc_druntime_cards` (the four card variables come from druntime's `core.internal.gc.cardbarrier`, so a
+  program built by DMD with `-preview=gcbarrier` and a collector in the same binary share them), and a per-round
+  `gcround` line in the phase trace.
+- **0042**: `collectCards` hands the scanner runs of dirty **cards** (512 bytes); `Scanner.addDirtyRange` clips each slot
+  to the requested range. The kernel tracker still reports whole pages, which the same code handles.
+- **Why**: the 500k city with the DMD barrier stalled the main thread for ~2 s. Each dirty card was one in its page
+  (cards found == pages found in every round after the first), so reporting pages made the collector rescan 8x what
+  the program wrote; a round took 0.15 to 1 s, the program dirtied more in that time, and the rounds
+  (80k, 150k, 250k, 450k pages) never converged while allocators waited on the hard limit. Over-marking was not the
+  cause (`cards_precision` shows DMD and LDC mark the same cards). The first guess, that DMD-compiled symgc scans
+  slowly, was wrong: seeding took 14-70 ms of 160-1,000 ms and the rest is scanning pages.
+- **Evidence** (Linux x86-64): city 500k, DMD with `-preview=gcbarrier`: worst frame 2.05 s -> 8.3 ms, 0 frames over
+  16 ms (was 30), 2-3 rounds instead of 4-5 or more. LDC with cards: worst 6.9 -> 6.1 ms. DMD correctness battery
+  after the change: `mark_race` 9.5M moves and `mark_race_glue` 2.1M moves (8 forms), 0 violations; `finalizer_order`,
+  `phobos_stress`, `thread_exit_race`, `cards_window`, `cards_precision` pass.
+- **Not done**: the 8 GiB stress, the bullet hell and the soak were not re-run after this change.
