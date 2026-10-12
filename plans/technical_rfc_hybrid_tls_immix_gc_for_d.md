@@ -1754,21 +1754,43 @@ With Phase 0 discovery concluded and the empirical goals verified, this section 
 
 The subsequent phases build upon the validated SymGC + LDC Card-Marking architecture to provide full game engine lifecycle controls, hardware optimization, upstream integration, and endurance guarantees:
 
-1. **Step 1 (Active): Game Engine Controls & Frame Telemetry (Profiler APIs)**
-   - Expose first-class game engine telemetry via `core.memory.GC.frameStats()` and `core.memory.GC.FrameStats`, reporting per-frame thread pause time, mutator allocation assist duration, and cycle state directly without scraping internal symbols.
-   - Implement real-time audio/simulation thread exemption (`GC.excludeCurrentThread()` / `GC.includeCurrentThread()`) so dedicated audio mixing threads (e.g. OpenAL, JACK, audio callbacks) never receive STW signals or undergo stack inspection, eliminating audio dropouts/underruns.
-   - Expose frame pacing budget hook (`GC.step(Duration maxTime)`) allowing game engines to donate leftover V-Sync inter-frame idle time to advance background sweeping or concurrent mark stages.
+1. **Step 1 / Opção 1 (Concluído & Verificado — Patch 0034): Game Engine Controls, Real-Time Audio Exemption & Frame Telemetry**
+   - **APIs no Druntime:** Implementada interface `core.gc.gcinterface.GCTelemetry` (ADR-8) e funções públicas em `core.memory.GC`: `GC.frameStats()`, `GC.FrameStats`, `GC.excludeCurrentThread()`, `GC.includeCurrentThread()`, `GC.isThreadExcluded()`, `GC.step(Duration maxTime)`.
+   - **Implementação no SymGC (Patch 0034):** Suporte a `SuspendState.Detached` no `tstate.d` e `symthread.d` filtrando threads de áudio nas pausas STW e scans de stack; telemetria em tempo real no `SnazzyGC` (`gcobj.d`) consultando `Arena.computeUsedPageCount() * PageSize`; varredura cooperativa temporizada `assistSweepTimed` no `collector.d`.
+   - **Evidência Experimental:**
+     - 113 de 113 testes unitários aprovados em `symgc_ut` com código de saída 0.
+     - Teste unitário dedicado `symgc/test/druntime/telemetry.d` aprovado com código 0.
+     - Benchmark real `bullet_hell_telemetry.d` (30s, 512 MiB de mapa, 20.000 projéteis/s, thread de áudio a 1000 Hz): 28.556 ticks de áudio, **0 glitches/underruns de áudio** (máximo tick de 3,4 ms) ao longo de 27 coleções completas; p50 = 694 µs, p99 = 1,17 ms, p99.9 = 1,99 ms, pior frame = 2,99 ms, **0 de 1.800 frames acima de 16,6 ms (100% dos frames a 60 FPS)**; telemetria HUD atualizada instantaneamente a cada frame.
 
-2. **Step 2 (Planned): Precise Heap Scanning (`scanner.d`)**
-   - Integrate D type bitmaps (`RTInfo`) and block `usedCapacity` tracking into `symgc/source/d/gc/scanner.d`.
-   - Restrict pointer scanning to actually live allocated slots and pointer-bearing fields instead of entire blocks, reducing RAM/L3 memory bandwidth consumption during concurrent marking by up to 50%.
+2. **Step 2 / Opção 2 (Em Andamento — Prioridade Imediata): Portabilidade para macOS e Windows (LDC Cards & SymGC Multiplataforma)**
+   - **Objetivo:** Universalizar a barreira de cartões do LDC e o runtime do SymGC para suporte nativo em macOS (Mach-O, Apple Silicon / AArch64 e x86_64) e Windows (PE/COFF x86_64), eliminando a restrição de "Linux-only" do coletor de baixa latência.
+   - **Arquitetura da Barreira LDC:** O passe LLVM `GCCardMarking.cpp` opera diretamente sobre LLVM IR agnóstico de plataforma. Ele emite instruções de deslocamento e gravação em byte (`CardBase[addr >> 9] = 1`), que o LLVM compila otimizadamente para x86_64 e ARM64 em qualquer sistema operacional.
+   - **Tabela de Cartões & Inicialização de Seção Binária (`cards.d`):**
+     - *Linux / BSD (ELF):* Seção `@section(".preinit_array")`. Mapeamento via `mmap` com `MAP_NORESERVE`.
+     - *macOS (Mach-O):* Seção de inicialização do carregador dinâmico dyld `@section("__DATA,__mod_init_func")`. Mapeamento de 256 GiB via `mmap(MAP_PRIVATE | MAP_ANON)` (no Darwin, o kernel aloca páginas sob demanda sem pré-alocação física de swap).
+     - *Windows (PE/COFF):* Tabela de inicializadores da CRT do MSVC `@section(".CRT$XCU")`. Reserva de endereço virtual via `VirtualAlloc(NULL, TableSize, MEM_RESERVE, PAGE_READWRITE)`.
+   - **Gerenciamento de Memória Virtual Multiplataforma (`memmap.d`):**
+     - Generalizar as diretivas `version(linux)` para `version(Posix)` em `pages_map`, `pages_unmap`, `pages_purge` com definições adequadas de `MAP_ANON` e `MADV_DONTNEED`/`MADV_FREE` para macOS Darwin.
+     - No Windows, sincronizar o commit de cartões em `pages_commit`: ao alocar blocos de heap, realizar o `MEM_COMMIT` da faixa correspondente da tabela de cartões (`addr >> CardShift`), garantindo tolerância estrita às cotas de pagefile do subsistema NT.
+   - **Detecção de Topologia de CPU (`cpu.d`):**
+     - Adicionar fallback para macOS e Posix genérico consultando `sysconf(_SC_NPROCESSORS_ONLN)` quando `sched_getaffinity` não estiver disponível.
 
-3. **Step 3 (Planned): Upstream Preparation & Packaging (LDC & SymGC PRs)**
-   - Prepare clean patch series and LLVM FileCheck test suites for upstream submission:
-     - PR to `ldc-developers/ldc` introducing the `-gc-card-marking` pass with coalescing and optional summary byte configuration.
-     - PR to `symmetryinvestments/symgc` upstreaming `latency-p3` concurrency, sweep duty cycle pacing, thread priority tuning, and unrolled 32-card scan.
+3. **Step 3 / Opção 3 (Planejado — Próxima Prioridade): Compactação de Blocos Fragmentados & Expurgo (Immix Defrag Phase)**
+   - **Objetivo:** Mitigar a fragmentação de memória em execuções de longa duração (jogos em sessões de várias horas, servidores web e daemons rodando por dias/semanas), devolvendo páginas físicas ao sistema operacional e consolidando slabs esparsos.
+   - **Detecção de Slabs Fragmentados:** Durante o ciclo de varredura concorrente (`collector.d` / `page.d`), identificar extents/slabs cuja taxa de ocupação ativa de slots caiu abaixo de um limiar crítico (ex.: < 25% de slots vivos).
+   - **Expurgo e Decommit Otimizado (`pages_purge` / `minimize`):**
+     - Slabs completamente vazios devem liberar suas páginas de volta ao OS via `pages_purge` (`madvise(MADV_DONTNEED)` no Posix / `VirtualFree(MEM_DECOMMIT)` no Windows), respeitando o teto de amortecimento `gSweepRetainPages`.
+   - **Fase de Compactação Cooperativa (Immix-style Evacuation):**
+     - Mecanismo cooperativo para evacuar sobreviventes de slabs esparsos durante alocações subsequentes, consolidando objetos vivos em slabs densos e permitindo que slabs antigos sejam liberados e desmapeados integralmente.
+   - **Métricas de Validação:** Execução do teste de estresse de fragmentação `frag` e sessões longas monitorando RSS estável sem vazamentos ou inflação de commit.
 
-4. **Step 4 (Planned): 4–8 GiB Long-Running Soak & Marathon Verification**
-   - Conduct 30–60 minute continuous soak runs of `bullet_hell_stress` and `trigger-rally-d` on 4–8 GiB live heaps with `-version=Symgc_verify` enabled to prove asymptotic zero memory leaks, zero fragmentation decay, and long-session stability.
+4. **Step 4 / Opção 4 (Planejado): Upstream Preparation, Packaging & RFC Formal**
+   - Submissão das alterações do compilador para `ldc-developers/ldc` (flags `-gc-card-marking` e `--gc-card-summary`).
+   - Submissão das otimizações de latência e telemetria para `symmetryinvestments/symgc` (branch `latency-p3`).
+   - Preparação do texto formal do DIP (D Improvement Proposal) para adoção no DMD e runtime oficial do D.
+
+5. **Step 5 / Opção 5 (Planejado): Marathon Soak 4–8 GiB & Endurance Verification**
+   - Execução de 30–60 minutos ininterruptos de `bullet_hell_stress` e simulações complexas (`aaa_sim`) com heaps de 4 a 8 GiB com `-version=Symgc_verify` ativo para garantia empírica de estabilidade de longo prazo.
+
 
 
