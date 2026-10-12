@@ -5,7 +5,7 @@
 // beside it. The stores `e.a = x; e.b = y; ...` are what the barrier
 // clustering of `-preview=gcbarrier` shares one barrier for.
 //
-//   entity_init SECONDS LIVE_MIB [RELINKS_PER_FRAME=200000] [CHURN_PER_FRAME=20000]
+//   entity_init SECONDS LIVE_MIB [RELINKS_PER_FRAME=200000] [CHURN_PER_FRAME=20000] [FPS=60, 0 = unpaced]
 //
 // LIVE_MIB is the size of the scene (do not go past 2048 for this machine).
 // Prints the frame times, and the time per relink in a phase with the
@@ -13,7 +13,8 @@
 import core.memory : GC;
 import core.stdc.stdio : printf;
 import std.conv : to;
-import core.time : MonoTime;
+import core.thread : Thread;
+import core.time : dur, Duration, MonoTime;
 import std.algorithm : sort;
 
 final class Entity
@@ -86,6 +87,10 @@ int main(string[] args)
     const liveMiB = args.length > 2 ? args[2].to!int : 1024;
     const relinks = args.length > 3 ? args[3].to!int : 200_000;
     const churnN = args.length > 4 ? args[4].to!int : 20_000;
+    const fps = args.length > 5 ? args[5].to!int : 60;      // 0: as fast as it goes
+    // (not computed inside the loop: with fps == 0 and -O, a build of dmd divided by zero there
+    // before testing fps > 0, which looks like a division hoisted out of its condition)
+    const frameUs = fps > 0 ? 1_000_000 / fps : 0;
 
     const entityBytes = Entity.classinfo.initializer.length;
     const n = cast(size_t) liveMiB * 1024 * 1024 / (entityBytes + 16);   // + the slot's rounding
@@ -127,8 +132,27 @@ int main(string[] args)
         relinkBatch(relinks);
         churn(churnN);
         times[frames++] = (MonoTime.currTime - f0).total!"usecs";
+        version (EntityInitTrace)
+        {
+            // what the program allocates, to compare with the heap's growth in the collector's trace
+            import core.stdc.stdio : fprintf, stderr;
+            if (frames % 100 == 0)
+                fprintf(stderr, "prog t=%.2f s frames=%zu allocated=%zu MiB\n",
+                        (MonoTime.currTime - t00).total!"msecs" / 1000.0, frames,
+                        frames * churnN * entityBytes / (1024 * 1024));
+        }
         if (times[frames - 1] > 16_000)
             printf("slow frame %zu at %.1f s: %ld us\n", frames, (f0 - t00).total!"msecs" / 1000.0, times[frames - 1]);
+
+        // A game waits for the next frame; a loop that does not runs the program
+        // several times faster than any game would, writes the heap that much
+        // faster, and no collector can keep up with it.
+        if (fps > 0)
+        {
+            const left = (f0 + dur!"usecs"(frameUs)) - MonoTime.currTime;
+            if (left > Duration.zero)
+                Thread.sleep(left);
+        }
     }
     auto ts = times[0 .. frames];
     ts.sort();

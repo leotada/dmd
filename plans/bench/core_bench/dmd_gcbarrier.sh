@@ -29,8 +29,8 @@ build() {
 	local out=$1 file=$2; shift 2
 	$DMD -conf= -I"$REPO/druntime/import" -I"$PHOBOS" -fPIC -O -release -inline -preview=gcbarrier \
 		-version=Symgc_druntime_hooks -version=Symgc_cards -version=Symgc_druntime_cards \
-		-I"$REPO/symgc/source" -defaultlib= "$@" \
-		-of="$out" "$file" $(find "$REPO/symgc/source" -name '*.d') \
+		-I"${SYMGC_SRC:-$REPO/symgc/source}" -defaultlib= "$@" \
+		-of="$out" "$file" $(find "${SYMGC_SRC:-$REPO/symgc/source}" -name '*.d') \
 		"$GCB_PHO/libphobos2.a" -L-L"$GCB_DRT" -L-ldruntime -L-lpthread -L-lm -L-ldl -L-lz
 }
 

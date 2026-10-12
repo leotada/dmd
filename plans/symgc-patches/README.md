@@ -1106,3 +1106,22 @@ The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not de
   after the change: `mark_race` 9.5M moves and `mark_race_glue` 2.1M moves (8 forms), 0 violations; `finalizer_order`,
   `phobos_stress`, `thread_exit_race`, `cards_window`, `cards_precision` pass.
 - **Not done**: the 8 GiB stress, the bullet hell and the soak were not re-run after this change.
+
+## 13. The hard limit follows the mark (patches 0046-0047)
+
+- **0046**: trace lines only (`gcwait`: how far into the mark a thread waited and the heap against the limit).
+- **0047**: the hard limit during a concurrent mark is the target plus an allowance that follows the heap's growth in the
+  last marks (1.5x the largest, extrapolated to the whole mark when a thread had to wait, decaying 25% a cycle), at least a
+  quarter and at most half the target; a program that needs more than half keeps the quarter. `SYMGC_ADAPTIVE_LIMIT=0`
+  restores the fixed limit. Also trace lines `gcgrowth`, `gcworklist` and the heap size in each `gcround`.
+- **Why**: found with the new `entity_init.d` (1 GiB, 10.3M entities with 8 pointers). The mark takes 1-2 s and the
+  heap grows ~280 MB meanwhile, more than the quarter of the target the allocator was given, so the main thread slept at
+  the limit for the rest of every mark: 1-2 s stalls, one per cycle. The program's own allocation explains only about
+  6,000 of the ~70,000 pages; where the rest comes from is not known (not the mark's work list, which peaks at 40 MiB).
+- **Evidence** (Linux x86-64, DMD with the barrier, same binary with and without the knob): 115 MB/s of allocation: stalls
+  10 -> 5-6 per minute, worst 1.55-1.95 s -> 0.9-1.0 s, RSS +5-10%; 11 MB/s: frames over 5 ms 33 -> 3. Unpaced
+  overload (the program rewrites the whole scene every 1.6 s): no gain, and 2.3x the memory without the half-target rule,
+  the same memory with it. Stress 2 and 8 GiB, city 500k, RTS and open world unchanged within noise (run before the
+  half-target rule); unit tests 113/113, `mark_race`, `mark_race_glue`, `finalizer_order`, `thread_exit_race` pass.
+- **Not done**: the first mark after a burst of allocation still waits (no history); the other models were not re-run
+  after the half-target rule; the unexplained growth.

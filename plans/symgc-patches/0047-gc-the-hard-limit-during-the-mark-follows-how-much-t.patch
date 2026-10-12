@@ -1,0 +1,271 @@
+From 43450f9d593acfa6acc95ad9f338703c4109af42 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 19:07:53 -0300
+Subject: [PATCH] gc: the hard limit during the mark follows how much the heap
+ grew in the last marks
+
+A thread that allocates past the hard limit while the mark runs waits for
+the mark. With a heap of 1 GiB and 80M pointers the mark takes 1-2 s and
+the heap grows ~280 MB meanwhile, more than the fixed quarter of the
+target: 1-2 s stalls, one per cycle. The allowance is now 1.5x the largest
+growth of the last marks (extrapolated to the whole mark when a thread had
+to wait; decays 25% a cycle), between a quarter and half the target; a
+program that needs more than half is overloading the mark and keeps the
+quarter. SYMGC_ADAPTIVE_LIMIT=0 turns it off. Trace: gcwait, gcgrowth,
+gcworklist, per-round used pages.
+
+entity_init 1 GiB, 115 MB/s: stalls 10 -> 5-6, worst 1.55-1.95 s -> 0.9-1.0 s,
+RSS +5-10%. At 11 MB/s frames over 5 ms 33 -> 3. Existing models unchanged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ guide/benchmarks.md     | 34 ++++++++++++++++
+ guide/how-it-works.md   | 13 +++++-
+ guide/integration.md    |  1 +
+ source/d/gc/collector.d | 88 +++++++++++++++++++++++++++++++++++++++--
+ source/d/gc/scanner.d   |  7 ++++
+ 5 files changed, 138 insertions(+), 5 deletions(-)
+
+diff --git a/guide/benchmarks.md b/guide/benchmarks.md
+index e49b232..a73bbc4 100644
+--- a/guide/benchmarks.md
++++ b/guide/benchmarks.md
+@@ -185,6 +185,40 @@ the meantime; rounds of 80k, 150k, 250k, 450k pages never converged. The collect
+ bytes), and rounds shrink (7-10k pages, then about 1k). LDC with cards went from 6.9 to 6.1 ms worst at the same
+ time. Not re-run after this change: the 8 GiB stress and the bullet hell in the table above.
+ 
++## Large heaps with many pointers: the hard limit follows the mark
++
++`entity_init.d`: a scene of entities with 8 pointer fields each, 1 GiB (10.3 million entities, 80 million pointers),
++a window of it rewritten every frame, new entities allocated every frame, paced at 60 frames per second. Marking
++such a heap takes one to two seconds (about 1.2 GB/s scanned), and the heap grows by about 70,000 pages (280 MB)
++meanwhile. With the old fixed limit (the target plus a quarter) a thread that allocated past it waited for the
++mark to end:
++
++The same binary with and without the new limit (`SYMGC_ADAPTIVE_LIMIT=0` is the old one), 60 s runs:
++
++| Run | Limit | Frames over 16 ms | Worst frame | Frames over 5 ms | Peak RSS |
++|---|---|---|---|---|---|
++| 1 GiB, 11 MB/s allocation (2,000 entities a frame) | fixed | 1 (first mark, 0.64 s) | 0.64 s | 33 | 1.82 GB |
++| | follows the mark | 1 (the same) | 0.62 s | 3 | 1.79 GB |
++| 1 GiB, 115 MB/s (20,000 entities a frame) | fixed | 10 and 8 (two runs) | 1.55 s, 1.95 s | all (frames take 6 ms) | 6.9-7.1 GB |
++| | follows the mark | 5 and 6 | 0.88 s, 1.04 s | all | 7.5-7.6 GB |
++| 512 MiB unpaced, 40 s (overload, see below) | fixed | 7 | 1.04 s | 36 | 1.76 GB |
++| | follows the mark | 7 and 6 | 1.17 s, 1.18 s | 56, 32 | 1.69-1.74 GB |
++
++At the lower rate the gain is in the tail below the stalls (frames over 5 ms: 33 to 3); at the higher one the stalls
++are fewer and shorter but not gone, and the memory is 5 to 10% larger. The first mark after a burst of allocation,
++such as building the scene, has no history to follow and still waits. The existing models are unchanged within noise
++(DMD with the barrier, one run each, fixed limit against follows the mark, from before the final rule below): stress 2 GiB worst
++1.27 / 1.47 ms, stress 8 GiB 1.85 / 1.91 ms, city 500k 9.7 / 8.8 ms, RTS 7.0 / 4.5 ms, open world 2.1 / 1.7 ms;
++peak RSS equal (RTS 2.5 / 1.8 GB).
++
++**Overload.** Run unpaced (`FPS=0`), the program rewrites the whole scene every 1.6 s, the dirty rounds do not
++converge and the mark takes 9 to 15 s: no collector keeps up with it. There, giving the allocator more room only made
++the heap bigger: 3.9-4.0 GB of RSS against 1.76 GB, with as many stalls. So the allowance is granted only up to half
++the target; when the growth the last marks needed is more than that, the program keeps the quarter. This rule was
++added after that measurement and was checked on this run (memory back to 1.7 GB) and on the 115 MB/s run above,
++but not on the other models. Where the heap's growth during a mark comes from (about 50,000 pages a second at 1 GiB,
++regardless of the program's own allocation, which is about 6,000 pages in the same time) is not explained yet.
++
+ ## Reproducing
+ 
+ ```sh
+diff --git a/guide/how-it-works.md b/guide/how-it-works.md
+index 23a99e8..c066501 100644
+--- a/guide/how-it-works.md
++++ b/guide/how-it-works.md
+@@ -69,9 +69,20 @@ mark threads (2-6)            [ mark ................... ]
+    may therefore read another dead object, which many programs do even though the spec forbids it.
+ 7. **Sweep, paced.** The GC thread returns dead slots to their slabs and slabs to their bins, one block at a time,
+    holding a lock for about 10 µs per step. It runs at most half of the time (`SYMGC_SWEEP_DUTY`). A thread that
+-   allocates while the heap is past 1.25x the target helps with the sweep, so the heap cannot run away. Free pages
++   allocates while the heap is past the hard limit helps with the sweep, so the heap cannot run away. Free pages
+    are kept warm up to the target and returned to the OS in small chunks.
+ 
++**The hard limit during the mark.** A thread that allocates past the hard limit while the mark runs cannot help it
++(the mark is not work an allocator can take); it waits until the mark ends. The limit is the target plus an
++allowance, and a fixed quarter of the target is too little when the mark is long: a heap of a gigabyte, with 10 million
++objects, grows by about 70,000 pages (280 MB) during a mark of one to two seconds, and the program stalled for the
++rest of it. The allowance now follows the growth seen during the last marks: 1.5 times the largest of them, with a
++slow decay, between a quarter and a half of the target. When a thread had to wait, the heap stopped growing at
++that moment, so the growth is scaled up to the whole length of the mark (at most eight times). The first mark after a
++burst of allocation, such as loading a level, has no history and still pays the old limit. A program that would need
++more than half the target is allocating faster than the mark can follow, and more room only makes its heap bigger, so
++it keeps the quarter (`SYMGC_ADAPTIVE_LIMIT=0` turns the whole mechanism off).
++
+ The mark is the algorithm of Boehm, Demers and Shenker ("Mostly parallel garbage collection", PLDI 1991): mark while
+ the program runs, then fix up what it changed. Pauses depend mostly on the number of threads and on how much was
+ written during the last round. Only the remark's read of the card table grows with the heap, slowly (about 0.2 ms
+diff --git a/guide/integration.md b/guide/integration.md
+index dad5786..53c1918 100644
+--- a/guide/integration.md
++++ b/guide/integration.md
+@@ -186,6 +186,7 @@ Environment variables, read at start-up:
+ | `SYMGC_MARK_NICE=n` | 10 | Nice value of the mark threads (Linux) |
+ | `SYMGC_SWEEP_DUTY=n` | 50 | Percent of the time the background sweeper may run |
+ | `SYMGC_SWEEP_NICE=n` | 10 | Nice value of the sweeper (Linux) |
++| `SYMGC_ADAPTIVE_LIMIT=0` | on | Use a fixed hard limit (the target plus a quarter) during the mark, instead of one that follows how much the heap grew in the last marks (`how-it-works.md`) |
+ | `SYMGC_CARD_SUMMARY=1` | off | With cards: also keep a summary byte per 64 KiB (faster remark at 8 GiB, slower stores with many threads) |
+ | `SYMGC_HEAP_RESERVE_GIB=n` | 256 (16 on Android and iOS) | With cards: address space to reserve at start-up for the memory that holds pointers, the most that part of the heap can grow to. The collector halves the request, down to 2 GiB, if the system will not give it |
+ 
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index a131f5f..0f230ec 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -92,6 +92,26 @@ struct DirtyList {
+ 	}
+ }
+ 
++version(Symgc_phase_trace) {
++	// When the concurrent mark started, for the trace lines.
++	__gshared ulong gTraceMarkStart;
++}
++
++/**
++ * How far the heap may grow past the collection target while the mark runs.
++ *
++ * A thread that allocates past the hard limit during a mark waits for it
++ * (`assistSweep`): it cannot help. A fixed quarter of the target is not enough
++ * when the mark is long, as for a heap of a gigabyte or more: the program stalls
++ * for as long as the mark has left. The allowance follows what the heap grew by
++ * during the last marks, as pages. When a thread had to wait, the growth is
++ * cut short by the wait itself, so it is extrapolated to the length of the mark.
++ */
++import d.sync.atomic : Atomic;
++shared Atomic!ulong gMarkBlockedAt;     // when a thread first waited for the mark, 0 if none did
++__gshared size_t gMarkStartUsed;        // pages in use when the mark started
++__gshared size_t gMarkGrowthDemand;     // pages the heap wants to grow by during a mark
++
+ struct Collector {
+ 	ThreadCache* treadCache;
+ 
+@@ -134,9 +154,13 @@ struct Collector {
+ 		 */
+ 		if (gMarkActive.load() != 0) {
+ 			import d.gc.time : sleepMicros;
++			ulong none = 0;
++			gMarkBlockedAt.cas(none, getMonotonicTime());
++
+ 			version(Symgc_phase_trace) {
+ 				import core.stdc.stdio : fprintf, stderr;
+-				fprintf(stderr, "gcwait: mark active, used=%zu pages over hardLimit=%zu pages\n",
++				fprintf(stderr, "gcwait: %.0f us into the mark, used=%zu pages over hardLimit=%zu pages\n",
++				        cast(double) (getMonotonicTime() - gTraceMarkStart) / Microsecond,
+ 				        cast(size_t) Arena.computeUsedPageCount(), cast(size_t) gSweepHardLimit);
+ 			}
+ 
+@@ -564,6 +588,10 @@ private:
+ 
+ 		// 3. The mark, with the program running.
+ 		auto tMark0 = getMonotonicTime();
++		version(Symgc_phase_trace) {
++			gTraceMarkStart = tMark0;
++		}
++
+ 		markEndGC();
+ 
+ 		DirtyList list;
+@@ -586,8 +614,8 @@ private:
+ 				import core.stdc.stdio : fprintf, stderr;
+ 				version(Symgc_cards) {
+ 					import d.gc.cards : gCardsFound;
+-					fprintf(stderr, "gcround %u dirty_pages=%zu cards=%zu at %.0f us\n", rounds, lastPages,
+-					        gCardsFound, cast(double) (getMonotonicTime() - tMark0) / Microsecond);
++					fprintf(stderr, "gcround %u dirty_pages=%zu cards=%zu used=%zu at %.0f us\n", rounds, lastPages,
++					        gCardsFound, cast(size_t) Arena.computeUsedPageCount(), cast(double) (getMonotonicTime() - tMark0) / Microsecond);
+ 					gCardsFound = 0;
+ 				} else {
+ 					fprintf(stderr, "gcround %u dirty_pages=%zu at %.0f us\n", rounds, lastPages,
+@@ -702,6 +730,7 @@ private:
+ 		}
+ 
+ 		gMarkActive.store(0);
++		updateMarkGrowthDemand(tMark0);
+ 
+ 		version(Symgc_druntime_hooks) {
+ 			import core.thread.symthread;
+@@ -829,9 +858,60 @@ private:
+ 			fprintf(stderr, "gcstart used=%zu pages nextTarget=%zu pages\n", usedPages, cast(size_t) target);
+ 		}
+ 
++		// A quarter of the target, or 1.5 times what the heap grew by during
++		// the last marks if that is more, up to half the target. A program
++		// that would need more than that is allocating faster than the mark
++		// can follow: extra room only lets the heap grow (measured: twice
++		// the memory and as many stalls), so it keeps the quarter.
++		__gshared int adaptive = -1;
++		if (adaptive < 0) {
++			import core.stdc.stdlib : getenv;
++			auto env = getenv("SYMGC_ADAPTIVE_LIMIT");
++			adaptive = env !is null && env[0] == '0' ? 0 : 1;
++		}
++
++		auto allowance = target / 4;
++		auto wanted = adaptive ? gMarkGrowthDemand + gMarkGrowthDemand / 2 : 0;
++		if (wanted > allowance && wanted <= target / 2) {
++			allowance = wanted;
++		}
++
+ 		gSweepGrowthLimit = target + target / 8;
+-		gSweepHardLimit = target + target / 4;
++		gSweepHardLimit = target + allowance;
+ 		gSweepRetainPages = target;
++
++		gMarkStartUsed = usedPages;
++		gMarkBlockedAt.store(0);
++	}
++
++	/**
++	 * The mark is over: remember how much the heap grew by while it ran
++	 * (see `gMarkGrowthDemand`). If a thread waited at the hard limit, the heap
++	 * stopped growing then, so the growth is scaled up to the whole mark.
++	 */
++	void updateMarkGrowthDemand(ulong markStart) {
++		auto now = getMonotonicTime();
++		auto used = Arena.computeUsedPageCount();
++		size_t growth = used > gMarkStartUsed ? used - gMarkStartUsed : 0;
++
++		auto blockedAt = gMarkBlockedAt.load();
++		if (blockedAt > markStart) {
++			// Up to eight times: a wait right at the start says little.
++			auto before = max((blockedAt - markStart), (now - markStart) / 8);
++			growth = cast(size_t) (cast(double) growth * (now - markStart) / before);
++		}
++
++		// Remember the larger of this mark and the last ones, forgetting slowly.
++		auto remembered = gMarkGrowthDemand - gMarkGrowthDemand / 4;
++		gMarkGrowthDemand = max(growth, remembered);
++
++		version(Symgc_phase_trace) {
++			import core.stdc.stdio : fprintf, stderr;
++			fprintf(stderr, "gcgrowth: heap grew %zu pages in %.0f us of mark%s, demand now %zu pages\n",
++			        cast(size_t) (used > gMarkStartUsed ? used - gMarkStartUsed : 0),
++			        cast(double) (now - markStart) / Microsecond,
++			        (blockedAt > markStart ? " (a thread waited)" : "").ptr, gMarkGrowthDemand);
++		}
+ 	}
+ 
+ 	/**
+diff --git a/source/d/gc/scanner.d b/source/d/gc/scanner.d
+index 125d77c..1f57bbf 100644
+--- a/source/d/gc/scanner.d
++++ b/source/d/gc/scanner.d
+@@ -329,6 +329,13 @@ struct ScanningList {
+ 			size = getAllocSize(count * WorkItem.sizeof);
+ 		}
+ 
++		version(Symgc_phase_trace) {
++			if (size >= (32 << 20)) {
++				import core.stdc.stdio : fprintf, stderr;
++				fprintf(stderr, "gcworklist grows to %zu MiB (%zu items)\n", size >> 20, size / WorkItem.sizeof);
++			}
++		}
++
+ 		auto ptr = threadCache.realloc(worklist.ptr, size, false);
+ 		worklist = (cast(WorkItem*) ptr)[0 .. size / WorkItem.sizeof];
+ 	}
+-- 
+2.51.0
+
