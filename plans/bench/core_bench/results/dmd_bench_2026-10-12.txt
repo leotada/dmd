@@ -1,0 +1,59 @@
+# 2026-10-12T11:48:56-03:00 6.12.0-160000.38-default governor=powersave epp=power
+# dmd: DMD64 D Compiler v2.113.0-beta.1-1015-g92ac966eeb-dirty
+stress2g.stock.1 | frame_p50_us=178 p99=699 p999=138414 max=138629 over1ms=5 over2ms=4 over5ms=4 over16ms=4 frames=1800 | maxrss_kib=4414832 | rc=0
+stress2g.oneday.1 | frame_p50_us=217 p99=967 p999=1106 max=1265 over1ms=11 over2ms=0 over5ms=0 over16ms=0 frames=1800 | maxrss_kib=3025704 | rc=0
+stress2g.stock.2 | frame_p50_us=177 p99=703 p999=138357 max=140746 over1ms=5 over2ms=4 over5ms=4 over16ms=4 frames=1800 | maxrss_kib=4414832 | rc=0
+stress2g.oneday.2 | frame_p50_us=218 p99=979 p999=1152 max=1185 over1ms=15 over2ms=0 over5ms=0 over16ms=0 frames=1800 | maxrss_kib=3011320 | rc=0
+stress2g.nogc.1 | frame_p50_us=175 p99=801 p999=974 max=982 over1ms=0 over2ms=0 over5ms=0 over16ms=0 frames=1800 | maxrss_kib=4846860 | rc=0
+stress2g.upstream.1 | frame_p50_us=202 p99=987 p999=24711 max=28009 over1ms=15 over2ms=3 over5ms=3 over16ms=3 frames=1800 | maxrss_kib=3019596 | rc=0
+stress2g.stw.1 | frame_p50_us=208 p99=943 p999=10336 max=11105 over1ms=12 over2ms=3 over5ms=3 over16ms=0 frames=1800 | maxrss_kib=3026076 | rc=0
+stress2g.ldc_cards.1 | frame_p50_us=107 p99=629 p999=768 max=871 over1ms=0 over2ms=0 over5ms=0 over16ms=0 frames=1800 | maxrss_kib=3024072 | rc=0
+stress8g.stock.1 | frame_p50_us=177 p99=735 p999=539322 max=548065 over1ms=4 over2ms=2 over5ms=2 over16ms=2 frames=1800 | maxrss_kib=16937836 | rc=0
+stress8g.oneday.1 | frame_p50_us=214 p99=946 p999=1189 max=1222 over1ms=13 over2ms=0 over5ms=0 over16ms=0 frames=1800 | maxrss_kib=11258688 | rc=0
+stress8g.stw.1 | frame_p50_us=208 p99=946 p999=1113 max=35264 over1ms=9 over2ms=1 over5ms=1 over16ms=1 frames=1800 | maxrss_kib=11259544 | rc=0
+stress8g.upstream.1 | frame_p50_us=200 p99=933 p999=1254 max=63638 over1ms=8 over2ms=1 over5ms=1 over16ms=1 frames=1800 | maxrss_kib=10927288 | rc=0
+stress8g.ldc_cards.1 | frame_p50_us=106 p99=640 p999=840 max=844 over1ms=0 over2ms=0 over5ms=0 over16ms=0 frames=1800 | maxrss_kib=11300920 | rc=0
+bh2g.stock.1 | frame_p50_us=1213 p99=1545 p999=1748 max=150897 over1ms=1628 over2ms=1 over5ms=1 over16ms=1 frames=1800 | maxrss_kib=5399164 | rc=0
+bh2g.oneday.1 | frame_p50_us=1479 p99=2526 p999=4045 max=4256 over1ms=1649 over2ms=51 over5ms=0 over16ms=0 frames=1800 | maxrss_kib=3095480 | rc=0
+bh2g.stw.1 | frame_p50_us=1453 p99=2049 p999=13158 max=13338 over1ms=1655 over2ms=18 over5ms=7 over16ms=0 frames=1800 | maxrss_kib=3077884 | rc=0
+bh2g.upstream.1 | frame_p50_us=1450 p99=2107 p999=24499 max=25385 over1ms=1655 over2ms=25 over5ms=7 over16ms=7 frames=1800 | maxrss_kib=3048600 | rc=0
+bh2g.ldc_cards.1 | frame_p50_us=651 p99=985 p999=1235 max=1301 over1ms=16 over2ms=0 over5ms=0 over16ms=0 frames=1800 | maxrss_kib=3077988 | rc=0
+city500k.stock.1 | frame_p50_us=9064 p99=78692 p999=131043 max=137033 over1ms=3600 over2ms=3600 over5ms=3594 over16ms=37 frames=3600 | maxrss_kib=2989796 | rc=0
+city500k.oneday.1 | frame_p50_us=4281 p99=6964 p999=8590 max=9808 over1ms=3600 over2ms=3600 over5ms=482 over16ms=0 frames=3600 | maxrss_kib=3563560 | rc=0
+city500k.upstream.1 | frame_p50_us=3852 p99=97244 p999=106538 max=106830 over1ms=3600 over2ms=3600 over5ms=268 over16ms=40 frames=3600 | maxrss_kib=2833860 | rc=0
+city500k.stock.2 | frame_p50_us=9164 p99=81064 p999=151912 max=192842 over1ms=3600 over2ms=3600 over5ms=3597 over16ms=37 frames=3600 | maxrss_kib=2989704 | rc=0
+city500k.oneday.2 | frame_p50_us=4257 p99=7093 p999=8927 max=9716 over1ms=3600 over2ms=3600 over5ms=438 over16ms=0 frames=3600 | maxrss_kib=3550296 | rc=0
+city500k.upstream.2 | frame_p50_us=3775 p99=97729 p999=109123 max=113269 over1ms=3600 over2ms=3600 over5ms=221 over16ms=40 frames=3600 | maxrss_kib=2834360 | rc=0
+city500k.stw.1 | frame_p50_us=3559 p99=5789 p999=57940 max=60711 over1ms=3600 over2ms=3600 over5ms=167 over16ms=25 frames=3600 | maxrss_kib=3335544 | rc=0
+city500k.ldc_cards.1 | frame_p50_us=3130 p99=4663 p999=5782 max=6865 over1ms=3600 over2ms=3600 over5ms=15 over16ms=0 frames=3600 | maxrss_kib=3082692 | rc=0
+city100k.stock.1 | frame_p50_us=1743 p99=2701 p999=31882 max=40374 over1ms=3526 over2ms=897 over5ms=19 over16ms=18 frames=3600 | maxrss_kib=2499180 | rc=0
+city100k.oneday.1 | frame_p50_us=1127 p99=2062 p999=2729 max=3682 over1ms=2479 over2ms=45 over5ms=0 over16ms=0 frames=3600 | maxrss_kib=2589616 | rc=0
+city100k.stw.1 | frame_p50_us=998 p99=1821 p999=17013 max=17542 over1ms=1785 over2ms=20 over5ms=13 over16ms=10 frames=3600 | maxrss_kib=2567784 | rc=0
+city100k.upstream.1 | frame_p50_us=1124 p99=2074 p999=45018 max=48518 over1ms=2477 over2ms=47 over5ms=14 over16ms=14 frames=3600 | maxrss_kib=2537124 | rc=0
+rts.stock.1 | frame_p50_us=2602 p99=4753 p999=10755 max=13205 over1ms=3152 over2ms=2611 over5ms=33 over16ms=0 frames=3600 | maxrss_kib=2381344 | rc=0
+rts.oneday.1 | frame_p50_us=2445 p99=3421 p999=4128 max=4711 over1ms=3091 over2ms=2594 over5ms=0 over16ms=0 frames=3600 | maxrss_kib=2546292 | rc=0
+rts.stw.1 | frame_p50_us=2244 p99=3328 p999=9820 max=11006 over1ms=2767 over2ms=2497 over5ms=14 over16ms=0 frames=3600 | maxrss_kib=2528560 | rc=0
+rts.upstream.1 | frame_p50_us=2206 p99=3034 p999=33511 max=36855 over1ms=2731 over2ms=2480 over5ms=15 over16ms=14 frames=3600 | maxrss_kib=2504092 | rc=0
+openworld.stock.1 | frame_p50_us=290 p99=466 p999=14862 max=16576 over1ms=7 over2ms=7 over5ms=6 over16ms=2 frames=3600 | maxrss_kib=2512756 | rc=0
+openworld.oneday.1 | frame_p50_us=295 p99=500 p999=637 max=1338 over1ms=1 over2ms=0 over5ms=0 over16ms=0 frames=3600 | maxrss_kib=2787228 | rc=0
+openworld.stw.1 | frame_p50_us=291 p99=496 p999=1896 max=8846 over1ms=4 over2ms=3 over5ms=3 over16ms=0 frames=3600 | maxrss_kib=2784664 | rc=0
+openworld.upstream.1 | frame_p50_us=285 p99=486 p999=639 max=14129 over1ms=3 over2ms=2 over5ms=2 over16ms=0 frames=3600 | maxrss_kib=2771324 | rc=0
+gcb_alloc1t.stock.1 | RESULT workload=alloc seconds=0.4207 mops=20.204 rss_kib=5512 peak_kib=5512 gcs=552 gc_ms=49.9 maxpause_ms=0.93  | maxrss_kib=5212 | rc=0
+gcb_alloc1t.oneday.1 | RESULT workload=alloc seconds=0.5491 mops=15.479 rss_kib=57600 peak_kib=83880 gcs=15 gc_ms=204.4 maxpause_ms=0.34  | maxrss_kib=83880 | rc=0
+gcb_alloc1t.stock.2 | RESULT workload=alloc seconds=0.4344 mops=19.568 rss_kib=5396 peak_kib=5396 gcs=552 gc_ms=52.4 maxpause_ms=0.88  | maxrss_kib=5068 | rc=0
+gcb_alloc1t.oneday.2 | RESULT workload=alloc seconds=0.5640 mops=15.071 rss_kib=57232 peak_kib=83888 gcs=15 gc_ms=220.1 maxpause_ms=0.57  | maxrss_kib=83888 | rc=0
+gcb_alloc1t.stock.3 | RESULT workload=alloc seconds=0.4341 mops=19.579 rss_kib=5600 peak_kib=5600 gcs=552 gc_ms=52.7 maxpause_ms=0.87  | maxrss_kib=5236 | rc=0
+gcb_alloc1t.oneday.3 | RESULT workload=alloc seconds=0.5382 mops=15.794 rss_kib=61700 peak_kib=83712 gcs=15 gc_ms=187.1 maxpause_ms=0.34  | maxrss_kib=83712 | rc=0
+gcb_alloc8t.stock.1 | RESULT workload=alloc seconds=7.9620 mops=4.270 rss_kib=5876 peak_kib=5876 gcs=2277 gc_ms=753.2 maxpause_ms=2.51  | maxrss_kib=5508 | rc=0
+gcb_alloc8t.oneday.1 | RESULT workload=alloc seconds=0.9438 mops=36.023 rss_kib=83908 peak_kib=132616 gcs=45 gc_ms=897.0 maxpause_ms=1.16  | maxrss_kib=132616 | rc=0
+gcb_alloc8t.stock.2 | RESULT workload=alloc seconds=8.0840 mops=4.206 rss_kib=5864 peak_kib=5864 gcs=2279 gc_ms=755.3 maxpause_ms=3.12  | maxrss_kib=5116 | rc=0
+gcb_alloc8t.oneday.2 | RESULT workload=alloc seconds=0.9528 mops=35.686 rss_kib=87984 peak_kib=126288 gcs=46 gc_ms=909.4 maxpause_ms=4.57  | maxrss_kib=126288 | rc=0
+gcb_alloc8t.stock.3 | RESULT workload=alloc seconds=8.0705 mops=4.213 rss_kib=5840 peak_kib=5840 gcs=2279 gc_ms=760.3 maxpause_ms=2.15  | maxrss_kib=5228 | rc=0
+gcb_alloc8t.oneday.3 | RESULT workload=alloc seconds=0.8984 mops=37.845 rss_kib=85380 peak_kib=132164 gcs=47 gc_ms=853.7 maxpause_ms=3.46  | maxrss_kib=132164 | rc=0
+gcb_frag.stock.1 | RESULT workload=frag seconds=2.0591 mops=1.457 rss_kib=1001652 peak_kib=1001652 gcs=33 gc_ms=111.7 maxpause_ms=3.39 steady_rss_kib=1000749 | maxrss_kib=1001312 | rc=0
+gcb_frag.oneday.1 | RESULT workload=frag seconds=3.5751 mops=0.839 rss_kib=900340 peak_kib=900340 gcs=42 gc_ms=2708.3 maxpause_ms=2.46 steady_rss_kib=894873 | maxrss_kib=900160 | rc=0
+gcb_frag.stock.2 | RESULT workload=frag seconds=2.0765 mops=1.445 rss_kib=1001572 peak_kib=1001572 gcs=33 gc_ms=111.4 maxpause_ms=4.07 steady_rss_kib=1000669 | maxrss_kib=1001528 | rc=0
+gcb_frag.oneday.2 | RESULT workload=frag seconds=3.8387 mops=0.782 rss_kib=925280 peak_kib=963860 gcs=42 gc_ms=3073.8 maxpause_ms=3.20 steady_rss_kib=947496 | maxrss_kib=963860 | rc=0
+gcb_frag.stock.3 | RESULT workload=frag seconds=2.1000 mops=1.429 rss_kib=1001568 peak_kib=1001568 gcs=33 gc_ms=114.1 maxpause_ms=4.20 steady_rss_kib=1000665 | maxrss_kib=1001404 | rc=0
+gcb_frag.oneday.3 | RESULT workload=frag seconds=3.8333 mops=0.783 rss_kib=906572 peak_kib=906572 gcs=42 gc_ms=2995.8 maxpause_ms=3.52 steady_rss_kib=900084 | maxrss_kib=906092 | rc=0
+DONE
