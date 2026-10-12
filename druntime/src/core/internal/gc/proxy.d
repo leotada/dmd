@@ -256,6 +256,18 @@ extern (C)
             telem.step(maxTimeHns);
     }
 
+    size_t gc_defrag() nothrow @nogc
+    {
+        import core.gc.gcinterface : GCTelemetry;
+        if (auto telem = () @trusted { return cast(GCTelemetry) instance; }())
+            return telem.defrag();
+        () @trusted {
+            auto fn = cast(void delegate() nothrow @nogc) &instance.minimize;
+            fn();
+        }();
+        return 0;
+    }
+
     void gc_addRoot( void* p ) nothrow @nogc
     {
         return instance.addRoot( p );

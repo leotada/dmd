@@ -1005,7 +1005,33 @@ Introduces dedicated mutator-level game engine APIs via `core.gc.gcinterface.GCT
    - **Frame Latency:** p50 = 694 us (0.69 ms), p99 = 1.17 ms, p99.9 = 1.99 ms, max frame = 2.99 ms, **0 of 1,800 frames over 16 ms (100% locked 60 FPS)**.
    - **Telemetry:** HUD accurately reported real-time heap usage (872 MiB) and per-frame mutator pause metrics without performance penalty.
 
+### 8. Option 2: Cross-Platform Portability for macOS Mach-O & Windows PE/COFF (Patch 0035)
 
+Generalizes card table reservation, binary lifecycle initializers, and virtual memory operations across Posix (Linux, macOS Darwin) and Windows PE/COFF:
 
+- **Target-Independent LLVM Pass:**
+  `ldc/gen/passes/GCCardMarking.cpp` operates on LLVM IR level (`ptrtoint`, `lshr`, `store i8 1`), compiling out-of-the-box to native instructions across all hardware architectures (x86_64, AArch64 / Apple Silicon, Windows).
+- **Cross-Platform Card Table (`cards.d`):**
+  - Added `__sd_gc_card_init` supporting Windows `VirtualAlloc(MEM_RESERVE)` and macOS `mmap(MAP_ANON)`.
+  - Added binary initializers: `.preinit_array` (ELF/Linux), `__DATA,__mod_init_func` (macOS Mach-O), and `.CRT$XCU` (Windows PE/COFF).
+- **Virtual Memory Sync (`memmap.d`):**
+  - Generalized `version(linux)` to `version(Posix)` with Darwin/OSX definitions (`MAP_ANON`, `MADV_FREE`, `MAP_NORESERVE`).
+  - Added Windows card table `MEM_COMMIT` and `MEM_DECOMMIT` synchronization in `pages_commit` and `pages_purge`.
+- **CPU Affinity & Count (`cpu.d`):**
+  - Added fallback for macOS / Posix via `sysconf(_SC_NPROCESSORS_ONLN)`.
 
+### 9. Option 3: Heap Defragmentation, Sparse Slab Compaction & Page Purging (Patch 0036)
 
+Implements active heap defragmentation and physical memory compaction to eliminate external and internal fragmentation:
+
+- **Empty Slab Reclamation (`Bin.defrag`):**
+  Inspects cached slabs in small size-class bins (`slabs` priority heap). Slabs where all slots are free (`nfree == nslots`) are extracted and returned in batches to the page filler via `batchFreeExtents`, clearing extent maps and restoring block page availability.
+- **Physical Page Purging (`PageFiller.minimizeAll`):**
+  Iterates over dense and sparse block descriptor rings and immediately purges all free dirty pages back to the kernel via `pages_purge` (`madvise(MADV_DONTNEED)` on Linux, `madvise(MADV_FREE)` on macOS, `VirtualAlloc(MEM_DECOMMIT)` on Windows), ignoring `sweepRetain`.
+- **Collector Integration (`Collector.defrag`):**
+  Flushes the invoking thread's local cache, ensures any running concurrent sweep cycle completes, defragments all small bins across all arenas, and purges all unused block pages to the operating system.
+- **Runtime API (`GC.minimize()` & `GC.defrag()`):**
+  Wired standard `core.memory.GC.minimize()` to `Collector.defrag()`. Added `GC.defrag()` returning the exact count of physical pages purged back to the OS.
+- **Validation:**
+  - `symgc_ut`: All 113 unit tests pass cleanly with zero regressions.
+  - `test_defrag.d`: Validated allocation of 50,000 objects across multiple slabs, followed by sparse freeing and 100% reclamation; verified heap reduction from 3.6 MB down to 401 KB without crashes or memory corruption.

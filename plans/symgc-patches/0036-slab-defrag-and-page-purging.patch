@@ -1,0 +1,221 @@
+From d71d72add87941269e2dbb03b91d1f9e4615b61e Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 00:42:21 -0300
+Subject: [PATCH] feat(gc): implement heap defragmentation, empty slab
+ compaction and page purging (Option 3)
+
+---
+ source/d/gc/arena.d     | 14 ++++++++++++
+ source/d/gc/bin.d       | 49 +++++++++++++++++++++++++++++++++++++++++
+ source/d/gc/capi.d      |  6 +++++
+ source/d/gc/collector.d | 27 +++++++++++++++++++++++
+ source/d/gc/page.d      | 24 ++++++++++++++++++++
+ source/symgc/gcobj.d    |  8 ++++++-
+ 6 files changed, 127 insertions(+), 1 deletion(-)
+
+diff --git a/source/d/gc/arena.d b/source/d/gc/arena.d
+index 08d69c7..7553755 100644
+--- a/source/d/gc/arena.d
++++ b/source/d/gc/arena.d
+@@ -275,6 +275,20 @@ package:
+ 		return filler.assistSweep(emap);
+ 	}
+ 
++	/**
++	 * Defragment all small bins by returning completely empty slabs to the filler,
++	 * then immediately minimize all blocks by purging free pages back to the OS.
++	 * Returns total number of pages purged back to the OS.
++	 */
++	size_t defrag(ref CachedExtentMap emap) shared {
++		size_t freedSlabs = 0;
++		foreach (i; 0 .. BinCount) {
++			freedSlabs += bins[i].defrag(emap, &filler);
++		}
++
++		return filler.minimizeAll();
++	}
++
+ 	void clearBinsForCollection() shared {
+ 		foreach (i; 0 .. BinCount) {
+ 			bins[i].clearForCollection();
+diff --git a/source/d/gc/bin.d b/source/d/gc/bin.d
+index 88d5408..296b7b8 100644
+--- a/source/d/gc/bin.d
++++ b/source/d/gc/bin.d
+@@ -285,4 +285,53 @@ package:
+ 
+ 		(cast(PriorityExtentHeap*) &slabs).combine(cSlabs);
+ 	}
++
++	/**
++	 * Defragment the bin: inspect all cached slabs in `slabs` heap.
++	 * Slabs that have become completely free (nfree == nslots) are
++	 * removed from the bin and returned to the page filler via `batchFreeExtents`,
++	 * reclaiming the block pages so they can be purged to the OS.
++	 * Returns the number of freed extents.
++	 */
++	size_t defrag(ref CachedExtentMap emap, shared(PageFiller)* filler) shared {
++		Extent*[64] retainBuf = void;
++		size_t retainCount = 0;
++		Extent*[64] freedBuf = void;
++		size_t freedCount = 0;
++
++		{
++			mutex.lock();
++			scope(exit) mutex.unlock();
++
++			auto self = cast(Bin*) &this;
++			auto heap = cast(PriorityExtentHeap*) &slabs;
++			if (heap.empty) {
++				return 0;
++			}
++
++			while (!heap.empty) {
++				auto e = heap.pop();
++				if (e.nfree == e.nslots && freedCount < freedBuf.length) {
++					freedBuf[freedCount++] = e;
++				} else {
++					if (retainCount < retainBuf.length) {
++						retainBuf[retainCount++] = e;
++					} else {
++						heap.insert(e);
++						break;
++					}
++				}
++			}
++
++			foreach (i; 0 .. retainCount) {
++				heap.insert(retainBuf[i]);
++			}
++		}
++
++		if (freedCount > 0) {
++			filler.batchFreeExtents(emap, freedBuf[0 .. freedCount]);
++		}
++
++		return freedCount;
++	}
+ }
+diff --git a/source/d/gc/capi.d b/source/d/gc/capi.d
+index fc8fe2d..1f6de0d 100644
+--- a/source/d/gc/capi.d
++++ b/source/d/gc/capi.d
+@@ -155,3 +155,9 @@ void __sd_gc_step(ulong maxTimeHns) {
+ 	auto collector = Collector(&threadCache);
+ 	collector.assistSweepTimed(maxTimeHns);
+ }
++
++size_t __sd_gc_defrag() {
++	import d.gc.collector;
++	auto collector = Collector(&threadCache);
++	return collector.defrag();
++}
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 861b935..e13596e 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -212,6 +212,33 @@ struct Collector {
+ 		}
+ 	}
+ 
++	/**
++	 * Defragment heap and purge unused physical memory back to the OS:
++	 * 1. Flushes current thread's local cache.
++	 * 2. Waits for any running background sweep to finish.
++	 * 3. Defragments all small bins across all arenas (reclaiming empty slabs).
++	 * 4. Purges all free pages to the OS across all arenas.
++	 * Returns total pages purged to the OS.
++	 */
++	size_t defrag() {
++		threadCache.flush();
++
++		import d.gc.extent : gSweepCycle;
++		while (gSweepCycle.load() != 0) {
++			assistSweep();
++		}
++
++		size_t purgedPages = 0;
++		foreach (i; 0 .. ArenaCount) {
++			auto a = Arena.getIfInitialized(i);
++			if (a !is null) {
++				purgedPages += a.defrag(emap);
++			}
++		}
++
++		return purgedPages;
++	}
++
+ 	void runGCCycle() {
+ 		/**
+ 		 * An explicit collection is synchronous: let a running background
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 6c140b2..509f69c 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -2256,6 +2256,30 @@ private:
+ 		emap.clear(e);
+ 		freePagesImpl(e);
+ 	}
++
++	/**
++	 * Immediately minimize all blocks (dense and sparse) by returning all
++	 * free dirty pages to the OS via pages_purge, ignoring sweepRetain.
++	 * Returns total number of pages purged to the OS.
++	 */
++	package size_t minimizeAll() shared {
++		auto self = cast(PageFiller*) &this;
++		mutex.lock();
++		scope(exit) mutex.unlock();
++		version(Symgc_lock_hist) lastHolder = 6;
++
++		size_t purgedPages = 0;
++		foreach (ring; [&self.denseBlocks, &self.sparseBlocks]) {
++			for (auto r = ring.range; !r.empty; r.popFront()) {
++				auto b = r.front;
++				if (b !is null) {
++					purgedPages += b.minimize();
++				}
++			}
++		}
++
++		return purgedPages;
++	}
+ }
+ 
+ @"allocPages" unittest {
+diff --git a/source/symgc/gcobj.d b/source/symgc/gcobj.d
+index 5a58f7a..5fe71e0 100644
+--- a/source/symgc/gcobj.d
++++ b/source/symgc/gcobj.d
+@@ -34,6 +34,7 @@ extern(C) nothrow {
+ 	void __sd_gc_step(ulong maxTimeHns);
+ 	void __sd_gc_time_thread(ulong* dst);
+ 	void __sd_gc_time_total(ulong* dst);
++	size_t __sd_gc_defrag();
+ 
+ 	// hook prototypes needed for druntime api (see below)
+ 	void* __sd_gc_hook_alloc(size_t size, bool containsPointers, bool zeroData);
+@@ -171,7 +172,7 @@ final class SnazzyGC : GC, GCTelemetry
+ 	 */
+ 	void minimize() nothrow
+ 	{
+-		// Minimization happens on every collect.
++		__sd_gc_defrag();
+ 	}
+ 
+ 	/**
+@@ -420,6 +421,11 @@ final class SnazzyGC : GC, GCTelemetry
+ 		(cast(void function(ulong) nothrow @nogc)&__sd_gc_step)(maxTimeHns);
+ 	}
+ 
++	size_t defrag() @trusted nothrow @nogc
++	{
++		return (cast(size_t function() nothrow @nogc)&__sd_gc_defrag)();
++	}
++
+ 	/**
+ 	 * add p to list of roots
+ 	 */
+-- 
+2.51.0
+

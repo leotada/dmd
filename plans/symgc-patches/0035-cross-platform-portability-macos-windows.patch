@@ -1,0 +1,267 @@
+From 65562ce68547b53328f8217d0a59f18516909188 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 00:27:36 -0300
+Subject: [PATCH] port: cross-platform macOS (Mach-O) and Windows (PE/COFF)
+ card marking and virtual memory
+
+---
+ source/d/gc/cards.d  | 85 +++++++++++++++++++++++++++++++-------------
+ source/d/gc/cpu.d    |  8 +++++
+ source/d/gc/memmap.d | 65 +++++++++++++++++++++++++++------
+ 3 files changed, 124 insertions(+), 34 deletions(-)
+
+diff --git a/source/d/gc/cards.d b/source/d/gc/cards.d
+index 5b5092a..19d7cac 100644
+--- a/source/d/gc/cards.d
++++ b/source/d/gc/cards.d
+@@ -19,7 +19,21 @@ module d.gc.cards;
+  */
+ 
+ 
+-import core.sys.posix.sys.mman;
++version(Windows) {
++	import core.sys.windows.winbase : VirtualAlloc, MEM_RESERVE, MEM_COMMIT, PAGE_READWRITE;
++} else version(Posix) {
++	version(linux) {
++		import core.sys.linux.sys.mman;
++		enum MAP_NORESERVE = 0x4000;
++	} else version(OSX) {
++		import core.sys.darwin.sys.mman;
++		enum MAP_NORESERVE = 0;
++		enum MAP_ANONYMOUS = MAP_ANON;
++	} else {
++		import core.sys.posix.sys.mman;
++		enum MAP_NORESERVE = 0x4000;
++	}
++}
+ import core.atomic;
+ 
+ enum CardShift = 9;
+@@ -45,35 +59,52 @@ extern(C) __gshared ubyte* __sd_gc_card_summary_base;
+ /**
+  * Mapped before any code that stores a pointer runs, not lazily. The
+  * constructors of the program run in no defined order, so this goes in
+- * `.preinit_array`, which the dynamic loader runs before all of them.
++ * `.preinit_array` (Linux/ELF), `__DATA,__mod_init_func` (macOS), or
++ * `.CRT$XCU` (Windows), which the dynamic loader runs before all of them.
+  */
+ extern(C) void __sd_gc_card_init() {
+ 	if (__sd_gc_card_base !is null) {
+ 		return;
+ 	}
+ 
+-	enum NoReserve = 0x4000; // MAP_NORESERVE on Linux
+-	auto q = mmap(null, SummarySize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | NoReserve, -1, 0);
+-	if (q is MAP_FAILED) {
+-		import core.stdc.stdio : fputs, stderr;
+-		import core.stdc.stdlib : abort;
+-		fputs("symgc: cannot map the card summary\n", stderr);
+-		abort();
+-	}
+-
+-	__sd_gc_card_summary_base = cast(ubyte*) q;
+-
+-	enum MAP_NORESERVE = 0x4000; // Linux
+-	enum Flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+-	auto p = mmap(null, TableSize, PROT_READ | PROT_WRITE, Flags, -1, 0);
+-	if (p is MAP_FAILED) {
+-		import core.stdc.stdio : fputs, stderr;
+-		import core.stdc.stdlib : abort;
+-		fputs("symgc: cannot map the card table\n", stderr);
+-		abort();
++	version(Windows) {
++		auto q = VirtualAlloc(null, SummarySize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++		if (q is null) {
++			import core.stdc.stdio : fputs, stderr;
++			import core.stdc.stdlib : abort;
++			fputs("symgc: cannot map the card summary\n", stderr);
++			abort();
++		}
++		__sd_gc_card_summary_base = cast(ubyte*) q;
++
++		auto p = VirtualAlloc(null, TableSize, MEM_RESERVE, PAGE_READWRITE);
++		if (p is null) {
++			import core.stdc.stdio : fputs, stderr;
++			import core.stdc.stdlib : abort;
++			fputs("symgc: cannot map the card table\n", stderr);
++			abort();
++		}
++		__sd_gc_card_base = cast(ubyte*) p;
++	} else version(Posix) {
++		enum Flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
++		auto q = mmap(null, SummarySize, PROT_READ | PROT_WRITE, Flags, -1, 0);
++		if (q is MAP_FAILED) {
++			import core.stdc.stdio : fputs, stderr;
++			import core.stdc.stdlib : abort;
++			fputs("symgc: cannot map the card summary\n", stderr);
++			abort();
++		}
++		__sd_gc_card_summary_base = cast(ubyte*) q;
++
++		auto p = mmap(null, TableSize, PROT_READ | PROT_WRITE, Flags, -1, 0);
++		if (p is MAP_FAILED) {
++			import core.stdc.stdio : fputs, stderr;
++			import core.stdc.stdlib : abort;
++			fputs("symgc: cannot map the card table\n", stderr);
++			abort();
++		}
++		__sd_gc_card_base = cast(ubyte*) p;
+ 	}
+-
+-	__sd_gc_card_base = cast(ubyte*) p;
+ }
+ 
+ private __gshared bool gSummaryEnabled = false;
+@@ -301,5 +332,11 @@ void clearCards(size_t start, size_t size) {
+ version(LDC) {
+ 	import ldc.attributes : section;
+ 
+-	@section(".preinit_array") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
++	version(Windows) {
++		@section(".CRT$XCU") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
++	} else version(OSX) {
++		@section("__DATA,__mod_init_func") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
++	} else {
++		@section(".preinit_array") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
++	}
+ }
+diff --git a/source/d/gc/cpu.d b/source/d/gc/cpu.d
+index 503a2e0..58206e1 100644
+--- a/source/d/gc/cpu.d
++++ b/source/d/gc/cpu.d
+@@ -23,6 +23,14 @@ auto computeCoreCount() {
+ 		import core.cpuid;
+ 		return threadsPerCPU();
+ 	}
++	else version(Posix) {
++		import core.sys.posix.unistd : sysconf, _SC_NPROCESSORS_ONLN;
++		auto count = sysconf(_SC_NPROCESSORS_ONLN);
++		return count > 0 ? cast(uint) count : 1;
++	}
++	else {
++		return 1;
++	}
+ }
+ 
+ @"getCoreCount" unittest {
+diff --git a/source/d/gc/memmap.d b/source/d/gc/memmap.d
+index 6252dd9..3c9881b 100644
+--- a/source/d/gc/memmap.d
++++ b/source/d/gc/memmap.d
+@@ -3,11 +3,19 @@ module d.gc.memmap;
+ import d.gc.spec;
+ import d.gc.util;
+ 
+-version(linux) {
+-	import core.sys.linux.sys.mman;
+-
+-	// not included in druntime for some reason
+-	enum MADV_FREE = 8;
++version(Posix) {
++	version(linux) {
++		import core.sys.linux.sys.mman;
++		enum MADV_FREE = 8;
++	} else version(OSX) {
++		import core.sys.darwin.sys.mman;
++		enum MAP_NORESERVE = 0;
++		enum MAP_ANONYMOUS = MAP_ANON;
++		enum MADV_FREE = 5;
++	} else {
++		import core.sys.posix.sys.mman;
++		enum MAP_NORESERVE = 0x4000;
++	}
+ }
+ else version(Windows) {
+ 	import core.sys.windows.winbase;
+@@ -98,17 +106,39 @@ void pages_commit(void* addr, size_t size) {
+ 		auto ret = VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE);
+ 		if (ret !is null) {
+ 			assert(ret is addr, "MEM_COMMIT moved alloction!");
++			version(Symgc_cards) {
++				import d.gc.cards : __sd_gc_card_base, CardShift;
++				if (__sd_gc_card_base !is null) {
++					size_t cardOffset = (cast(size_t) addr) >> CardShift;
++					size_t cardBytes = (size >> CardShift);
++					if (cardBytes == 0) cardBytes = 1;
++					size_t alignedOffset = cardOffset & ~4095UL;
++					size_t alignedBytes = ((cardOffset + cardBytes + 4095UL) & ~4095UL) - alignedOffset;
++					VirtualAlloc(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_COMMIT, PAGE_READWRITE);
++				}
++			}
+ 			return;
+ 		}
+ 
+ 		if (applyPerReservation(VmOp.commit, addr, size)) {
++			version(Symgc_cards) {
++				import d.gc.cards : __sd_gc_card_base, CardShift;
++				if (__sd_gc_card_base !is null) {
++					size_t cardOffset = (cast(size_t) addr) >> CardShift;
++					size_t cardBytes = (size >> CardShift);
++					if (cardBytes == 0) cardBytes = 1;
++					size_t alignedOffset = cardOffset & ~4095UL;
++					size_t alignedBytes = ((cardOffset + cardBytes + 4095UL) & ~4095UL) - alignedOffset;
++					VirtualAlloc(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_COMMIT, PAGE_READWRITE);
++				}
++			}
+ 			return;
+ 		}
+ 
+ 		reportVmFailure("MEM_COMMIT", addr, size);
+ 		assert(false, "Could not commit memory!");
+ 	}
+-	// linux does not need explicit commit
++	// Posix does not need explicit commit
+ }
+ 
+ version(Windows) {
+@@ -263,7 +293,7 @@ version(Windows)
+ }
+ 
+ void pages_unmap(void* addr, size_t size) {
+-	version(linux) {
++	version(Posix) {
+ 		auto ret = munmap(addr, size);
+ 		assert(ret == 0, "munmap failed!");
+ 	}
+@@ -274,10 +304,25 @@ void pages_unmap(void* addr, size_t size) {
+ }
+ 
+ void pages_purge(void* addr, size_t size) {
+-	version(linux) {
++	version(Posix) {
+ 		auto ret = madvise(addr, size, MADV_DONTNEED);
+ 		assert(ret == 0, "madvise failed!");
+ 	} else version(Windows) {
++		version(Symgc_cards) {
++			import d.gc.cards : __sd_gc_card_base, CardShift;
++			if (__sd_gc_card_base !is null) {
++				size_t cardOffset = (cast(size_t) addr) >> CardShift;
++				size_t cardBytes = (size >> CardShift);
++				if (cardBytes > 0) {
++					size_t alignedOffset = cardOffset & ~4095UL;
++					size_t alignedBytes = (cardBytes & ~4095UL);
++					if (alignedBytes > 0) {
++						VirtualFree(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_DECOMMIT);
++					}
++				}
++			}
++		}
++
+ 		/**
+ 		 * This used to discard the result. A decommit that straddles two
+ 		 * reservations fails with ERROR_INVALID_PARAMETER and leaves the pages
+@@ -410,9 +455,9 @@ void* os_pages_map(void* addr, size_t size, size_t alignment) {
+ 	assert(isAligned(addr, alignment), "Invalid addr!");
+ 	assert(size > 0 && isAligned(size, PageSize), "Invalid size!");
+ 
+-	version(linux) {
++	version(Posix) {
+ 		enum PagesFDTag = -1;
+-		enum MMapFlags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
++		enum MMapFlags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+ 
+ 		auto ret =
+ 			mmap(addr, size, PROT_READ | PROT_WRITE, MMapFlags, PagesFDTag, 0);
+-- 
+2.51.0
+

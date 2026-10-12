@@ -312,4 +312,5 @@ interface GCTelemetry
     void includeCurrentThread() nothrow @nogc;
     bool isThreadExcluded() nothrow @nogc;
     void step(ulong maxTimeHns) nothrow @nogc;
+    size_t defrag() nothrow @nogc;
 }

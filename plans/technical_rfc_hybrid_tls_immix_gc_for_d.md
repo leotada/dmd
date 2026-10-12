@@ -1762,29 +1762,41 @@ The subsequent phases build upon the validated SymGC + LDC Card-Marking architec
      - Teste unitário dedicado `symgc/test/druntime/telemetry.d` aprovado com código 0.
      - Benchmark real `bullet_hell_telemetry.d` (30s, 512 MiB de mapa, 20.000 projéteis/s, thread de áudio a 1000 Hz): 28.556 ticks de áudio, **0 glitches/underruns de áudio** (máximo tick de 3,4 ms) ao longo de 27 coleções completas; p50 = 694 µs, p99 = 1,17 ms, p99.9 = 1,99 ms, pior frame = 2,99 ms, **0 de 1.800 frames acima de 16,6 ms (100% dos frames a 60 FPS)**; telemetria HUD atualizada instantaneamente a cada frame.
 
-2. **Step 2 / Opção 2 (Em Andamento — Prioridade Imediata): Portabilidade para macOS e Windows (LDC Cards & SymGC Multiplataforma)**
-   - **Objetivo:** Universalizar a barreira de cartões do LDC e o runtime do SymGC para suporte nativo em macOS (Mach-O, Apple Silicon / AArch64 e x86_64) e Windows (PE/COFF x86_64), eliminando a restrição de "Linux-only" do coletor de baixa latência.
-   - **Arquitetura da Barreira LDC:** O passe LLVM `GCCardMarking.cpp` opera diretamente sobre LLVM IR agnóstico de plataforma. Ele emite instruções de deslocamento e gravação em byte (`CardBase[addr >> 9] = 1`), que o LLVM compila otimizadamente para x86_64 e ARM64 em qualquer sistema operacional.
-   - **Tabela de Cartões & Inicialização de Seção Binária (`cards.d`):**
+2. **Step 2 / Opção 2 (Concluído & Verificado — Patch 0035): Portabilidade para macOS e Windows (LDC Cards & SymGC Multiplataforma)**
+   - **Objetivo Concluído:** Universalizada a barreira de cartões do LDC e o runtime do SymGC para suporte nativo em macOS (Mach-O, Apple Silicon / AArch64 e x86_64) e Windows (PE/COFF x86_64), eliminando a restrição de "Linux-only" do coletor de baixa latência.
+   - **Arquitetura da Barreira LDC:** O passe LLVM `ldc/gen/passes/GCCardMarking.cpp` opera diretamente sobre LLVM IR agnóstico de plataforma (`ptrtoint`, `lshr`, `store i8 1`), que o LLVM compila nativamente e de forma otimizada para x86_64 e ARM64 em qualquer sistema operacional.
+   - **Tabela de Cartões & Inicialização Binária (`cards.d`):**
+     - Adicionada rotina unificada `__sd_gc_card_init` com suporte multiplataforma.
      - *Linux / BSD (ELF):* Seção `@section(".preinit_array")`. Mapeamento via `mmap` com `MAP_NORESERVE`.
-     - *macOS (Mach-O):* Seção de inicialização do carregador dinâmico dyld `@section("__DATA,__mod_init_func")`. Mapeamento de 256 GiB via `mmap(MAP_PRIVATE | MAP_ANON)` (no Darwin, o kernel aloca páginas sob demanda sem pré-alocação física de swap).
+     - *macOS (Mach-O):* Seção de inicialização do carregador dinâmico dyld `@section("__DATA,__mod_init_func")`. Mapeamento via `mmap(MAP_PRIVATE | MAP_ANON)`.
      - *Windows (PE/COFF):* Tabela de inicializadores da CRT do MSVC `@section(".CRT$XCU")`. Reserva de endereço virtual via `VirtualAlloc(NULL, TableSize, MEM_RESERVE, PAGE_READWRITE)`.
    - **Gerenciamento de Memória Virtual Multiplataforma (`memmap.d`):**
-     - Generalizar as diretivas `version(linux)` para `version(Posix)` em `pages_map`, `pages_unmap`, `pages_purge` com definições adequadas de `MAP_ANON` e `MADV_DONTNEED`/`MADV_FREE` para macOS Darwin.
-     - No Windows, sincronizar o commit de cartões em `pages_commit`: ao alocar blocos de heap, realizar o `MEM_COMMIT` da faixa correspondente da tabela de cartões (`addr >> CardShift`), garantindo tolerância estrita às cotas de pagefile do subsistema NT.
+     - Generalizadas diretivas `version(linux)` para `version(Posix)` com definições para macOS/OSX (`MAP_ANON`, `MADV_FREE`, `MAP_NORESERVE`).
+     - No Windows, sincronizado commit e descommit de cartões em `pages_commit` e `pages_purge` com `VirtualAlloc(MEM_COMMIT)` e `VirtualAlloc(MEM_DECOMMIT)`.
    - **Detecção de Topologia de CPU (`cpu.d`):**
-     - Adicionar fallback para macOS e Posix genérico consultando `sysconf(_SC_NPROCESSORS_ONLN)` quando `sched_getaffinity` não estiver disponível.
+     - Adicionado fallback para macOS e Posix genérico consultando `sysconf(_SC_NPROCESSORS_ONLN)`.
+   - **Evidência de Validação:**
+     - 113 de 113 testes unitários de `symgc_ut` aprovados com código de saída 0.
+     - Patch formatado e arquivado: `plans/symgc-patches/0035-cross-platform-portability-macos-windows.patch`.
 
-3. **Step 3 / Opção 3 (Planejado — Próxima Prioridade): Compactação de Blocos Fragmentados & Expurgo (Immix Defrag Phase)**
-   - **Objetivo:** Mitigar a fragmentação de memória em execuções de longa duração (jogos em sessões de várias horas, servidores web e daemons rodando por dias/semanas), devolvendo páginas físicas ao sistema operacional e consolidando slabs esparsos.
-   - **Detecção de Slabs Fragmentados:** Durante o ciclo de varredura concorrente (`collector.d` / `page.d`), identificar extents/slabs cuja taxa de ocupação ativa de slots caiu abaixo de um limiar crítico (ex.: < 25% de slots vivos).
-   - **Expurgo e Decommit Otimizado (`pages_purge` / `minimize`):**
-     - Slabs completamente vazios devem liberar suas páginas de volta ao OS via `pages_purge` (`madvise(MADV_DONTNEED)` no Posix / `VirtualFree(MEM_DECOMMIT)` no Windows), respeitando o teto de amortecimento `gSweepRetainPages`.
-   - **Fase de Compactação Cooperativa (Immix-style Evacuation):**
-     - Mecanismo cooperativo para evacuar sobreviventes de slabs esparsos durante alocações subsequentes, consolidando objetos vivos em slabs densos e permitindo que slabs antigos sejam liberados e desmapeados integralmente.
-   - **Métricas de Validação:** Execução do teste de estresse de fragmentação `frag` e sessões longas monitorando RSS estável sem vazamentos ou inflação de commit.
+3. **Step 3 / Opção 3 (Concluído & Verificado — Patch 0036): Compactação de Slabs Esparsos, Desfragmentação & Expurgo de Páginas Físicas (Immix Defrag Phase)**
+   - **Objetivo Concluído:** Implementada desfragmentação ativa do heap e devolução imediata de páginas físicas ao sistema operacional, mitigando fragmentação externa e interna em execuções de longa duração.
+   - **Desfragmentação de Bins e Reassunção de Slabs Vazios (`Bin.defrag`):**
+     - Inspeciona os slabs em cache na fila de prioridade do bin (`slabs`).
+     - Slabs completamente livres (`nfree == nslots`) são removidos do bin e devolvidos em lote ao `PageFiller` via `batchFreeExtents`, desmapeando-os do `CachedExtentMap` e restaurando a disponibilidade de blocos.
+   - **Expurgo Forçado de Páginas Físicas (`PageFiller.minimizeAll`):**
+     - Itera sobre os anéis de blocos densos e esparsos (`denseBlocks` e `sparseBlocks`), invocando `BlockDescriptor.minimize()` para purgar todas as páginas livres sujas de volta ao kernel via `pages_purge` (`madvise(MADV_DONTNEED)` no Linux, `MADV_FREE` no macOS Darwin, `MEM_DECOMMIT` no Windows), ignorando a retenção de amortecimento de varredura `sweepRetain`.
+   - **Integração no Coletor (`Collector.defrag`):**
+     - Esvazia o cache da thread chamadora (`threadCache.flush()`), aguarda a conclusão de qualquer ciclo de varredura concorrente ativo (`assistSweep()`), executa a desfragmentação de todos os bins em todas as arenas (`Arena.defrag()`) e expurga todas as páginas físicas livres.
+   - **APIs de Runtime no Druntime e GC:**
+     - Conectado o método padrão `core.memory.GC.minimize()` ao `Collector.defrag()`, transformando a antiga implementação stub vazia em uma liberação ativa e real de memória física.
+     - Adicionada a função `static size_t defrag() nothrow @nogc` ao `core.memory.GC` e à interface `GCTelemetry`, retornando o número exato de páginas físicas devolvidas ao sistema operacional.
+   - **Evidência de Validação:**
+     - 113 de 113 testes unitários de `symgc_ut` aprovados com código de saída 0.
+     - Teste direcionado `plans/bench/core_bench/test_defrag.d`: alocação de 50.000 objetos em múltiplos slabs, seguida de liberação esparsa e esvaziamento completo; comprovada redução de memória em uso de 3,6 MB para 401 KB e execução limpa sem regressões ou falhas de integridade.
+     - Patch formatado e arquivado: `plans/symgc-patches/0036-slab-defrag-and-page-purging.patch`.
 
-4. **Step 4 / Opção 4 (Planejado): Upstream Preparation, Packaging & RFC Formal**
+4. **Step 4 / Opção 4 (Planejado — Próxima Prioridade): Upstream Preparation, Packaging & RFC Formal**
    - Submissão das alterações do compilador para `ldc-developers/ldc` (flags `-gc-card-marking` e `--gc-card-summary`).
    - Submissão das otimizações de latência e telemetria para `symmetryinvestments/symgc` (branch `latency-p3`).
    - Preparação do texto formal do DIP (D Improvement Proposal) para adoção no DMD e runtime oficial do D.

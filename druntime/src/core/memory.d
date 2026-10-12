@@ -144,6 +144,7 @@ private
     extern (C) void gc_includeCurrentThread ( ) nothrow @nogc;
     extern (C) bool gc_isThreadExcluded ( ) nothrow @nogc;
     extern (C) void gc_step ( ulong maxTimeHns ) nothrow @nogc;
+    extern (C) size_t gc_defrag ( ) nothrow @nogc;
 }
 
 version (CoreDdoc)
@@ -949,6 +950,17 @@ extern(D):
         if (__traits(hasMember, T, "total"))
     {
         gc_step(maxTime.total!"hnsecs");
+    }
+
+    /**
+     * Defragments small allocation slabs, returns completely empty slabs to the OS,
+     * and purges unused physical pages back to the kernel.
+     * Returns:
+     *   The total number of physical pages purged back to the OS.
+     */
+    static size_t defrag() nothrow @nogc
+    {
+        return gc_defrag();
     }
 
 extern(C):
