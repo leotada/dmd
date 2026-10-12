@@ -1,0 +1,32 @@
+From 2e2b48650c50e7c72565b899f0c208bd598b110c Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 18:09:52 -0300
+Subject: [PATCH] trace: print the heap against the hard limit when a thread
+ waits for the mark
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ source/d/gc/collector.d | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index 3a898ed..a131f5f 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -134,6 +134,12 @@ struct Collector {
+ 		 */
+ 		if (gMarkActive.load() != 0) {
+ 			import d.gc.time : sleepMicros;
++			version(Symgc_phase_trace) {
++				import core.stdc.stdio : fprintf, stderr;
++				fprintf(stderr, "gcwait: mark active, used=%zu pages over hardLimit=%zu pages\n",
++				        cast(size_t) Arena.computeUsedPageCount(), cast(size_t) gSweepHardLimit);
++			}
++
+ 			while (gMarkActive.load() != 0 && Arena.computeUsedPageCount() > gSweepHardLimit) {
+ 				sleepMicros(100);
+ 			}
+-- 
+2.51.0
+

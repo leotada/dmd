@@ -127,6 +127,8 @@ int main(string[] args)
         relinkBatch(relinks);
         churn(churnN);
         times[frames++] = (MonoTime.currTime - f0).total!"usecs";
+        if (times[frames - 1] > 16_000)
+            printf("slow frame %zu at %.1f s: %ld us\n", frames, (f0 - t00).total!"msecs" / 1000.0, times[frames - 1]);
     }
     auto ts = times[0 .. frames];
     ts.sort();
