@@ -1,0 +1,178 @@
+From 7737c74834ae69e657de984fe5cce1a00cc9b012 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 16:40:47 -0300
+Subject: [PATCH] docs: guide for DMD with -preview=gcbarrier, card-granular
+ rounds
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ guide/benchmarks.md   | 27 ++++++++++++++++++++++++++
+ guide/how-it-works.md |  4 +++-
+ guide/integration.md  | 45 +++++++++++++++++++++++++++++++++++++++++++
+ guide/platforms.md    |  8 ++++++--
+ guide/testing.md      |  6 ++++++
+ 5 files changed, 87 insertions(+), 3 deletions(-)
+
+diff --git a/guide/benchmarks.md b/guide/benchmarks.md
+index 95ce1ad..d15a300 100644
+--- a/guide/benchmarks.md
++++ b/guide/benchmarks.md
+@@ -149,6 +149,33 @@ On real workloads, run back to back in the same session (LDC + cards), the check
+ against 0.91-0.97 ms (and one 8.5 ms outlier in the unchecked runs); 500k city p50 2.68-2.95 ms against 2.86-3.06 ms,
+ worst 7.3-8.3 ms against 8.3-8.4 ms; no frame over 16 ms in any run.
+ 
++## DMD with `-preview=gcbarrier`
++
++Same machine, DMD -O -release -inline, druntime and Phobos built with the flag (`integration.md`, section 4).
++
++**Cost per store** (`barrier_micro.d`, pinned, medians of five): a pointer store pays +0.9 to +1.4 ns and a short
++pointer copy +2.3 ns, because the barrier is a call (DMD has no inline expansion of it yet; LDC's costs 0 to 0.5 ns).
++Stores of ints, to the stack and to globals are unchanged. The instrumented druntime is 0.9% larger and Phobos 0.3%.
++
++**Frames, DMD with cards against DMD with the kernel tracker:**
++
++| Workload | DMD + barrier | DMD + kernel tracker |
++|---|---|---|
++| Stress, 2 GiB, worst frame | 1.09-1.16 ms | 1.14-1.27 ms |
++| Stress, 8 GiB, worst frame | 1.66 ms (p50 311 us) | 1.22 ms (p50 214 us) |
++| Bullet hell, 2 GiB, p99.9 / worst | 3.3 / 3.35 ms | 4.0 / 4.3 ms |
++| City, 500k citizens, worst frame | 8.3 ms, none over 16 ms | 9.8 ms |
++
++So the barrier gives DMD what the kernel tracker gives on Linux 6.7+, without needing that kernel, and it is the
++route to the other systems where DMD runs. The price is the median at large heaps (8 GiB: 311 against 214 us).
++
++**The 500k city used to stall for 2 s** with this build. The cause was in the collector, not the barrier: it handed
++the scanner whole 4 KiB pages for each dirty card, and this program writes one pointer into a very large number of
++pages, so a round rescanned eight times what had been written, took 0.15 to 1 s, and the program dirtied more in
++the meantime; rounds of 80k, 150k, 250k, 450k pages never converged. The collector now hands over cards (512
++bytes), and rounds shrink (7-10k pages, then about 1k). LDC with cards went from 6.9 to 6.1 ms worst at the same
++time. Not re-run after this change: the 8 GiB stress and the bullet hell in the table above.
++
+ ## Reproducing
+ 
+ ```sh
+diff --git a/guide/how-it-works.md b/guide/how-it-works.md
+index 00b2d94..23a99e8 100644
+--- a/guide/how-it-works.md
++++ b/guide/how-it-works.md
+@@ -60,7 +60,9 @@ mark threads (2-6)            [ mark ................... ]
+    least 2 and at most 6 (`SYMGC_MARK_THREADS`), at a nice value of 10 on Linux so that game threads win a shared
+    core. Objects allocated during the mark are *born live*: they are not traced and not freed this cycle.
+ 4. **Dirty rounds.** The program kept writing while the mark ran. The GC rescans what was written since, in rounds,
+-   until fewer than 512 pages are dirty.
++   until fewer than 512 pages' worth are dirty. With cards the unit rescanned is the card (512 bytes), not the page:
++   a program that writes one pointer into each of many pages (a hash table, a tree) would otherwise make the rounds
++   rescan eight times what it wrote, and they would not converge. The kernel tracker can only say "this page".
+ 5. **Remark pause.** Stop the threads again, rescan the roots, stacks, thread-local storage and the last dirty
+    memory, restart. Typically 0.1 to 0.6 ms at 2 GiB of live data. After it, everything reachable is marked.
+ 6. **Finalize.** Every finalizer of the cycle runs, in every arena, before any dead slot is reused. A destructor
+diff --git a/guide/integration.md b/guide/integration.md
+index e572b14..8d0fd4f 100644
+--- a/guide/integration.md
++++ b/guide/integration.md
+@@ -10,6 +10,7 @@ collector actually running. Read `platforms.md` first if you are not on Linux x8
+ | **Plugin** | Stock DMD 2.112+, or LDC with a 2.112+ frontend | Nothing; oneday is a dub dependency | The allocator without a global lock, the concurrent paced sweep, and on Linux 6.7+ the concurrent mark through the kernel tracker. Elsewhere the mark is a pause |
+ | **Plugin + this project's druntime** | DMD 2.113 built from this project | A dmd and Phobos build | The same, plus the game-engine calls (`GC.frameStats`, `excludeCurrentThread`, `step`, `defrag`) |
+ | **Card barrier** | LDC built from this project's `gc-card-marking` branch | An LDC build with its runtime | The concurrent mark on any Linux kernel without page faults, the lowest tail, and the game-engine calls |
++| **Card barrier, DMD** | DMD built from this project, with `-preview=gcbarrier` | A dmd, plus druntime and Phobos rebuilt with the flag | The same concurrent mark through cards instead of the kernel tracker: it does not need Linux 6.7+. The barrier is a call, so a pointer store costs about 1 ns more than with LDC |
+ 
+ GDC: GDC 15 (druntime 2.111) cannot run symgc in a program with more than one thread yet; see `platforms.md`.
+ 
+@@ -127,6 +128,50 @@ and build with `PATH=<wrapper dir>:$PATH dub build -b release --compiler=ldc2`.
+ collector read the card table instead of asking the kernel. The LDC changes are also kept as patches in
+ `plans/ldc-patches/` of the dmd repository.
+ 
++### This project's DMD with the card barrier (`-preview=gcbarrier`)
++
++The flag makes DMD's backend call `_d_gcBarrier(addr)` after each store of a pointer into memory that is not a local
++variable or a global, and `_d_gcBarrierRange(addr, n)` after a copy or a store of a slice, delegate or struct. The
++functions are in druntime (`core.internal.gc.cardbarrier`) and do nothing until a collector that wants the barrier
++starts: with the default GC the cost is a compare. oneday sets up the card table when it starts.
++
++**Every piece of D code that stores pointers into the GC heap must carry the flag**, as with LDC: a store made by code
++built without it is invisible to the concurrent mark and can lose an object. That means druntime and Phobos too.
++Build the dmd as above, then build druntime and Phobos into their own directory so the normal ones stay usable
++(`plans/bench/core_bench/dmd_gcbarrier.sh libs` does exactly this, into `generated/gcb`):
++
++```sh
++make -C druntime -j$(nproc) ROOT_OF_THEM_ALL=../generated/gcb OBJDIR=obj/gcb \
++  DFLAGS="-conf= -Isrc -Iimport -w -de -preview=dip1000 -preview=fieldwise -m64 -fPIC -preview=dtorfields -O -release -inline -preview=gcbarrier" \
++  ../generated/gcb/linux/release/64/libdruntime.a
++make -C ../phobos -j$(nproc) BUILD=release ROOT_OF_THEM_ALL=generated/gcb DMDEXTRAFLAGS=-preview=gcbarrier \
++  generated/gcb/linux/release/64/libphobos2.a
++```
++
++Then compile the program and the collector with the flag, and tell the collector to read the cards:
++
++```sh
++dmd -conf= -Idruntime/import -I../phobos -fPIC -O -release -inline -preview=gcbarrier \
++    -version=Symgc_druntime_hooks -version=Symgc_cards -version=Symgc_druntime_cards \
++    -Isymgc/source -defaultlib= mygame.d $(find symgc/source -name '*.d') \
++    ../phobos/generated/gcb/linux/release/64/libphobos2.a \
++    -L-Lgenerated/gcb/linux/release/64 -L-ldruntime -L-lpthread -L-lm -L-ldl -L-lz
++```
++
++`-version=Symgc_druntime_cards` makes the collector use the card variables that druntime defines, so that code built
++with the flag and the collector see the same table. The collector's own code is never instrumented (its names are
++skipped by the pass).
++
++What the flag does not cover, and the rule for each:
++
++* **Inline assembly and C code** that stores pointers into GC memory: call `_d_gcBarrier` yourself afterwards.
++* **`core.atomic`** is covered (`atomicStore`, `atomicExchange`, `cas`, `casWeak` call the barrier under the version
++  `D_GCBarrier`, which the flag defines).
++* **Memory outside the window** (`malloc`, a stack, a global) needs no barrier, and the barrier ignores it.
++
++To check a build, `plans/bench/core_bench/gcbarrier_codegen_check.sh` counts barrier calls in small functions, and
++`mark_race.d` / `mark_race_glue.d` fail within seconds if a store is missed (see `testing.md`).
++
+ ## 5. Runtime options
+ 
+ Environment variables, read at start-up:
+diff --git a/guide/platforms.md b/guide/platforms.md
+index 2ab108a..71a5177 100644
+--- a/guide/platforms.md
++++ b/guide/platforms.md
+@@ -16,6 +16,7 @@ see `testing.md`.
+ | LDC with a 2.112+ frontend, stock | ≥ 2.112 | Supported by upstream | Builds | Kernel tracker expected, as above | — | Expected; please report |
+ | DMD 2.113 from this project (patched druntime) | 2.113 | Works | Works | Kernel tracker, Linux 6.7+ | — | Checked |
+ | LDC 1.43-git from this project (`gc-card-marking`) | 2.113 | Does not run on this runtime | Works | Cards, or the kernel tracker | Yes | Checked |
++| DMD 2.113 from this project, `-preview=gcbarrier` | 2.113 | Does not run on this runtime | Works | Cards, on Linux x86-64 (the only target DMD builds for) | Yes, a call per pointer store | Checked |
+ 
+ **Why GDC 15 fails:** its druntime (2.111) has `tlsGCData` but not the GC's thread-init hook, which druntime gained
+ in April 2025 (2.112). The collector never learns about the threads druntime starts and asserts when it tries to
+@@ -70,8 +71,11 @@ runs beside it.
+ | LDC | Yes | Yes | Yes | Yes | Yes | Yes | Yes, less tested |
+ | GDC | Yes | Yes | MinGW | Unknown | Unknown | No | No |
+ 
+-Phones mean LDC. The plan to make the barrier come from the shared D frontend, so that DMD, LDC and GDC all emit it
+-for every target they support, is in `plans/cross_platform_gc_plan.md` of the dmd repository.
++Phones mean LDC. The barrier is not emitted by the shared frontend: a frontend rewrite would miss the pointer stores
++the code generator makes by itself (the elements of an array literal, a struct literal, a closure frame). What the
++compilers share is the switch, the card ABI and the two druntime functions; each backend has a pass of its own: an
++LLVM pass in LDC (done), a pass over the element trees in DMD (done, `backend/gcbarrier.d`), a GIMPLE pass for GDC
++(not started). The plan is in `plans/cross_platform_gc_plan.md` of the dmd repository.
+ 
+ ## Machine requirements
+ 
+diff --git a/guide/testing.md b/guide/testing.md
+index 35c8397..ed45c63 100644
+--- a/guide/testing.md
++++ b/guide/testing.md
+@@ -48,6 +48,12 @@ In `plans/bench/core_bench/`:
+ | `phobos_stress.d` | A mix of Phobos code allocating from several threads runs clean |
+ | `thread_exit_race.d` | Threads exiting during a concurrent mark do not crash it |
+ | `cards_window.d` (run it with `cards_window.sh`) | With the card barrier: the window exists before `main` and holds the memory with pointers; a store marks its card and only that one; stores and copies to `malloc` memory, ranges at odd addresses (below and above the window, with a tag in the top byte) mark nothing; a range running past the end is cut; the collector settles for a smaller window when the address space is limited. Run it first on any new platform |
++| `mark_race_glue.d` | Eight ways of storing a pointer into a node (field, element, array literal, struct literal, closure, `atomicStore`, `cas`, a copy) lose nothing. Built without the barrier it reports 1,600 to 1,900 violations in a run. The test for a compiler's barrier pass |
++| `cards_precision.d` | The barrier marks the cards of what was written and no others: an array, a field of every object, a struct array, a copy, the same field 100,000 times, a neighbour nobody wrote to. A barrier that marks more makes the collector rescan for nothing |
++| `gcbarrier_codegen_check.sh` | DMD only: counts the calls to the barrier in small functions (a field store has one, an int store none, a global none, an array literal one per element); run with and without `EXTRA=-fPIC` |
++
++DMD with the barrier is built with `plans/bench/core_bench/dmd_gcbarrier.sh build OUT FILE.d`, which links the
++instrumented druntime and Phobos; run the programs with `--DRT-gcopt=gc:sdcq`.
+ 
+ And the collector's unit tests, from the dmd repository root:
+ 
+-- 
+2.51.0
+

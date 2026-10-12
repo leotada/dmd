@@ -53,17 +53,18 @@ count() {
 	objdump -dr --no-show-raw-insn "$WORK/t.o" |
 		awk -v fn="_D1t$(printf '%d' ${#1})$1" -v sym="$2" '
 			/^[0-9a-f]+ <.*>:$/ { infn = index($0, fn "F") > 0 }
-			infn && index($0, "R_X86_64_PLT32\t" sym "-") || infn && index($0, "R_X86_64_PC32\t" sym "-") { n++ }
+			infn && /R_X86_64_/ && index($0, "\t" sym "-") { n++ }
 			END { print n + 0 }'
 }
 
 fail=0
 check() { # function  barrier  range
 	local one range
-	one=$(count "$1" _d_gcBarrier)
+	# a store of one pointer is expanded in place and reads the card table's base once
+	one=$(count "$1" __sd_gc_card_base)
 	range=$(count "$1" _d_gcBarrierRange)
 	if [ "$one" -eq "$2" ] && [ "$range" -eq "$3" ]; then
-		printf "ok    %-18s _d_gcBarrier x%d, _d_gcBarrierRange x%d\n" "$1" "$one" "$range"
+		printf "ok    %-18s single x%d, range x%d\n" "$1" "$one" "$range"
 	else
 		printf "FAIL  %-18s got x%d and x%d, expected x%d and x%d\n" "$1" "$one" "$range" "$2" "$3"
 		fail=1

@@ -120,6 +120,9 @@ enum RTLSYM
 
     GCBARRIER,          // _d_gcBarrier(void* addr): after a store of a pointer to addr
     GCBARRIERRANGE,     // _d_gcBarrierRange(void* addr, size_t n): after a copy of n bytes to addr
+    GCCARDLO,           // size_t __sd_gc_card_lo: start of the collector's window
+    GCCARDN,            // size_t __sd_gc_card_n: number of cards in it
+    GCCARDBASE,         // ubyte* __sd_gc_card_base: the card table
 }
 
 private __gshared Symbol*[RTLSYM.max + 1] rtlsym;
@@ -251,6 +254,9 @@ Symbol* getRtlsym(RTLSYM i) @trusted
         case RTLSYM.CXA_ATEXIT:             symbolz(ps,FL.func,FREGSAVED,"__cxa_atexit", 0, t); break;
         case RTLSYM.GCBARRIER:              symbolz(ps,FL.func,FREGSAVED,"_d_gcBarrier", 0, t); break;
         case RTLSYM.GCBARRIERRANGE:         symbolz(ps,FL.func,FREGSAVED,"_d_gcBarrierRange", 0, t); break;
+        case RTLSYM.GCCARDLO:               symbolz(ps,FL.extern_,0,"__sd_gc_card_lo",0,tstypes[TYullong]); break;
+        case RTLSYM.GCCARDN:                symbolz(ps,FL.extern_,0,"__sd_gc_card_n",0,tstypes[TYullong]); break;
+        case RTLSYM.GCCARDBASE:             symbolz(ps,FL.extern_,0,"__sd_gc_card_base",0,tspvoid); break;
         default:
             assert(0);
     }

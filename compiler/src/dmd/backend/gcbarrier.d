@@ -249,6 +249,37 @@ bool isVariableAddress(elem* a)
 }
 
 /**
+ * The barrier for one pointer store, expanded in place:
+ * ---
+ * idx = (cast(size_t) addr - __sd_gc_card_lo) >> 9;
+ * if (idx < __sd_gc_card_n) __sd_gc_card_base[idx] = 1;
+ * ---
+ * the same test `_d_gcBarrier` makes, without the call. The store of the card
+ * is a plain byte store, which is as strong as the call's release store on
+ * x86, the only target this backend generates code for.
+ * Params:
+ *      addr = the address that was stored to (consumed)
+ * Returns:
+ *      the expression, of type int
+ */
+@trusted
+elem* inlineBarrier(elem* addr)
+{
+    addr.Ety = TYullong;        // an address as a number (the same size)
+    elem* rel = el_bin(OPmin, TYullong, addr, el_var(getRtlsym(RTLSYM.GCCARDLO)));
+    elem* idx = el_bin(OPshr, TYullong, rel, el_long(TYint, 9));
+    elem* idx2 = el_same(idx);          // idx = (tmp = ...); idx2 = tmp
+
+    elem* inWindow = el_bin(OPlt, TYint, idx, el_var(getRtlsym(RTLSYM.GCCARDN)));
+
+    elem* card = el_una(OPind, TYuchar,
+                        el_bin(OPadd, TYnptr, el_var(getRtlsym(RTLSYM.GCCARDBASE)), idx2));
+    elem* mark = el_bin(OPeq, TYuchar, card, el_long(TYuchar, 1));
+
+    return el_bin(OPandand, TYint, inWindow, mark);
+}
+
+/**
  * `e` is an OPeq, OPstreq or OPmemcpy: add the call that follows it.
  * Params:
  *      e = the store
@@ -332,7 +363,7 @@ elem* store(elem* e, bool used)
     }
     else
     {
-        call = el_bin(OPcall, TYvoid, el_var(getRtlsym(RTLSYM.GCBARRIER)), addr);
+        call = inlineBarrier(addr);
     }
 
     elem* r = el_combine(e, call);
