@@ -38,6 +38,16 @@ void intSliceCopy(int[] d, int[] s) { d[] = s[]; }
 void sliceStore(N[]* d, N[] s) { *d = s; }
 N valueUsed(N a, N b) { return a.next = b; }
 void arrayLiteral(N a, N b) { auto x = [a, b]; }
+class Wide { N a; ubyte[600] pad; N b; N c; }
+class Tri { N a; N b; N c; N d; }
+void threeFields(Tri t, N v) { t.a = v; t.b = v; t.c = v; }
+void fourFields(Tri t, N v) { t.a = v; t.b = v; t.c = v; t.d = v; }
+void twoSame(N a, N v) { a.next = v; a.next = v; }
+void farFields(Wide w, N v) { w.a = v; w.b = v; }
+void mixedBases(N a, N b, N v) { a.next = v; b.next = v; a.other = v; }
+void afterCall(N a, N v) { a.next = v; afterCall(a, v); a.other = v; }
+void sideEffectValue(N a, N v, N function() f) { a.next = v; a.other = f(); }
+void threeAdjacent(N a, N v) { a.next = v; a.other = v; a.next = v; }
 void viaRef(ref N slot, N v) { slot = v; }
 void delegateStore(void delegate()* d, void delegate() v) { *d = v; }
 Wrap* newWithLiteral(N a) { return new Wrap(a); }
@@ -53,15 +63,18 @@ count() {
 	objdump -dr --no-show-raw-insn "$WORK/t.o" |
 		awk -v fn="_D1t$(printf '%d' ${#1})$1" -v sym="$2" '
 			/^[0-9a-f]+ <.*>:$/ { infn = index($0, fn "F") > 0 }
-			infn && /R_X86_64_/ && index($0, "\t" sym "-") { n++ }
+			# a card is marked by `movb $0x1,(...)`; the others are references to a symbol
+			infn && sym == "CARDSTORE" && /movb +\$0x1,\(/ { n++ }
+			infn && sym != "CARDSTORE" && /R_X86_64_/ && index($0, "\t" sym "-") { n++ }
 			END { print n + 0 }'
 }
 
 fail=0
 check() { # function  barrier  range
 	local one range
-	# a store of one pointer is expanded in place and reads the card table's base once
-	one=$(count "$1" __sd_gc_card_base)
+	# barriers for stores of pointers are expanded in place: count the byte stores that mark
+	# a card (three or more stores to one object that follow each other share two)
+	one=$(count "$1" CARDSTORE)
 	range=$(count "$1" _d_gcBarrierRange)
 	if [ "$one" -eq "$2" ] && [ "$range" -eq "$3" ]; then
 		printf "ok    %-18s single x%d, range x%d\n" "$1" "$one" "$range"
@@ -71,7 +84,15 @@ check() { # function  barrier  range
 	fi
 }
 
-check twoFields        2 0   # one call per store (no clustering yet)
+check twoFields        2 0   # two stores to different fields: two barriers (a shared one would cost as much)
+check threeFields      2 0   # three: one barrier for the pair of cards (3 sequences before)
+check fourFields       2 0
+check twoSame          1 0   # the same field twice: one
+check farFields        2 0   # Wide.a and .b are 600+ bytes apart: two
+check threeAdjacent    2 0
+check mixedBases       3 0   # the bases alternate: no run of the same one
+check afterCall        2 0   # a call between the stores: they stay apart
+check sideEffectValue  2 0   # a store whose value is a call is not part of a cluster
 check intField         0 0   # not a pointer
 check global           0 0   # a global is a root
 check globalElem       0 0

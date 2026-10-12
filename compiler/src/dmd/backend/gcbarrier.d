@@ -40,6 +40,7 @@ module dmd.backend.gcbarrier;
 import core.stdc.string : strncmp;
 
 import dmd.backend.cc;
+import dmd.backend.blockopt : block_pred;
 import dmd.backend.cdef;
 import dmd.backend.el;
 import dmd.backend.global;
@@ -67,6 +68,8 @@ void gcBarrierFunction(Symbol* sfunc, block* startblock)
 {
     if (!gcBarrierEnabled || isCollectorCode(sfunc.Sident.ptr))
         return;
+
+    clusterBlocks(startblock);
 
     for (block* b = startblock; b; b = b.Bnext)
     {
@@ -118,6 +121,7 @@ elem* walk(elem* e, bool used)
         switch (op)
         {
             case OPcomma:
+                clusterChain(e, used);
                 e.E1 = walk(e.E1, false);
                 e.E2 = walk(e.E2, used);
                 break;
@@ -249,6 +253,216 @@ bool isVariableAddress(elem* a)
 }
 
 /**
+ * Stores of pointers to fields of one object that follow each other
+ * (`a.next = x; a.other = y; a.prev = z;`) share one barrier. Statements are
+ * the elements of a chain of commas; a run of them that
+ *  - store a pointer through the same variable `base`, at `base + constant`,
+ *  - with values that have no side effects (nothing between the stores can
+ *    change `base` or call the collector), and
+ *  - lie within 511 bytes of each other (so two adjacent cards cover them),
+ * gets one barrier for the lowest and the highest address, after the last of
+ * them. Like the LDC pass, this assumes the stores themselves do not change
+ * the variable `base` (that would take a pointer to the variable inside the
+ * object it points to).
+ */
+struct Member
+{
+    elem** slot;        // where the store is in the tree
+    long offset;
+}
+
+@trusted
+void collectStatements(elem** pe, ref elem**[] list)
+{
+    elem* e = *pe;
+    if (e.Eoper == OPcomma)
+    {
+        collectStatements(&e.E1, list);
+        collectStatements(&e.E2, list);
+    }
+    else
+        list ~= pe;
+}
+
+/// Is `*pe` a store that can join a cluster? Sets `base` and `offset`.
+@trusted
+bool clusterable(elem* e, out elem* base, out long offset)
+{
+    if (e.Eoper != OPeq || (e.Eflags & (EFLAGS_ptrfree | EFLAGS_gcdone)))
+        return false;
+    if (!typtr(tybasic(e.Ety)))
+        return false;
+
+    elem* lhs = e.E1;
+    if (lhs.Eoper != OPind || isVariableAddress(lhs.E1))
+        return false;
+    if (e.E2.Eoper == OPconst && el_tolong(e.E2) == 0)
+        return false;                   // null: no barrier at all
+    if (el_sideeffect(e.E2))
+        return false;
+
+    elem* a = lhs.E1;
+    offset = 0;
+    if (a.Eoper == OPadd && a.E2.Eoper == OPconst)
+    {
+        offset = el_tolong(a.E2);
+        a = a.E1;
+    }
+    if (a.Eoper != OPvar || !typtr(tybasic(a.Ety)))
+        return false;
+    base = a;
+    return true;
+}
+
+@trusted
+void clusterChain(elem* top, bool used)
+{
+    elem**[] list;
+    collectStatements(&top, list);
+    // `top` itself is a comma, so the list is made of its parts
+    if (list.length < 2)
+        return;
+
+    // The value of the whole chain is its last statement: leave it alone.
+    clusterList(list, list.length - (used ? 1 : 0));
+}
+
+/**
+ * Before the optimizer runs, each statement is a block of its own, joined to
+ * the next by a goto. Cluster across a run of such blocks: each continues into
+ * the next, which nothing else jumps to.
+ */
+@trusted
+void clusterBlocks(block* startblock)
+{
+    block_pred(startblock);
+
+    for (block* b = startblock; b; )
+    {
+        elem**[] list;
+        block* last = b;
+        for (;;)
+        {
+            if (last.Belem)
+                collectStatements(&last.Belem, list);
+            if (last.bc != BC.goto_ || !last.Bnext || last.Bsucc.length != 1 ||
+                last.Bsucc[0] != last.Bnext || last.Bnext.Bpred.length != 1)
+                break;
+            last = last.Bnext;
+        }
+
+        // the value of the last block's expression is used if its branch needs one
+        const lastUsed = last.Belem && valueUsed(last.bc);
+        if (list.length >= 2)
+            clusterList(list, list.length - (lastUsed ? 1 : 0));
+        b = last.Bnext;
+    }
+}
+
+@trusted
+void clusterList(elem**[] list, size_t n)
+{
+    size_t i = 0;
+    while (i < n)
+    {
+        elem* base;
+        long off;
+        if (!clusterable(*list[i], base, off))
+        {
+            i++;
+            continue;
+        }
+
+        long lo = off, hi = off;
+        size_t members = 1;
+        size_t lastMember = i;
+        size_t j = i + 1;
+        while (j < n)
+        {
+            elem* b2;
+            long o2;
+            if (clusterable(*list[j], b2, o2))
+            {
+                const newLo = o2 < lo ? o2 : lo;
+                const newHi = o2 > hi ? o2 : hi;
+                if (!el_match(base, b2) || newHi - newLo > 511)
+                    break;
+                lo = newLo;
+                hi = newHi;
+                members++;
+                lastMember = j;
+            }
+            else if (el_sideeffect(*list[j]))
+                break;          // a call, a store of something else: the run ends
+            // else a plain read (the front end re-reads the value it stored): the run goes on
+            j++;
+        }
+
+        // Two stores to different fields cost as much with one barrier for the
+        // pair as with two (the pair needs a second card test): three or more
+        // are where sharing pays.
+        if (members >= 3 || (members == 2 && lo == hi))
+        {
+            // only the statements that are members, not the reads between them
+            for (size_t k = i; k <= lastMember; k++)
+            {
+                elem* b3;
+                long o3;
+                if (clusterable(*list[k], b3, o3))
+                    (*list[k]).Eflags |= EFLAGS_gcdone;
+            }
+
+            elem* a = el_copytree(base);
+            if (lo != 0)
+                a = el_bin(OPadd, a.Ety, a, el_long(TYsize_t, lo));
+            elem* barrier = lo == hi ? inlineBarrier(a) : inlineBarrierSpan(a, hi - lo);
+            elem** last = list[lastMember];
+            *last = el_combine(*last, barrier);
+        }
+        i = lastMember + 1;
+    }
+}
+
+/**
+ * The barrier for stores into [addr, addr + span], span < 512: the card of
+ * addr and, if the span reaches into the next one, that one.
+ * Params:
+ *      addr = lowest address stored to (consumed)
+ *      span = distance to the highest, in bytes
+ */
+@trusted
+elem* inlineBarrierSpan(elem* addr, long span)
+{
+    addr.Ety = TYullong;
+    elem* rel = el_bin(OPmin, TYullong, addr, el_var(getRtlsym(RTLSYM.GCCARDLO)));
+    elem* rel2 = el_same(rel);                  // rel = (r = addr - lo)
+    elem* idx = el_bin(OPshr, TYullong, rel, el_long(TYint, 9));
+    elem* idx2 = el_same(idx);
+    elem* idx3 = el_copytree(idx2);
+
+    elem* first = el_bin(OPandand, TYint,
+        el_bin(OPlt, TYint, idx, el_var(getRtlsym(RTLSYM.GCCARDN))),
+        el_bin(OPeq, TYuchar,
+               el_una(OPind, TYuchar, el_bin(OPadd, TYnptr, el_var(getRtlsym(RTLSYM.GCCARDBASE)), idx2)),
+               el_long(TYuchar, 1)));
+
+    // the second card: only when the span crosses into it
+    elem* end = el_bin(OPshr, TYullong,
+                       el_bin(OPadd, TYullong, rel2, el_long(TYullong, span)), el_long(TYint, 9));
+    elem* end2 = el_same(end);
+    elem* end3 = el_copytree(end2);
+    elem* second = el_bin(OPandand, TYint,
+        el_bin(OPne, TYint, end, idx3),
+        el_bin(OPandand, TYint,
+            el_bin(OPlt, TYint, end2, el_var(getRtlsym(RTLSYM.GCCARDN))),
+            el_bin(OPeq, TYuchar,
+                   el_una(OPind, TYuchar, el_bin(OPadd, TYnptr, el_var(getRtlsym(RTLSYM.GCCARDBASE)), end3)),
+                   el_long(TYuchar, 1))));
+
+    return el_combine(first, second);
+}
+
+/**
  * The barrier for one pointer store, expanded in place:
  * ---
  * idx = (cast(size_t) addr - __sd_gc_card_lo) >> 9;
@@ -290,7 +504,7 @@ elem* inlineBarrier(elem* addr)
 @trusted
 elem* store(elem* e, bool used)
 {
-    if (e.Eflags & EFLAGS_ptrfree)
+    if (e.Eflags & (EFLAGS_ptrfree | EFLAGS_gcdone))
         return e;
 
     const op = e.Eoper;

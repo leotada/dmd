@@ -31,7 +31,7 @@ import core.time : MonoTime, seconds, dur;
 
 enum Nodes = 4000;
 enum Threads = 4;
-enum Forms = 8;
+enum Forms = 9;
 
 shared size_t violations, moves;
 shared size_t[Forms] perForm;
@@ -87,6 +87,7 @@ final class Holder
     Node*[ulong] map;
     shared(Node)* sp;           // form 6
     shared(Node)* cp;           // form 7
+    Node* t1, t2, t3;           // form 8: three stores in a row to one object share a barrier
 }
 
 __gshared Node*[] roots;
@@ -114,6 +115,8 @@ pragma(inline, false) void put5(Holder h, Node* n) { h.map = null; h.map[n.id] =
 pragma(inline, false) void put6(Holder h, Node* n) { atomicStore(h.sp, cast(shared(Node)*) n); }
 pragma(inline, false) void put7(Holder h, Node* n) { h.cp = null; cas(&h.cp, cast(shared(Node)*) null, cast(shared(Node)*) n); }
 
+pragma(inline, false) void put8(Holder h, Node* n) { h.t1 = n; h.t2 = n; h.t3 = n; }
+
 pragma(inline, false) Node* get(Holder h, uint form, ulong id)
 {
     switch (form)
@@ -125,7 +128,8 @@ pragma(inline, false) Node* get(Holder h, uint form, ulong id)
         case 4: return h.list.length ? h.list[0] : null;
         case 5: auto p = id in h.map; return p ? *p : null;
         case 6: return cast(Node*) atomicLoad(h.sp);
-        default: return cast(Node*) atomicLoad(h.cp);
+        case 7: return cast(Node*) atomicLoad(h.cp);
+        default: return h.t2;       // form 8 (t1 and t3 hold it too, but only one need survive)
     }
 }
 
@@ -157,7 +161,8 @@ pragma(inline, false) ulong takeAndPut(Holder h, size_t i, bool slotA, uint form
         case 4: put4(h, held); break;
         case 5: put5(h, held); break;
         case 6: put6(h, held); break;
-        default: put7(h, held); break;
+        case 7: put7(h, held); break;
+        default: put8(h, held); break;
     }
 
     return id;

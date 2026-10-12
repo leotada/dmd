@@ -55,6 +55,8 @@ pragma(inline, false) void fillFields(Obj[] os, Obj p) { foreach (o; os) o.next 
 pragma(inline, false) void fillFieldsEvery(Obj[] os, Obj p, size_t step) { for (size_t i = 0; i < os.length; i += step) os[i].next = p; }
 pragma(inline, false) void fillStructs(Rec[] rs, void* p) { foreach (ref r; rs) r.a = p; }
 pragma(inline, false) void copyPtrs(void*[] d, void*[] s) { d[] = s[]; }
+final class Quad { Obj a, b, c, d; }
+pragma(inline, false) void fillQuads(Quad[] qs, Obj p) { foreach (q; qs) { q.a = p; q.b = p; q.c = p; q.d = p; } }
 pragma(inline, false) void sameCard(Obj o, Obj p) { foreach (i; 0 .. 100_000) o.next = p; }
 
 int main()
@@ -123,6 +125,25 @@ int main()
     clear(quiet.ptr, bytesArray);
     fillArray(arr, cast(void*) probe);       // writes elsewhere
     report("a neighbour nobody wrote to", marked(quiet.ptr, bytesArray), 0, 0);
+
+    // 8. four stores in a row to one object share a barrier (two cards: the
+    // lowest and the highest address): the cards must be exactly those of the fields
+    auto quads = new Quad[N];
+    foreach (ref q; quads) q = new Quad;
+    auto qlo = cast(void*) quads[0];
+    const qspan = cast(size_t) (cast(void*) quads[N - 1] + Quad.classinfo.initializer.length) - cast(size_t) qlo;
+    clear(qlo, qspan);
+    fillQuads(quads, probe);
+    const qmarked = marked(qlo, qspan);     // before the bookkeeping below allocates
+    size_t qdistinct;
+    bool[size_t] seen;
+    foreach (q; quads)
+        foreach (off; [Quad.a.offsetof, Quad.b.offsetof, Quad.c.offsetof, Quad.d.offsetof])
+        {
+            const c = (cast(size_t) cast(void*) q + off - __sd_gc_card_lo) >> CardShift;
+            if (c !in seen) { seen[c] = true; qdistinct++; }
+        }
+    report("four fields in a row of 100k objects", qmarked, qdistinct, qdistinct);
 
     if (failures == 0)
         printf("CARD PRECISION OK\n");
