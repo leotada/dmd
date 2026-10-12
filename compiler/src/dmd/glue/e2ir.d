@@ -194,6 +194,12 @@ elem* elAssign(elem* e1, elem* e2, Type t, type* tx)
             e.ET = tx;
 //            if (type_zeroCopy(tx))
 //                e.Eoper = OPcomma;
+            {
+                // A copy of data without pointers needs no GC write barrier.
+                import dmd.typesem : hasPointers;
+                if (t && !t.hasPointers())
+                    e.Eflags |= EFLAGS_ptrfree;
+            }
             break;
 
         default:
@@ -2669,6 +2675,12 @@ elem* toElem(Expression e, ref IRState irs)
                      *   memcpy(ex.ptr, ey.ptr, nbytes)[0..elen]
                      */
                     elem* e = el_bin(OPmemcpy, TYnptr, epto, el_param(epfr, nbytes));
+                    {
+                        // Elements without pointers need no GC write barrier.
+                        import dmd.typesem : hasPointers;
+                        if (!ae.e1.type.toBasetype().nextOf().hasPointers())
+                            e.Eflags |= EFLAGS_ptrfree;
+                    }
                     //elem* e = el_params(nbytes, epfr, epto, null);
                     //e = el_bin(OPcall,TYnptr,el_var(getRtlsym(RTLSYM.MEMCPY)),e);
                     e = el_pair(eto.Ety, el_copytree(elen), e);
@@ -7208,6 +7220,11 @@ elem* toElemStructLit(StructLiteralExp sle, ref IRState irs, EXP op, Symbol* sym
                 elem* esize = el_long(TYsize_t, t1b.size());
                 ep = array_toPtr(element.type, ep);
                 e1 = el_bin(OPmemcpy, TYnptr, e1, el_param(ep, esize));
+                {
+                    import dmd.typesem : hasPointers;
+                    if (!t1b.hasPointers())
+                        e1.Eflags |= EFLAGS_ptrfree;
+                }
             }
             else
             {

@@ -28,6 +28,7 @@ Optimisations
 * **goh.d**           global optimizer declarations
 * **gother.d**        other global optimizations
 * **gsroa.d**         SROA structured replacement of aggregate optimization
+* **gcbarrier.d**     GC write barrier after pointer stores (`-preview=gcbarrier`)
 * **evalu8.d**        constant folding
 * **divcoeff.d**      convert divisions to multiplications
 

@@ -218,6 +218,7 @@ extern (C++) struct Param
                                  // https://issues.dlang.org/show_bug.cgi?id=14246
     FeatureState systemVariables; // limit access to variables marked @system from @safe code
     bool useFastDFA;                 // Use fast data flow analysis engine
+    bool gcBarrier;                  // call the GC write barrier after pointer stores to non-local memory
 
     CHECKENABLE useInvariants  = CHECKENABLE._default;  // generate class invariant checks
     CHECKENABLE useIn          = CHECKENABLE._default;  // generate precondition checks

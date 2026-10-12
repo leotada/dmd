@@ -62,6 +62,7 @@ alias eflags_t = ubyte;
 enum
 {
     EFLAGS_variadic = 1,   // variadic function call
+    EFLAGS_ptrfree  = 2,   // OPeq/OPstreq/OPmemcpy of data that holds no pointers: no GC write barrier
 }
 
 alias nflags_t = ubyte;

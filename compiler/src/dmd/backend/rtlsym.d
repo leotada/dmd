@@ -116,7 +116,10 @@ enum RTLSYM
     FMOD,
     FMODL,
 
-    CXA_ATEXIT
+    CXA_ATEXIT,
+
+    GCBARRIER,          // _d_gcBarrier(void* addr): after a store of a pointer to addr
+    GCBARRIERRANGE,     // _d_gcBarrierRange(void* addr, size_t n): after a copy of n bytes to addr
 }
 
 private __gshared Symbol*[RTLSYM.max + 1] rtlsym;
@@ -246,6 +249,8 @@ Symbol* getRtlsym(RTLSYM i) @trusted
         case RTLSYM.FMODL:                  symbolz(ps,FL.func,FREGSAVED,"fmodl", 0, t); break;  // C library function fmodl()
 
         case RTLSYM.CXA_ATEXIT:             symbolz(ps,FL.func,FREGSAVED,"__cxa_atexit", 0, t); break;
+        case RTLSYM.GCBARRIER:              symbolz(ps,FL.func,FREGSAVED,"_d_gcBarrier", 0, t); break;
+        case RTLSYM.GCBARRIERRANGE:         symbolz(ps,FL.func,FREGSAVED,"_d_gcBarrierRange", 0, t); break;
         default:
             assert(0);
     }

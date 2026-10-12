@@ -240,6 +240,7 @@ struct Param
                                  // https://issues.dlang.org/show_bug.cgi?id=14246
     FeatureState systemVariables; // limit access to variables marked @system from @safe code
     d_bool useFastDFA;             // Use fast data flow analysis engine
+    d_bool gcBarrier;              // call the GC write barrier after pointer stores to non-local memory
 
     CHECKENABLE useInvariants;     // generate class invariant checks
     CHECKENABLE useIn;             // generate precondition checks

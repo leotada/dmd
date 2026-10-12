@@ -32,6 +32,7 @@ import dmd.backend.blockopt : block_compbcount, block_pred, blocklist_free, Bloc
 import dmd.backend.cgelem : doptelem;
 import dmd.backend.debugprint : WRfunc;
 import dmd.backend.ee : eecontext_convs;
+import dmd.backend.gcbarrier : gcBarrierFunction;
 import dmd.backend.go;
 import dmd.backend.symbol : symbol_generate, symbol_print, globsym;
 import dmd.backend.x86.cod3 : cod3_thunk;
@@ -881,6 +882,10 @@ void writefunc2(Symbol* sfunc, ref GlobalOptimizer go, ref BlockOpt bo)
     bo.startblock = sfunc.Sfunc.Fstartblock;
     sfunc.Sfunc.Fstartblock = null;
     assert(bo.startblock);
+
+    // -preview=gcbarrier: tell the collector what the function writes. Before
+    // the elements are lowered and optimized, so that what it adds is too.
+    gcBarrierFunction(sfunc, bo.startblock);
 
     assert(funcsym_p == null);
     funcsym_p = sfunc;
