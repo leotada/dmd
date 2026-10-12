@@ -1,0 +1,395 @@
+From 7439f269d198d05774333d966f77c87492f96f44 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 13:28:09 -0300
+Subject: [PATCH] gc-card-marking: range-check the barrier against the
+ collector's window
+
+The barrier indexed the card table with the absolute address, which needed a
+table for the whole address space (256 GiB reserved), a start-up hook that
+runs before every constructor (.preinit_array: shared libraries do not get
+it), and marked garbage for pointers with a tag in their top byte (Android's
+allocator tags malloc memory since Android 11).
+
+The collector's memory is now one contiguous window [lo, lo + n * 512), and
+the barrier is
+
+    if ((addr - lo) >> 9 < n)  cards[(addr - lo) >> 9] = 1;
+
+An address outside the window (malloc, tagged, an escaped stack slot) costs a
+compare and marks nothing; lo, n and the table are zero until the collector
+starts, which makes the barrier a no-op until then, so nothing has to run
+before the first constructor. Only the first of the two addresses of a
+cluster (or the first byte of a small copy) is checked: the second is in the
+same object.
+
+The analysis no longer emits code while it walks the function: it records
+requests, and the checks are generated afterwards with
+SplitBlockAndInsertIfThen, so the basic blocks it iterates are never changed
+under it. A copy of unknown size calls __sd_gc_card_range only when its first
+byte is inside the window.
+
+Measured (barrier_micro, LDC -O3, medians of 5, pinned): the check costs 0% on
+class fields, structs and linked lists, +9% on array element stores
+(0.45 to 0.49 ns), +5% to +15% on copies of 8 to 64 pointers. The 500k city
+and the 2 and 8 GiB stress tests are the same or slightly better than with
+the unchecked barrier.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ gen/passes/GCCardMarking.cpp | 203 ++++++++++++++++++++++-------------
+ gen/passes/GCCardMarking.h   |  14 ++-
+ 2 files changed, 143 insertions(+), 74 deletions(-)
+
+diff --git a/gen/passes/GCCardMarking.cpp b/gen/passes/GCCardMarking.cpp
+index 80a73ac366..2bdb02b222 100644
+--- a/gen/passes/GCCardMarking.cpp
++++ b/gen/passes/GCCardMarking.cpp
+@@ -17,7 +17,9 @@
+ #include "llvm/IR/InstIterator.h"
+ #include "llvm/IR/Instructions.h"
+ #include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/MDBuilder.h"
+ #include "llvm/Support/CommandLine.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+ 
+ using namespace llvm;
+ 
+@@ -41,39 +43,57 @@ struct Cluster {
+   SmallVector<StoreInst *, 4> Stores;
+ };
+ 
++/// A barrier to emit. The analysis only records these; the code is generated
++/// afterwards, because the range check splits basic blocks.
++struct Request {
++  Instruction *Before; // the barrier goes right before this instruction
++  DebugLoc Loc;
++  Value *First;  // the lowest address written
++  Value *Second; // a second card of the same object, or null
++  Value *Size;   // set for a range: a call to __sd_gc_card_range
++};
++
+ struct Marker {
+   Module &M;
+   LLVMContext &C;
+   Type *IntPtrTy;
+   GlobalVariable *CardBase;
++  GlobalVariable *CardLo;
++  GlobalVariable *CardCount;
+   GlobalVariable *SummaryBase;
+   FunctionCallee CardRange;
+   InlineAsm *CompilerBarrier;
++  MDNode *InRangeWeights;
++  SmallVector<Request, 32> Requests;
+ 
+   explicit Marker(Module &M)
+       : M(M), C(M.getContext()),
+         IntPtrTy(M.getDataLayout().getIntPtrType(M.getContext())),
+         SummaryBase(nullptr) {
+     auto *PtrTy = PointerType::getUnqual(C);
+-    CardBase = M.getGlobalVariable("__sd_gc_card_base");
+-    if (!CardBase) {
+-      CardBase = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
+-                                    GlobalValue::ExternalLinkage, nullptr,
+-                                    "__sd_gc_card_base");
+-    }
+-    if (EmitCardSummary) {
+-      SummaryBase = M.getGlobalVariable("__sd_gc_card_summary_base");
+-      if (!SummaryBase) {
+-        SummaryBase = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
+-                                         GlobalValue::ExternalLinkage, nullptr,
+-                                         "__sd_gc_card_summary_base");
+-      }
+-    }
++    CardBase = global("__sd_gc_card_base", PtrTy);
++    // The memory the collector tracks is one contiguous range: [lo, lo + n *
++    // 512). An address outside it (malloc, a tagged pointer, a stack slot that
++    // escaped) is not tracked, and the barrier skips it. Both are zero until
++    // the collector starts, which makes every barrier a no-op until then.
++    CardLo = global("__sd_gc_card_lo", IntPtrTy);
++    CardCount = global("__sd_gc_card_n", IntPtrTy);
++    if (EmitCardSummary)
++      SummaryBase = global("__sd_gc_card_summary_base", PtrTy);
+     CardRange = M.getOrInsertFunction(
+         "__sd_gc_card_range", Type::getVoidTy(C), PtrTy, IntPtrTy);
+     // Keeps the compiler from moving the card store above the pointer store.
+     CompilerBarrier = InlineAsm::get(FunctionType::get(Type::getVoidTy(C), false),
+                                      "", "~{memory}", /*hasSideEffects=*/true);
++    // Stores into the collector's memory are the common case.
++    InRangeWeights = MDBuilder(C).createLikelyBranchWeights();
++  }
++
++  GlobalVariable *global(StringRef Name, Type *Ty) {
++    if (auto *G = M.getGlobalVariable(Name))
++      return G;
++    return new GlobalVariable(M, Ty, /*isConstant=*/false,
++                              GlobalValue::ExternalLinkage, nullptr, Name);
+   }
+ 
+   /// Memory that the collector does not need cards for: stack slots (scanned
+@@ -131,25 +151,21 @@ struct Marker {
+     return false;
+   }
+ 
+-  void markCard(IRBuilder<> &B, Value *Addr) {
+-    B.CreateCall(CompilerBarrier);
+-    markCardNoBarrier(B, Addr);
+-  }
++  //===--------------------------------------------------------------------===//
++  // Analysis: record what needs a barrier, and where.
++  //===--------------------------------------------------------------------===//
+ 
+-  /// One byte per 64 KiB, so that finding the dirty cards of a big heap does
+-  /// not mean reading all of the card table.
+-  void markSummary(IRBuilder<> &B, Value *AddrInt) {
+-    if (!EmitCardSummary || !SummaryBase)
+-      return;
+-    auto *SIdx = B.CreateLShr(AddrInt, ConstantInt::get(IntPtrTy, SummaryShift));
+-    auto *SBase = B.CreateLoad(PointerType::getUnqual(C), SummaryBase);
+-    SBase->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(C, {}));
+-    auto *SSlot = B.CreateGEP(Type::getInt8Ty(C), SBase, SIdx);
+-    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), SSlot);
++  /// One card, after a store of a pointer that is not a plain store.
++  void markCard(Instruction *After, Value *Addr) {
++    Requests.push_back({After->getNextNode(), After->getDebugLoc(), Addr,
++                        nullptr, nullptr});
+   }
+ 
+-  void markRange(IRBuilder<> &B, Value *Dst, Value *Size) {
+-    B.CreateCall(CompilerBarrier);
++  void markRange(MemTransferInst *MT) {
++    Value *Dst = MT->getRawDest();
++    Value *Size = MT->getLength();
++    Instruction *Before = MT->getNextNode();
++
+     if (auto *CI = dyn_cast<ConstantInt>(Size)) {
+       uint64_t N = CI->getZExtValue();
+       if (N == 0) {
+@@ -157,37 +173,85 @@ struct Marker {
+       }
+       // At most two cards for up to 512 bytes: first and last byte.
+       if (N <= (1u << CardShift)) {
+-        markCardNoBarrier(B, Dst);
++        Value *Last = nullptr;
+         if (N > 1) {
+-          auto *Last = B.CreateGEP(Type::getInt8Ty(C), Dst,
+-                                   ConstantInt::get(IntPtrTy, N - 1));
+-          markCardNoBarrier(B, Last);
++          IRBuilder<> B(Before);
++          Last = B.CreateGEP(Type::getInt8Ty(C), Dst,
++                             ConstantInt::get(IntPtrTy, N - 1));
+         }
++        Requests.push_back({Before, MT->getDebugLoc(), Dst, Last, nullptr});
+         return;
+       }
+     }
+-    B.CreateCall(CardRange, {Dst, B.CreateZExtOrTrunc(Size, IntPtrTy)});
+-  }
+-
+-  void markCardNoBarrier(IRBuilder<> &B, Value *Addr) {
+-    auto *Int = B.CreatePtrToInt(Addr, IntPtrTy);
+-    auto *Idx = B.CreateLShr(Int, ConstantInt::get(IntPtrTy, CardShift));
+-    auto *Base = B.CreateLoad(PointerType::getUnqual(C), CardBase);
+-    Base->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(C, {}));
+-    auto *Slot = B.CreateGEP(Type::getInt8Ty(C), Base, Idx);
+-    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Slot);
+-    markSummary(B, Int);
++    Requests.push_back({Before, MT->getDebugLoc(), Dst, nullptr, Size});
+   }
+ 
+   void emitCluster(const Cluster &Clust) {
+     assert(Clust.LastStore && "Cluster has no stores");
+-    IRBuilder<> B(Clust.LastStore->getNextNode());
+-    B.SetCurrentDebugLocation(Clust.LastStore->getDebugLoc());
++    Value *Second =
++        Clust.MinOffset != Clust.MaxOffset ? Clust.MaxAddr : nullptr;
++    Requests.push_back({Clust.LastStore->getNextNode(),
++                        Clust.LastStore->getDebugLoc(), Clust.MinAddr, Second,
++                        nullptr});
++  }
++
++  //===--------------------------------------------------------------------===//
++  // Code generation.
++  //===--------------------------------------------------------------------===//
++
++  Value *invariantLoad(IRBuilder<> &B, Type *Ty, GlobalVariable *G) {
++    auto *L = B.CreateLoad(Ty, G);
++    L->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(C, {}));
++    return L;
++  }
++
++  void storeCard(IRBuilder<> &B, Value *Addr, Value *Lo) {
++    auto *Rel = B.CreateSub(B.CreatePtrToInt(Addr, IntPtrTy), Lo);
++    auto *Idx = B.CreateLShr(Rel, ConstantInt::get(IntPtrTy, CardShift));
++    auto *Base = invariantLoad(B, PointerType::getUnqual(C), CardBase);
++    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1),
++                  B.CreateGEP(Type::getInt8Ty(C), Base, Idx));
++
++    // One byte per 64 KiB, so that finding the dirty cards of a big heap does
++    // not mean reading all of the card table.
++    if (EmitCardSummary && SummaryBase) {
++      auto *SIdx = B.CreateLShr(Rel, ConstantInt::get(IntPtrTy, SummaryShift));
++      auto *SBase = invariantLoad(B, PointerType::getUnqual(C), SummaryBase);
++      B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1),
++                    B.CreateGEP(Type::getInt8Ty(C), SBase, SIdx));
++    }
++  }
++
++  /// if ((First - lo) >> 9 < n) { cards[...] = 1; cards[...] = 1; }
++  ///
++  /// Only the first address is checked: the second is in the same object, so
++  /// it is inside the tracked range whenever the first is.
++  void lower(const Request &R) {
++    IRBuilder<> B(R.Before);
++    B.SetCurrentDebugLocation(R.Loc);
+     B.CreateCall(CompilerBarrier);
+-    markCardNoBarrier(B, Clust.MinAddr);
+-    if (Clust.MinOffset != Clust.MaxOffset) {
+-      markCardNoBarrier(B, Clust.MaxAddr);
++
++    auto *Lo = invariantLoad(B, IntPtrTy, CardLo);
++    auto *Idx = B.CreateLShr(
++        B.CreateSub(B.CreatePtrToInt(R.First, IntPtrTy), Lo),
++        ConstantInt::get(IntPtrTy, CardShift));
++    auto *N = invariantLoad(B, IntPtrTy, CardCount);
++    auto *In = B.CreateICmpULT(Idx, N);
++
++    Instruction *Then = SplitBlockAndInsertIfThen(In, R.Before->getIterator(),
++                                                  /*Unreachable=*/false,
++                                                  InRangeWeights);
++    B.SetInsertPoint(Then);
++    B.SetCurrentDebugLocation(R.Loc);
++
++    if (R.Size) {
++      B.CreateCall(CardRange, {R.First, B.CreateZExtOrTrunc(R.Size, IntPtrTy)});
++      return;
+     }
++
++    storeCard(B, R.First, Lo);
++    if (R.Second)
++      storeCard(B, R.Second, Lo);
+   }
+ };
+ 
+@@ -206,7 +270,7 @@ bool GCCardMarking::run(Module &M) {
+       continue;
+     }
+ 
+-    bool FnChanged = false;
++    K.Requests.clear();
+ 
+     for (BasicBlock &BB : F) {
+       SmallVector<Instruction *, 64> Insts;
+@@ -223,7 +287,6 @@ bool GCCardMarking::run(Module &M) {
+         });
+         for (const Cluster &C : ActiveClusters) {
+           K.emitCluster(C);
+-          FnChanged = true;
+         }
+         ActiveClusters.clear();
+       };
+@@ -251,7 +314,6 @@ bool GCCardMarking::run(Module &M) {
+               return;
+             }
+             K.emitCluster(C);
+-            FnChanged = true;
+             C.MinOffset = Offset;
+             C.MaxOffset = Offset;
+             C.MinAddr = SI->getPointerOperand();
+@@ -282,10 +344,7 @@ bool GCCardMarking::run(Module &M) {
+           flushClusters();
+           if (!Marker::isUntracked(MT->getRawDest()) &&
+               !Marker::isPointerFreeCopy(MT)) {
+-            IRBuilder<> B(MT->getNextNode());
+-            B.SetCurrentDebugLocation(MT->getDebugLoc());
+-            K.markRange(B, MT->getRawDest(), MT->getLength());
+-            FnChanged = true;
++            K.markRange(MT);
+           }
+         } else if (auto *CB = dyn_cast<CallBase>(I)) {
+           if (auto *II = dyn_cast<IntrinsicInst>(CB)) {
+@@ -298,19 +357,13 @@ bool GCCardMarking::run(Module &M) {
+           flushClusters();
+           if (Marker::storesPointer(RMW->getValOperand()) &&
+               !Marker::isUntracked(RMW->getPointerOperand())) {
+-            IRBuilder<> B(RMW->getNextNode());
+-            B.SetCurrentDebugLocation(RMW->getDebugLoc());
+-            K.markCard(B, RMW->getPointerOperand());
+-            FnChanged = true;
++            K.markCard(RMW, RMW->getPointerOperand());
+           }
+         } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
+           flushClusters();
+           if (Marker::storesPointer(CX->getNewValOperand()) &&
+               !Marker::isUntracked(CX->getPointerOperand())) {
+-            IRBuilder<> B(CX->getNextNode());
+-            B.SetCurrentDebugLocation(CX->getDebugLoc());
+-            K.markCard(B, CX->getPointerOperand());
+-            FnChanged = true;
++            K.markCard(CX, CX->getPointerOperand());
+           }
+         } else if (isa<FenceInst>(I)) {
+           flushClusters();
+@@ -319,10 +372,7 @@ bool GCCardMarking::run(Module &M) {
+             flushClusters();
+             if (Marker::storesPointer(SI->getValueOperand()) &&
+                 !Marker::isUntracked(SI->getPointerOperand())) {
+-              IRBuilder<> B(SI->getNextNode());
+-              B.SetCurrentDebugLocation(SI->getDebugLoc());
+-              K.markCard(B, SI->getPointerOperand());
+-              FnChanged = true;
++              K.markCard(SI, SI->getPointerOperand());
+             }
+           } else if (Marker::storesPointer(SI->getValueOperand()) &&
+                      !Marker::isUntracked(SI->getPointerOperand())) {
+@@ -336,10 +386,19 @@ bool GCCardMarking::run(Module &M) {
+       flushClusters();
+     }
+ 
+-    if (FnChanged) {
+-      F.setMemoryEffects(MemoryEffects::unknown());
+-      Changed = true;
++    if (K.Requests.empty()) {
++      continue;
+     }
++
++    // The analysis is done: nothing is read from the function's blocks after
++    // this point, so splitting them is safe. Each request keeps its own
++    // instruction pointer, which stays valid whichever block it ends up in.
++    for (const Request &R : K.Requests) {
++      K.lower(R);
++    }
++
++    F.setMemoryEffects(MemoryEffects::unknown());
++    Changed = true;
+   }
+ 
+   return Changed;
+diff --git a/gen/passes/GCCardMarking.h b/gen/passes/GCCardMarking.h
+index 4f4b81e291..ca1f2f6d37 100644
+--- a/gen/passes/GCCardMarking.h
++++ b/gen/passes/GCCardMarking.h
+@@ -6,8 +6,18 @@
+ // stored-to address. The collector rescans the dirty cards with the program
+ // stopped, instead of asking the kernel which pages were written.
+ //
+-// The runtime provides:
+-//   extern(C) __gshared ubyte* __sd_gc_card_base;   // biased: base + (addr >> 9)
++// The collector's memory is one contiguous range, [lo, lo + n * 512). The
++// barrier is range checked, so an address outside it (malloc, a pointer with a
++// tag in its top byte, a stack slot that escaped) costs a compare and is not
++// marked, and nothing needs to be mapped for the rest of the address space:
++//
++//   if ((addr - lo) >> 9 < n)  base[(addr - lo) >> 9] = 1;
++//
++// The runtime provides (all zero until the collector starts, which makes the
++// barrier a no-op until then):
++//   extern(C) __gshared size_t __sd_gc_card_lo;     // start of the range
++//   extern(C) __gshared size_t __sd_gc_card_n;      // number of cards in it
++//   extern(C) __gshared ubyte* __sd_gc_card_base;   // one byte per card
+ //   extern(C) void __sd_gc_card_range(void* dst, size_t size);
+ //
+ //===----------------------------------------------------------------------===//
+-- 
+2.51.0
+

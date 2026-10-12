@@ -1,24 +1,13 @@
-// The LDC runtime in ldc-build-rt2 is built to work with the card barrier of our
-// symgc and refers to its three symbols. A program that links the stock GC or
-// the upstream symgc has no cards: these definitions satisfy the linker and
-// map the address range via .preinit_array so any barrier stores in druntime
-// during static initialization do not segfault.
-import core.sys.posix.sys.mman;
-
+// For a program that is built with the card barrier (or links a runtime that
+// is) but does not use our collector: the stock GC, or upstream symgc. The
+// barrier refers to these symbols, and these definitions satisfy the linker.
+//
+// All zero is a complete answer: the window has no cards, so the range check
+// of every barrier fails and nothing is marked. Nothing has to be mapped and
+// nothing has to run before main, unlike the shim for the first ABI
+// (card_shim_v1.d), which had to map a table in .preinit_array.
+extern(C) __gshared size_t __sd_gc_card_lo;
+extern(C) __gshared size_t __sd_gc_card_n;
 extern(C) __gshared ubyte* __sd_gc_card_base;
 extern(C) __gshared ubyte* __sd_gc_card_summary_base;
 extern(C) void __sd_gc_card_range(void* dst, size_t size) {}
-
-extern(C) void __sd_gc_card_shim_init() {
-	enum NoReserve = 0x4000;
-	enum TableSize = size_t(1) << (47 - 9);
-	enum SummarySize = size_t(1) << (47 - 16);
-	if (__sd_gc_card_summary_base is null)
-		__sd_gc_card_summary_base = cast(ubyte*) mmap(null, SummarySize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | NoReserve, -1, 0);
-	if (__sd_gc_card_base is null)
-		__sd_gc_card_base = cast(ubyte*) mmap(null, TableSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | NoReserve, -1, 0);
-}
-
-import ldc.attributes : section;
-@section(".preinit_array") __gshared extern(C) void function() __sd_gc_card_shim_preinit = &__sd_gc_card_shim_init;
-

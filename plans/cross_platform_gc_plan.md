@@ -157,3 +157,37 @@ GC, which in exchange stops for 151 ms once).
 | Never built off Linux x86-64 | Phase 1 runs the battery on every OS before barrier work |
 | Unexplained 81 ms and 7.1 ms frames at 8 GiB | The 30–60 min soak at 4–8 GiB with the verifier (RFC section 15, option 5) |
 | Upstream symgc does not take the patches | Small tested steps; druntime can host the collector directly |
+
+## Progress log
+
+### 2026-10-12: step A, the card ABI that works on every platform (done)
+
+The first step toward Android and the other platforms, and the ABI that the frontend barrier of phase 2 will specify.
+Everything below was run on Linux x86-64; nothing was run on another OS.
+
+* **One window.** The memory that holds pointers is one contiguous reservation made when the collector starts
+  (256 GiB on a desktop, 16 GiB on Android and iOS, `SYMGC_HEAP_RESERVE_GIB`, halved down to 2 GiB if the system
+  refuses). The card table covers the window only: 512 MiB for 256 GiB, 32 MiB for 16 GiB, instead of a table for the
+  whole 47-bit address space.
+* **Range-checked barrier.** `if ((addr - lo) >> 9 < n) cards[(addr - lo) >> 9] = 1`. Stores to `malloc` memory and
+  through pointers with a tag in the top byte (Android's allocator, since Android 11) fall outside and mark nothing.
+  `lo`, `n` and the table are zero until the collector starts, so every barrier is a no-op until then: no
+  `.preinit_array`, `__mod_init_func` or `.CRT$XCU` hook is needed, which is what keeps it working inside a shared
+  library (an Android game is one).
+* **Cost.** 0% on class fields, structs and linked lists; +9% on array element stores; +5% to +15% on copies of 8 to
+  64 pointers (`barrier_micro`). On the 500k city and the 2 and 8 GiB stress tests, the same as the unchecked barrier
+  within noise. The "measure it before adopting it" condition of phase 2 is met on LDC.
+* **Correctness.** `mark_race` passes (and loses about 80,000 objects per run without the barrier), as do
+  `finalizer_order`, `phobos_stress`, `thread_exit_race` and the 113 unit tests. `cards_window` checks the window,
+  the out-of-window cases, the tag, the clipping at the end, and the fallback when address space is limited (a 32 GiB
+  limit makes the collector settle for 16 GiB).
+* **Compiling for other targets**, `ldc2 -mtriple=<target> -c` on the whole collector with the barrier:
+  `x86_64-linux-gnu` and `aarch64-linux-gnu` compile; `aarch64-linux-android` and `x86_64-windows-msvc` compile after
+  four fixes (Windows constants imported from the wrong module, `usleep` and a scoping error in Linux-only code, and
+  `sched_getcpu`, which Android only has from API 29). macOS and iOS do not compile: the collector has no waiter
+  (no futex on Darwin) and its stop-the-world protocol is Linux (signals) or Windows only.
+* **What this does not show.** Nothing has been linked or run on Windows, Android or arm64 Linux: there is no NDK,
+  emulator, device or cross sysroot on the development machine. "Compiles" is the claim, not "works".
+
+Next for phase 1: run the battery on the Android emulator (build instructions in `symgc/guide/android.md`, untested),
+then Windows. For phase 2: a first prototype of the frontend lowering on DMD.

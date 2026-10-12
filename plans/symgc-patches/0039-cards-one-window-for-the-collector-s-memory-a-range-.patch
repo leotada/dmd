@@ -1,0 +1,870 @@
+From 5445b783c2b9297be8f9306932fa17839a10f01d Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 13:29:30 -0300
+Subject: [PATCH] cards: one window for the collector's memory, a range-checked
+ barrier ABI
+
+The card table indexed by absolute address needed 256 GiB (+2 GiB of summary)
+of address space, a table set up from .preinit_array (shared libraries do not
+get it, and an Android game is one), and it could not tell a heap address from
+a malloc pointer with a tag in its top byte.
+
+The memory that holds the program's pointers now comes from one contiguous
+window reserved when the collector starts, before main (createProcess), 256
+GiB on a desktop and 16 GiB on Android and iOS, SYMGC_HEAP_RESERVE_GIB to
+change it, halved down to 2 GiB if the system will not give it. The card table
+covers the window only (1/512 of it). The barrier is range checked against
+`__sd_gc_card_lo` and `__sd_gc_card_n`, zero until the collector starts, which
+makes it a no-op until then: nothing has to run before the first constructor,
+so the .preinit_array / __mod_init_func / .CRT$XCU hooks are gone.
+
+collectCards and __sd_gc_card_range work on indices relative to the window; the
+Windows commit and decommit of table pages go through cardsCommit and
+cardsDecommit (and decommit only the pages that hold nothing but the purged
+cards).
+
+Compiling the whole collector for other targets (ldc2 -mtriple=..., compile
+only) found what had never been compiled outside Linux, now fixed: the Windows
+constants imported from the wrong module; usleep and a scoping error in code
+written for Linux only (a portable sleepMicros, and a VirtualAlloc for the root
+chunks); sched_getcpu, which Android only has from API 29 (the arena comes from
+the thread id there). x86_64-windows-msvc, aarch64-linux-android and
+aarch64-linux-gnu now compile with the card barrier; macOS and iOS still need a
+waiter and a stop-the-world protocol, written up in guide/platforms.md.
+
+Checked (Linux x86-64, LDC with the range-checked barrier): mark_race (21.8M
+moves, 0 violations; the same program without the barrier loses ~80k per run),
+finalizer_order, phobos_stress x3, thread_exit_race, the 113 unit tests, DMD
+with the kernel tracker unchanged, and cards_window (default window, a 4 GiB
+window with the whole table summed, and a 32 GiB address-space limit that makes
+the collector settle for 16 GiB).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ guide/benchmarks.md     |  29 +++++
+ guide/how-it-works.md   |  39 ++++++-
+ guide/integration.md    |   4 +-
+ guide/platforms.md      |  41 +++++--
+ guide/testing.md        |   1 +
+ source/d/gc/cards.d     | 248 ++++++++++++++++++++++++++++------------
+ source/d/gc/collector.d |   8 +-
+ source/d/gc/memmap.d    |  36 +-----
+ source/d/gc/page.d      |   4 +-
+ source/d/gc/region.d    |  69 ++++++++++-
+ source/d/gc/scanner.d   |  11 +-
+ source/d/gc/tcache.d    |   9 +-
+ source/d/gc/thread.d    |   7 ++
+ source/d/gc/time.d      |  21 ++++
+ 14 files changed, 405 insertions(+), 122 deletions(-)
+
+diff --git a/guide/benchmarks.md b/guide/benchmarks.md
+index 41074a1..95ce1ad 100644
+--- a/guide/benchmarks.md
++++ b/guide/benchmarks.md
+@@ -120,6 +120,35 @@ and oneday is 8.6 times faster. The fragmentation workload is the weak spot: one
+ about 3 s in collection work against 0.11 s for druntime's GC; where that time goes has not been measured yet.
+ Single-thread throughput and `frag` are both open items.
+ 
++## The cost of the range-checked barrier
++
++The card barrier checks that the address it marks is inside the collector's window (`how-it-works.md`, "The card
++window"). That is one more compare and one more load per store, which is what lets one barrier serve Android (tagged
++pointers), Windows and the others. Measured on 2026-10-12 against the barrier without the check, with the same
++program, same machine and CPU setting, pinned to one core, medians of five runs, LDC -O3
++(`barrier_micro.d`, ns per operation):
++
++| Store pattern | No barrier | Without the check | With the check | Check vs without |
++|---|---|---|---|---|
++| Pointer array element | 0.14 | 0.45 | 0.49 | +9% |
++| Class field | 0.58 | 1.30 | 1.30 | 0% |
++| Two fields of an object | 0.35 | 0.97 | 0.97 | 0% |
++| Two fields of a struct | 0.28 | 0.91 | 0.91 | 0% |
++| Linked list | 0.77 | 1.30 | 1.30 | 0% |
++| Copy of 8 pointers | 2.66 | 7.81 | 8.20 | +5% |
++| Copy of 64 pointers | 6.86 | 12.87 | 14.82 | +15% |
++| Copy of 1,024 pointers | 72.95 | 71.35 | 73.15 | +3% |
++| Append pointers (library) | 20.92 | 20.82 | 22.30 | +7% |
++| AA insert, pointer values (library) | 33.56 | 33.47 | 34.17 | +2% |
++
++The two loads are invariant and are hoisted out of loops, which is why a loop of field stores does not slow down.
++Short copies pay a little more: a check, then a call that clips the range. Two stores to the same object share one
++check. The controls (stores of ints, to the stack, to globals) are unchanged.
++
++On real workloads, run back to back in the same session (LDC + cards), the check changes nothing you can measure: stress test 2 GiB worst frame 0.67-0.72 ms with the check against 0.67-0.89 ms without; 8 GiB 0.89-1.35 ms
++against 0.91-0.97 ms (and one 8.5 ms outlier in the unchecked runs); 500k city p50 2.68-2.95 ms against 2.86-3.06 ms,
++worst 7.3-8.3 ms against 8.3-8.4 ms; no frame over 16 ms in any run.
++
+ ## Reproducing
+ 
+ ```sh
+diff --git a/guide/how-it-works.md b/guide/how-it-works.md
+index 94767c2..00b2d94 100644
+--- a/guide/how-it-works.md
++++ b/guide/how-it-works.md
+@@ -84,7 +84,7 @@ again. oneday has three ways, chosen once, at the first collection:
+ 
+ | Mode | How it knows what was written | Needs | Cost to the program |
+ |---|---|---|---|
+-| **Card barrier** | The compiler emits `cards[address >> 9] = 1` after each pointer store; one byte per 512 bytes of memory | LDC built from the `gc-card-marking` branch, everything compiled with `-gc-card-marking`, symgc built with `-version=Symgc_cards` | One byte store per pointer store (0.5 to 1.4 ns in microbenchmarks). Pointer-free stores and copies cost nothing |
++| **Card barrier** | The compiler emits `if ((addr - lo) >> 9 < n) cards[(addr - lo) >> 9] = 1` after each pointer store; one byte per 512 bytes of the collector's memory (see "The card window" below) | LDC built from the `gc-card-marking` branch, everything compiled with `-gc-card-marking`, symgc built with `-version=Symgc_cards` | A compare and a byte store per pointer store (0.5 to 1.4 ns in microbenchmarks). Pointer-free stores and copies cost nothing; a store outside the window costs only the compare |
+ | **Kernel dirty pages** | Linux write-protects the pointer-holding heap asynchronously (`userfaultfd` write-protect) and reports written pages (`PAGEMAP_SCAN`) | Linux 6.7 or newer, x86-64; any compiler | A fault of about 1.5 µs on the first write to each page in each cycle |
+ | **None** | Nothing: the mark stops the program | Nothing | No barrier cost; the pause is the whole mark, which grows with the heap |
+ 
+@@ -95,6 +95,37 @@ What the card barrier cannot see: pointer writes made by code compiled without `
+ libraries. C code may hold pointers to GC memory and read through them; that is fine. C code that *writes* a GC
+ pointer into GC memory while a mark runs is not seen. The kernel tracker sees every write, C included.
+ 
++### The card window
++
++With cards, the memory that holds your program's pointers is one contiguous range of address space, the window,
++reserved when the collector starts (before `main`). The card table covers the window and nothing else, one byte per
++512 bytes, so its size follows the heap the program can have and not the address space of the machine: 512 MiB of
++table for a 256 GiB window, 32 MiB for 16 GiB. Memory is only committed as the heap grows and the table is only
++touched where pointers are written.
++
++The barrier is range checked. `lo` is the start of the window and `n` the number of cards in it, both zero until the
++collector starts:
++
++```
++if ((addr - lo) >> 9 < n)  cards[(addr - lo) >> 9] = 1;
++```
++
++Three things follow, and they are what makes the same barrier usable on every platform:
++
++* A store to memory outside the window costs the compare and marks nothing. That is every store into `malloc` memory,
++  and every store through a pointer with a tag in its top byte, which is what Android's allocator returns for malloc
++  memory since Android 11: such an address minus `lo` is enormous, so the compare fails. The collector's own memory
++  is never tagged.
++* Before the collector starts, every barrier is a no-op, so there is nothing that has to run before everyone else's
++  start-up code. The table is set up by the collector itself, and a shared library loaded later (an Android game is
++  one) works the same as an executable.
++* A machine with little address space (many phones have 39 bits, 512 GiB for everything) still runs: the collector
++  asks for the window it wants and halves the request until the system agrees, down to 2 GiB. Run out of the window
++  and the program is out of memory, as it would be at any other heap limit.
++
++Memory that holds pointers but is not in the window (the program's static data, thread stacks, ranges added with
++`GC.addRange`) is not tracked by cards. It is scanned again as a root in the remark pause, as before.
++
+ ## What still stops your threads
+ 
+ * The start and remark pauses (sub-millisecond at 2 GiB with tracking).
+@@ -148,7 +179,9 @@ the others do nothing.
+ ## Limits worth knowing
+ 
+ * Measured on Linux x86-64 only. See `platforms.md` for the other systems.
+-* With cards, the table reserves 256 GiB (+2 GiB summary) of address space with `MAP_NORESERVE`; this needs
+-  `vm.overcommit_memory` 0 or 1, and it does not fit the smaller address spaces of phones yet.
++* With cards, the collector reserves its memory as one window of address space up front (256 GiB on a desktop, 16
++  GiB on Android and iOS, `SYMGC_HEAP_RESERVE_GIB` to change it) and cannot grow past it. The reservation is
++  `MAP_NORESERVE` on Posix, which needs `vm.overcommit_memory` 0 or 1, and `MEM_RESERVE` on Windows, which costs no
++  memory. If the system will not give that much address space, the collector halves the request down to 2 GiB.
+ * Objects never move. Slices, interior pointers and pointers held by C stay valid; fragmentation is handled by
+   returning empty slabs and pages, not by compaction.
+diff --git a/guide/integration.md b/guide/integration.md
+index 4db6063..e572b14 100644
+--- a/guide/integration.md
++++ b/guide/integration.md
+@@ -140,6 +140,7 @@ Environment variables, read at start-up:
+ | `SYMGC_SWEEP_DUTY=n` | 50 | Percent of the time the background sweeper may run |
+ | `SYMGC_SWEEP_NICE=n` | 10 | Nice value of the sweeper (Linux) |
+ | `SYMGC_CARD_SUMMARY=1` | off | With cards: also keep a summary byte per 64 KiB (faster remark at 8 GiB, slower stores with many threads) |
++| `SYMGC_HEAP_RESERVE_GIB=n` | 256 (16 on Android and iOS) | With cards: address space to reserve at start-up for the memory that holds pointers, the most that part of the heap can grow to. The collector halves the request, down to 2 GiB, if the system will not give it |
+ 
+ druntime's own options still apply where they make sense: `--DRT-gcopt=parallel:N` sets the mark threads too.
+ 
+@@ -159,6 +160,7 @@ druntime's own options still apply where they make sense: `--DRT-gcopt=parallel:
+ | `tlsGCData was not set for this thread!` (or `SIGILL` in `suspendDruntimeThreads`) | druntime 2.111 (GDC 15) and a second thread | Use a compiler with druntime 2.112+ |
+ | `undefined identifier GCTelemetry` | An older checkout of the fork | Update the fork; it builds without this project's druntime since 2026-10-12 |
+ | Programs run slower than with druntime's GC | A debug build of the collector | Build with `-b release` (dub) or `-O -release` |
+-| The card table cannot be mapped at start-up | `vm.overcommit_memory=2` | Use 0 or 1, or build without cards |
++| `symgc: cannot map the card table` or `cannot reserve address space for the heap` at start-up | `vm.overcommit_memory=2`, or an address-space limit (`ulimit -v`) smaller than 2 GiB plus its card table | Use `vm.overcommit_memory` 0 or 1, raise the limit, or build without cards |
++| Out of memory with plenty of RAM free, built with cards | The program used up the window | Raise `SYMGC_HEAP_RESERVE_GIB` |
+ | Long pauses that grow with the heap | No write tracking: kernel older than 6.7, no cards, or `SYMGC_CONCURRENT_MARK=0` | Check the setup table above |
+ | A crash or a corrupted object only under oneday | A bug, or C code writing GC pointers into GC memory | Rebuild with `-version=Symgc_verify` and report it (`testing.md`) |
+diff --git a/guide/platforms.md b/guide/platforms.md
+index ef4b089..2ab108a 100644
+--- a/guide/platforms.md
++++ b/guide/platforms.md
+@@ -32,11 +32,32 @@ poses as a placeholder thread while it scans (`core/thread/symthread.d`), which
+ | OS | Upstream symgc | oneday | Write tracking available | Known blockers |
+ |---|---|---|---|---|
+ | Linux x86-64 | Supported | Measured (every number in `benchmarks.md`) | Cards (patched LDC); kernel tracker on 6.7+ | None |
+-| Linux arm64 | Tested upstream (4 KiB pages) | Never built | Cards expected to work; the kernel tracker hard-codes x86-64 syscall numbers | The syscall numbers in `d/gc/dirty.d` |
+-| Windows x64 | Supported with DMD 2.112+ | Code written (card table with `VirtualAlloc`, `.CRT$XCU` start-up), never built | Cards (patched LDC); a `GetWriteWatch` tracker is planned | Untested |
+-| macOS (Intel, Apple Silicon) | Unknown | Code written (`__mod_init_func` start-up, Darwin `mmap`), never built | Cards (patched LDC) | Untested; DMD only targets Intel |
+-| Android arm64 | Unknown | Never built | Cards (patched LDC) | The barrier does not mask tagged pointers (Android 11+); the card table is set up from `.preinit_array`, which shared libraries ignore; the 256 GiB table does not fit 39-bit address spaces |
+-| iOS | Unknown | Never built | Cards (patched LDC), after the Android fixes | Same as Android, plus Apple's limits on virtual memory |
++| Linux arm64 | Tested upstream (4 KiB pages) | Compiles, with the card barrier (checked 2026-10-12). Never run | Cards (patched LDC); the kernel tracker is x86-64 only (`d/gc/dirty.d` hard-codes its syscall numbers) | Needs a machine or an emulator to run the battery |
++| Windows x64 | Supported with DMD 2.112+ | Compiles for `x86_64-windows-msvc`, with the card barrier (checked 2026-10-12). Never linked or run | Cards (patched LDC); a `GetWriteWatch` tracker is planned | Needs a Windows machine; pacing sleeps are coarse (see below) |
++| macOS (Intel, Apple Silicon) | Unknown | Does **not** compile | Cards (patched LDC) | No `Waiter` (no futex on Darwin), and the stop-the-world protocol is Linux (signals) or Windows only: see "macOS and iOS" below |
++| Android arm64 | Unknown | Compiles for `aarch64-linux-android`, with the card barrier (checked 2026-10-12). Never linked or run | Cards (patched LDC) | Needs an NDK, a runtime cross-built for Android, and a device or emulator. The barrier and the card table are ready for it (tagged pointers, `.so` start-up, 39-bit address spaces: see `how-it-works.md`) |
++| iOS | Unknown | Does **not** compile (same as macOS) | Cards (patched LDC), after the macOS work | Same as macOS, plus Apple's limits on virtual memory |
++
++"Compiles" means the whole collector builds with `ldc2 -mtriple=<target> -c -gc-card-marking
++-d-version=Symgc_cards`; it says nothing yet about running. Before 2026-10-12 the Windows, Android and macOS code had
++never been compiled for its target. Compiling it found, and fixed: the Windows constants imported from the wrong
++module; `usleep` and a scoping error in code written for Linux only; `sched_getcpu`, which Android only has from API
++level 29 (a thread now picks its arena from its id there).
++
++### macOS and iOS
++
++Two pieces are missing, both inside the collector:
++
++1. **A waiter.** `d/sync/waiter.d` has a futex implementation for Linux and a `WaitOnAddress` one for Windows. Darwin
++   has neither. A futex can be emulated with a table of `pthread` mutexes and condition variables keyed by address
++   (the compare-and-wait done under the bucket's lock), which keeps `FutexWaiter` unchanged.
++2. **Stopping the threads.** On Linux the collector signals each thread and waits for it to reach a safe point; on
++   Windows it suspends it and checks that it is not inside the collector. druntime stops Darwin threads with Mach
++   `thread_suspend`, so the Windows-style protocol is the natural base, but it relies on Win32 events in
++   `d/gc/thread.d` (`waitForGCBusy`, delayed threads) that need a Darwin counterpart.
++
++Neither can be tested without a Mac, so neither is written yet. The card barrier itself is ready for both: it is plain
++LLVM IR and its table is set up with `mmap`.
+ 
+ Without write tracking the collector still works everywhere it builds: the mark stops the program, and the sweep
+ runs beside it.
+@@ -54,8 +75,14 @@ for every target they support, is in `plans/cross_platform_gc_plan.md` of the dm
+ 
+ ## Machine requirements
+ 
+-* With cards: the card table reserves 256 GiB (+2 GiB summary) of address space with `MAP_NORESERVE`, so
+-  `vm.overcommit_memory` must be 0 or 1.
++* With cards: the collector reserves the address space for its pointer-holding memory (the window) when it starts,
++  256 GiB on a desktop and 16 GiB on Android and iOS, plus a card table of 1/512 of it (512 MiB and 32 MiB). On Posix
++  that is `MAP_NORESERVE`, so `vm.overcommit_memory` must be 0 or 1; on Windows it is `MEM_RESERVE`, which costs no
++  memory. If the system will not give that much, the collector asks for half, down to 2 GiB.
++  `SYMGC_HEAP_RESERVE_GIB` sets the first request. A program cannot grow its pointer-holding heap past the window.
++* Windows pacing: the sweeper and the helpers sleep for 50 to 100 microseconds on Posix. Windows sleeps in ticks of the
++  system timer (a millisecond at best), so a shorter wait yields the core instead, which spins a little; a high
++  resolution waitable timer would be better and has not been tried.
+ * Kernel tracker: Linux 6.7+ with `userfaultfd` available to unprivileged processes in user mode
+   (`UFFD_USER_MODE_ONLY`, the default on most distributions). If it is not available, the collector falls back to the
+   stop-the-world mark without telling you; `SYMGC_DIRTY=0` forces that fallback for comparisons.
+diff --git a/guide/testing.md b/guide/testing.md
+index 5c1b00b..35c8397 100644
+--- a/guide/testing.md
++++ b/guide/testing.md
+@@ -47,6 +47,7 @@ In `plans/bench/core_bench/`:
+ | `finalizer_order.d` | A destructor never sees another dead object's memory reused |
+ | `phobos_stress.d` | A mix of Phobos code allocating from several threads runs clean |
+ | `thread_exit_race.d` | Threads exiting during a concurrent mark do not crash it |
++| `cards_window.d` (run it with `cards_window.sh`) | With the card barrier: the window exists before `main` and holds the memory with pointers; a store marks its card and only that one; stores and copies to `malloc` memory, ranges at odd addresses (below and above the window, with a tag in the top byte) mark nothing; a range running past the end is cut; the collector settles for a smaller window when the address space is limited. Run it first on any new platform |
+ 
+ And the collector's unit tests, from the dmd repository root:
+ 
+diff --git a/source/d/gc/cards.d b/source/d/gc/cards.d
+index 19d7cac..298c026 100644
+--- a/source/d/gc/cards.d
++++ b/source/d/gc/cards.d
+@@ -5,22 +5,39 @@ module d.gc.cards;
+  *
+  * With `-version=Symgc_cards` the collector does not ask the kernel which
+  * pages were written (d.gc.dirty); the compiler says so. Code built with
+- * ldc2 `-gc-card-marking` sets one byte in the card table, `base[addr >> 9]`,
+- * after each store of a pointer to memory that is not on the stack or a
+- * global, and after each memcpy/memmove to such memory. The collector reads
+- * and clears the table to find the 512 byte cards to scan again.
++ * ldc2 `-gc-card-marking` sets one byte in the card table after each store of
++ * a pointer to memory that is not on the stack or a global, and after each
++ * memcpy/memmove to such memory. The collector reads and clears the table to
++ * find the 512 byte cards to scan again.
+  *
+  * Compared to the kernel route: a store that is not a pointer (a float in an
+  * object that is written every frame) dirties nothing, nothing faults after a
+  * collection cycle starts, and the pause only depends on the pointers the
+- * program wrote. The price: every store of a pointer costs three more
++ * program wrote. The price: every store of a pointer costs a few more
+  * instructions, and writes that do not come from instrumented code (a C
+  * library, `read()` into a buffer) are not seen.
++ *
++ * The memory that holds the program's pointers is one contiguous range, the
++ * window: [`__sd_gc_card_lo`, `__sd_gc_card_lo` + `__sd_gc_card_n` * 512). The
++ * card table covers the window and nothing else, so its size follows the heap
++ * the program can have, not the address space of the machine (a phone with 39
++ * bits of address space cannot give 256 GiB to a table). The barrier is range
++ * checked:
++ *
++ *     if ((addr - lo) >> 9 < n) base[(addr - lo) >> 9] = 1;
++ *
++ * so a store to memory outside the window (malloc, a pointer with a tag in
++ * its top byte, as the Android allocator hands out) costs a compare and marks
++ * nothing. `lo`, `n` and `base` are zero until the collector starts: until
++ * then every barrier is a no-op, which is right, because no memory of the
++ * collector exists. The tables are set up when the collector starts, before
++ * `main`, not by a constructor that has to run before every other one, which
++ * is what `.preinit_array` was for and what a shared library cannot have.
+  */
+ 
+-
+ version(Windows) {
+-	import core.sys.windows.winbase : VirtualAlloc, MEM_RESERVE, MEM_COMMIT, PAGE_READWRITE;
++	import core.sys.windows.winbase : VirtualAlloc, VirtualFree;
++	import core.sys.windows.winnt : MEM_RESERVE, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE;
+ } else version(Posix) {
+ 	version(linux) {
+ 		import core.sys.linux.sys.mman;
+@@ -44,66 +61,147 @@ enum CardSize = size_t(1) << CardShift;
+ // cards, which is what keeps the pause small for a heap of many GiB.
+ enum SummaryShift = 16;
+ enum CardsPerSummary = size_t(1) << (SummaryShift - CardShift);
+-enum SummarySize = size_t(1) << (47 - SummaryShift);
+-
+-// The whole user address space: 2^47 bytes of addresses, one byte per card.
+-enum TableSize = size_t(1) << (47 - CardShift);
+ 
+ /**
+- * The code the compiler emits loads this on each barrier, and indexes it
+- * with `address >> CardShift`.
++ * What the code the compiler emits loads on each barrier.
+  */
++extern(C) __gshared size_t __sd_gc_card_lo;
++extern(C) __gshared size_t __sd_gc_card_n;
+ extern(C) __gshared ubyte* __sd_gc_card_base;
+ extern(C) __gshared ubyte* __sd_gc_card_summary_base;
+ 
++// The window is carved in blocks of this many bytes (see d.gc.region).
++enum WindowGranule = size_t(1) << 30;
++
+ /**
+- * Mapped before any code that stores a pointer runs, not lazily. The
+- * constructors of the program run in no defined order, so this goes in
+- * `.preinit_array` (Linux/ELF), `__DATA,__mod_init_func` (macOS), or
+- * `.CRT$XCU` (Windows), which the dynamic loader runs before all of them.
++ * How much address space to reserve for the memory that holds pointers: the
++ * most the heap can grow to. SYMGC_HEAP_RESERVE_GIB overrides it. The default
++ * leaves room on a machine with a small address space.
+  */
+-extern(C) void __sd_gc_card_init() {
+-	if (__sd_gc_card_base !is null) {
+-		return;
++size_t windowSizeWanted() {
++	import core.stdc.stdlib : getenv, atoi;
++
++	if (auto env = getenv("SYMGC_HEAP_RESERVE_GIB")) {
++		auto gib = atoi(env);
++		if (gib > 0) {
++			return size_t(gib) * WindowGranule;
++		}
++	}
++
++	// A phone has 39 bits of address space on many devices (512 GiB for
++	// everything: libraries, stacks, the GPU driver's mappings).
++	version(Android) {
++		enum DefaultGiB = 16;
++	} else version(iOS) {
++		enum DefaultGiB = 16;
++	} else version(D_LP64) {
++		enum DefaultGiB = 256;
++	} else {
++		enum DefaultGiB = 1;
+ 	}
+ 
++	return size_t(DefaultGiB) * WindowGranule;
++}
++
++/// The smallest window worth having: smaller than this and the program is
++/// better off failing at start-up than running out of heap a minute in.
++enum WindowMinimum = size_t(2) * WindowGranule;
++
++void cardsFatal(string msg) {
++	import core.stdc.stdio : fprintf, stderr;
++	import core.stdc.stdlib : abort;
++	fprintf(stderr, "symgc: %.*s\n", cast(int) msg.length, msg.ptr);
++	abort();
++}
++
++private void* mapTable(size_t size) {
+ 	version(Windows) {
+-		auto q = VirtualAlloc(null, SummarySize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+-		if (q is null) {
+-			import core.stdc.stdio : fputs, stderr;
+-			import core.stdc.stdlib : abort;
+-			fputs("symgc: cannot map the card summary\n", stderr);
+-			abort();
+-		}
+-		__sd_gc_card_summary_base = cast(ubyte*) q;
+-
+-		auto p = VirtualAlloc(null, TableSize, MEM_RESERVE, PAGE_READWRITE);
+-		if (p is null) {
+-			import core.stdc.stdio : fputs, stderr;
+-			import core.stdc.stdlib : abort;
+-			fputs("symgc: cannot map the card table\n", stderr);
+-			abort();
+-		}
+-		__sd_gc_card_base = cast(ubyte*) p;
++		// Reserved here, committed with the memory it covers (cardsCommit).
++		return VirtualAlloc(null, size, MEM_RESERVE, PAGE_READWRITE);
+ 	} else version(Posix) {
+ 		enum Flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+-		auto q = mmap(null, SummarySize, PROT_READ | PROT_WRITE, Flags, -1, 0);
+-		if (q is MAP_FAILED) {
+-			import core.stdc.stdio : fputs, stderr;
+-			import core.stdc.stdlib : abort;
+-			fputs("symgc: cannot map the card summary\n", stderr);
+-			abort();
++		auto p = mmap(null, size, PROT_READ | PROT_WRITE, Flags, -1, 0);
++		return p is MAP_FAILED ? null : p;
++	}
++}
++
++/**
++ * Set up the tables for a window the collector has reserved. Called once,
++ * before any pointer is stored into the window's memory, from the thread that
++ * starts the collector.
++ */
++void cardsInit(void* lo, size_t size) {
++	assert(__sd_gc_card_base is null, "The card table is already set up!");
++	assert(size % WindowGranule == 0, "Invalid window size!");
++
++	auto cards = mapTable(size >> CardShift);
++	if (cards is null) {
++		cardsFatal("cannot map the card table");
++	}
++
++	// The summary is small (4 MiB for 256 GiB) and mapped even when unused.
++	version(Windows) {
++		auto summary = VirtualAlloc(null, size >> SummaryShift, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++	} else {
++		auto summary = mapTable(size >> SummaryShift);
++	}
++	if (summary is null) {
++		cardsFatal("cannot map the card summary");
++	}
++
++	__sd_gc_card_summary_base = cast(ubyte*) summary;
++	__sd_gc_card_base = cast(ubyte*) cards;
++	__sd_gc_card_lo = cast(size_t) lo;
++
++	// Last: this is what switches the barriers on.
++	atomicStore!(MemoryOrder.rel)(*cast(shared(size_t)*) &__sd_gc_card_n, size >> CardShift);
++}
++
++/**
++ * Where, in the table, are the cards of [addr, addr + size)? Windows commits
++ * the table in step with the memory it covers; elsewhere nothing is needed.
++ */
++version(Windows) {
++	private bool cardSlice(void* addr, size_t size, out size_t first, out size_t bytes) {
++		auto rel = cast(size_t) addr - __sd_gc_card_lo;
++		if (__sd_gc_card_base is null || rel >= (__sd_gc_card_n << CardShift)) {
++			return false;
++		}
++
++		first = rel >> CardShift;
++		bytes = size >> CardShift;
++		return true;
++	}
++
++	void cardsCommit(void* addr, size_t size) {
++		size_t first, bytes;
++		if (!cardSlice(addr, size, first, bytes)) {
++			return;
++		}
++
++		if (bytes == 0) {
++			bytes = 1;
++		}
++
++		// Whole pages of the table that cover the cards.
++		auto from = first & ~4095UL;
++		auto to = (first + bytes + 4095UL) & ~4095UL;
++		VirtualAlloc(__sd_gc_card_base + from, to - from, MEM_COMMIT, PAGE_READWRITE);
++	}
++
++	void cardsDecommit(void* addr, size_t size) {
++		size_t first, bytes;
++		if (!cardSlice(addr, size, first, bytes) || bytes == 0) {
++			return;
+ 		}
+-		__sd_gc_card_summary_base = cast(ubyte*) q;
+-
+-		auto p = mmap(null, TableSize, PROT_READ | PROT_WRITE, Flags, -1, 0);
+-		if (p is MAP_FAILED) {
+-			import core.stdc.stdio : fputs, stderr;
+-			import core.stdc.stdlib : abort;
+-			fputs("symgc: cannot map the card table\n", stderr);
+-			abort();
++
++		// Only the pages of the table that hold nothing but these cards:
++		// the neighbours' cards share the pages at both ends.
++		auto from = (first + 4095UL) & ~4095UL;
++		auto to = (first + bytes) & ~4095UL;
++		if (to > from) {
++			VirtualFree(__sd_gc_card_base + from, to - from, MEM_DECOMMIT);
+ 		}
+-		__sd_gc_card_base = cast(ubyte*) p;
+ 	}
+ }
+ 
+@@ -129,8 +227,21 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
+ 		return;
+ 	}
+ 
+-	auto first = cast(size_t) dst >> CardShift;
+-	auto last = (cast(size_t) dst + size - 1) >> CardShift;
++	// A copy to memory outside the window marks nothing. Objects do not
++	// straddle the window's edges, so one that starts outside is outside.
++	auto limit = __sd_gc_card_n << CardShift;
++	auto rel = cast(size_t) dst - __sd_gc_card_lo;
++	if (rel >= limit) {
++		return;
++	}
++
++	auto lastByte = rel + size - 1;
++	if (lastByte >= limit || lastByte < rel) {
++		lastByte = limit - 1;
++	}
++
++	auto first = rel >> CardShift;
++	auto last = lastByte >> CardShift;
+ 	auto cards = __sd_gc_card_base;
+ 	auto sums = __sd_gc_card_summary_base;
+ 	const bool useSummary = isSummaryEnabled();
+@@ -168,15 +279,22 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
+ }
+ 
+ /**
+- * Read and clear the cards of [start, start + size), calling `dg` with the
+- * page aligned runs that cover the dirty ones. Returns the number of pages.
++ * Read and clear the cards of [start, start + size), which lies in the window,
++ * calling `dg` with the page aligned runs that cover the dirty ones. Returns
++ * the number of pages.
+  */
+ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*, size_t) dg) {
+ 	enum PageSize = 4096;
+ 	enum CardsPerPage = PageSize / CardSize;
+ 
+-	auto lo = start >> CardShift;
+-	auto hi = (start + size) >> CardShift;
++	// The window starts on a block boundary, so a card index counted from it
++	// maps to a page address by plain arithmetic.
++	auto windowLo = __sd_gc_card_lo;
++	assert(start >= windowLo && start + size <= windowLo + (__sd_gc_card_n << CardShift),
++	       "Range outside the card window!");
++
++	auto lo = (start - windowLo) >> CardShift;
++	auto hi = (start + size - windowLo) >> CardShift;
+ 	auto base = __sd_gc_card_base;
+ 
+ 	size_t pages = 0;
+@@ -195,7 +313,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ 	}
+ 
+ 	void page(size_t pageIndex) {
+-		auto s = pageIndex * PageSize;
++		auto s = windowLo + pageIndex * PageSize;
+ 		if (s == runHi && runHi != 0) {
+ 			runHi = s + PageSize;
+ 			return;
+@@ -328,15 +446,3 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
+ void clearCards(size_t start, size_t size) {
+ 	collectCards(start, size, null);
+ }
+-
+-version(LDC) {
+-	import ldc.attributes : section;
+-
+-	version(Windows) {
+-		@section(".CRT$XCU") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
+-	} else version(OSX) {
+-		@section("__DATA,__mod_init_func") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
+-	} else {
+-		@section(".preinit_array") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
+-	}
+-}
+diff --git a/source/d/gc/collector.d b/source/d/gc/collector.d
+index e13596e..533861f 100644
+--- a/source/d/gc/collector.d
++++ b/source/d/gc/collector.d
+@@ -133,9 +133,9 @@ struct Collector {
+ 		 * busy, and is stopped like any other.
+ 		 */
+ 		if (gMarkActive.load() != 0) {
+-			import core.sys.posix.unistd : usleep;
++			import d.gc.time : sleepMicros;
+ 			while (gMarkActive.load() != 0 && Arena.computeUsedPageCount() > gSweepHardLimit) {
+-				usleep(100);
++				sleepMicros(100);
+ 			}
+ 
+ 			return;
+@@ -163,8 +163,8 @@ struct Collector {
+ 			if (!worked) {
+ 				// The sweeper is on a part that is not ours (finalizers) or
+ 				// another thread is in a step: do not fight it for the lock.
+-				import core.sys.posix.unistd : usleep;
+-				usleep(50);
++				import d.gc.time : sleepMicros;
++				sleepMicros(50);
+ 			}
+ 		}
+ 	}
+diff --git a/source/d/gc/memmap.d b/source/d/gc/memmap.d
+index 3c9881b..e8a093b 100644
+--- a/source/d/gc/memmap.d
++++ b/source/d/gc/memmap.d
+@@ -107,30 +107,16 @@ void pages_commit(void* addr, size_t size) {
+ 		if (ret !is null) {
+ 			assert(ret is addr, "MEM_COMMIT moved alloction!");
+ 			version(Symgc_cards) {
+-				import d.gc.cards : __sd_gc_card_base, CardShift;
+-				if (__sd_gc_card_base !is null) {
+-					size_t cardOffset = (cast(size_t) addr) >> CardShift;
+-					size_t cardBytes = (size >> CardShift);
+-					if (cardBytes == 0) cardBytes = 1;
+-					size_t alignedOffset = cardOffset & ~4095UL;
+-					size_t alignedBytes = ((cardOffset + cardBytes + 4095UL) & ~4095UL) - alignedOffset;
+-					VirtualAlloc(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_COMMIT, PAGE_READWRITE);
+-				}
++				import d.gc.cards : cardsCommit;
++				cardsCommit(addr, size);
+ 			}
+ 			return;
+ 		}
+ 
+ 		if (applyPerReservation(VmOp.commit, addr, size)) {
+ 			version(Symgc_cards) {
+-				import d.gc.cards : __sd_gc_card_base, CardShift;
+-				if (__sd_gc_card_base !is null) {
+-					size_t cardOffset = (cast(size_t) addr) >> CardShift;
+-					size_t cardBytes = (size >> CardShift);
+-					if (cardBytes == 0) cardBytes = 1;
+-					size_t alignedOffset = cardOffset & ~4095UL;
+-					size_t alignedBytes = ((cardOffset + cardBytes + 4095UL) & ~4095UL) - alignedOffset;
+-					VirtualAlloc(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_COMMIT, PAGE_READWRITE);
+-				}
++				import d.gc.cards : cardsCommit;
++				cardsCommit(addr, size);
+ 			}
+ 			return;
+ 		}
+@@ -309,18 +295,8 @@ void pages_purge(void* addr, size_t size) {
+ 		assert(ret == 0, "madvise failed!");
+ 	} else version(Windows) {
+ 		version(Symgc_cards) {
+-			import d.gc.cards : __sd_gc_card_base, CardShift;
+-			if (__sd_gc_card_base !is null) {
+-				size_t cardOffset = (cast(size_t) addr) >> CardShift;
+-				size_t cardBytes = (size >> CardShift);
+-				if (cardBytes > 0) {
+-					size_t alignedOffset = cardOffset & ~4095UL;
+-					size_t alignedBytes = (cardBytes & ~4095UL);
+-					if (alignedBytes > 0) {
+-						VirtualFree(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_DECOMMIT);
+-					}
+-				}
+-			}
++			import d.gc.cards : cardsDecommit;
++			cardsDecommit(addr, size);
+ 		}
+ 
+ 		/**
+diff --git a/source/d/gc/page.d b/source/d/gc/page.d
+index 509f69c..63b4266 100644
+--- a/source/d/gc/page.d
++++ b/source/d/gc/page.d
+@@ -626,8 +626,8 @@ public:
+ 
+ 		auto t0 = getMonotonicTime();
+ 
+-		import core.sys.posix.unistd : usleep;
+-		usleep(cast(uint) (owed / 10));
++		import d.gc.time : sleepMicros;
++		sleepMicros(cast(uint) (owed / 10));
+ 
+ 		auto slept = getMonotonicTime() - t0;
+ 		return slept >= owed ? 0 : owed - slept;
+diff --git a/source/d/gc/region.d b/source/d/gc/region.d
+index aaf2d60..c4f0daf 100644
+--- a/source/d/gc/region.d
++++ b/source/d/gc/region.d
+@@ -72,7 +72,29 @@ private:
+ 	// Count of blocks that are currently acquired.
+ 	size_t nBlocks = 0;
+ 
++	version(Symgc_cards) {
++		// The memory that holds pointers comes from one contiguous reservation
++		// (see d.gc.cards), so that the card table covers it and nothing more.
++		// It is handed out in chunks as the heap grows.
++		void* windowNext;
++		void* windowEnd;
++	}
++
+ public:
++	version(Symgc_cards) {
++		/**
++		 * Reserve the window, and set up the card table for it. Called when
++		 * the collector starts, before the program can store a pointer into
++		 * the collector's memory.
++		 */
++		void reserveWindow() shared {
++			mutex.lock();
++			scope(exit) mutex.unlock();
++
++			(cast(RegionAllocator*) &this).reserveWindowImpl();
++		}
++	}
++
+ 	bool acquire(ref void* blockAddress, uint extraBlocks = 0) shared {
+ 		mutex.lock();
+ 		scope(exit) mutex.unlock();
+@@ -248,6 +270,36 @@ private:
+ 		regionsByRange.insert(r);
+ 	}
+ 
++	version(Symgc_cards) {
++		void reserveWindowImpl() {
++			assert(mutex.isHeld(), "Mutex not held!");
++			assert(trackDirty, "Only the pointer allocator has a window!");
++
++			if (windowNext !is null) {
++				return;
++			}
++
++			import d.gc.cards;
++			auto size = windowSizeWanted();
++
++			// A machine with a small address space may not have what we ask
++			// for: ask for less, down to a floor.
++			void* ptr = base.reserveAddressSpace(size, BlockSize);
++			while (ptr is null && size > WindowMinimum) {
++				size = alignDown(size / 2, WindowGranule);
++				ptr = base.reserveAddressSpace(size, BlockSize);
++			}
++
++			if (ptr is null) {
++				cardsFatal("cannot reserve address space for the heap");
++			}
++
++			cardsInit(ptr, size);
++			windowNext = ptr;
++			windowEnd = ptr + size;
++		}
++	}
++
+ 	Region* refillAddressSpace(uint extraBlocks) {
+ 		assert(mutex.isHeld(), "Mutex not held!");
+ 
+@@ -259,7 +311,22 @@ private:
+ 		auto blocks = alignUp(extraBlocks + 1, RefillBlockCount);
+ 		auto size = blocks * BlockSize;
+ 
+-		auto ptr = base.reserveAddressSpace(size, BlockSize);
++		void* ptr = null;
++		version(Symgc_cards) {
++			if (trackDirty) {
++				// Out of window: the program has used all it reserved.
++				if (windowNext !is null
++					    && size <= cast(size_t) (windowEnd - windowNext)) {
++					ptr = windowNext;
++					windowNext += size;
++				}
++			} else {
++				ptr = base.reserveAddressSpace(size, BlockSize);
++			}
++		} else {
++			ptr = base.reserveAddressSpace(size, BlockSize);
++		}
++
+ 		if (ptr is null) {
+ 			unusedRegions.insert(r);
+ 			return null;
+diff --git a/source/d/gc/scanner.d b/source/d/gc/scanner.d
+index 9996c6f..27531ac 100644
+--- a/source/d/gc/scanner.d
++++ b/source/d/gc/scanner.d
+@@ -691,14 +691,21 @@ public:
+ 			size *= 2;
+ 		}
+ 
++		void* p = null;
+ 		version(Posix) {
+ 			import core.sys.posix.sys.mman;
+-			auto p = mmap(null, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++			p = mmap(null, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+ 			if (p == MAP_FAILED) {
+ 				return null;
+ 			}
++		} else version(Windows) {
++			import core.sys.windows.winbase : VirtualAlloc;
++			import core.sys.windows.winnt : MEM_RESERVE, MEM_COMMIT, PAGE_READWRITE;
++			p = VirtualAlloc(null, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++			if (p is null) {
++				return null;
++			}
+ 		} else {
+-			// The concurrent mark is Linux only: nothing to copy for.
+ 			return null;
+ 		}
+ 
+diff --git a/source/d/gc/tcache.d b/source/d/gc/tcache.d
+index 75f35b3..0a625f0 100644
+--- a/source/d/gc/tcache.d
++++ b/source/d/gc/tcache.d
+@@ -1223,7 +1223,14 @@ private:
+ 		 * of glibc thanks to rseqs, but we might want to find
+ 		 * an alternative on other systems.
+ 		 */
+-		 version(linux) {
++		 version(Android) {
++			// sched_getcpu needs API level 29, and the loader refuses a
++			// library that names a symbol the device does not have. A thread
++			// picks its arena from its id instead: same spread over the
++			// arenas, and a thread keeps its arena for as long as it lives.
++			return cast(uint) tid & ((ArenaCount >> 1) - 1);
++		 }
++		 else version(linux) {
+ 			import core.sys.linux.sched;
+ 			return sched_getcpu();
+ 		 }
+diff --git a/source/d/gc/thread.d b/source/d/gc/thread.d
+index 14e7c22..df1e858 100644
+--- a/source/d/gc/thread.d
++++ b/source/d/gc/thread.d
+@@ -12,6 +12,13 @@ void createProcess() {
+ 	Arena.initializeArenaStorage(gBase);
+ 	gExtentMap.initialize(gBase);
+ 
++	// The memory that holds pointers, and the card table that covers it, exist
++	// from here on: before main, so before any barrier has run.
++	version(Symgc_cards) {
++		import d.gc.region;
++		gPointerRegionAllocator.reserveWindow();
++	}
++
+ 	enterBusyState();
+ 	scope(exit) exitBusyState();
+ 
+diff --git a/source/d/gc/time.d b/source/d/gc/time.d
+index b31940d..e9119e4 100644
+--- a/source/d/gc/time.d
++++ b/source/d/gc/time.d
+@@ -14,3 +14,24 @@ ulong getMonotonicTime() {
+ 	auto cur = MonoTime.currTime();
+ 	return (cur - MonoTime.zero).total!"hnsecs";
+ }
++
++/**
++ * Sleep for about `us` microseconds. The collector paces itself with sleeps
++ * of 50 to 100 microseconds, which Posix gives. Windows sleeps in ticks of
++ * the system timer (a millisecond at best), so a short wait yields the core
++ * instead of sleeping a whole tick, and a longer one sleeps in whole
++ * milliseconds.
++ */
++void sleepMicros(uint us) {
++	version(Windows) {
++		import core.sys.windows.winbase : Sleep, SwitchToThread;
++		if (us < 1000) {
++			SwitchToThread();
++		} else {
++			Sleep((us + 999) / 1000);
++		}
++	} else version(Posix) {
++		import core.sys.posix.unistd : usleep;
++		usleep(us);
++	}
++}
+-- 
+2.51.0
+

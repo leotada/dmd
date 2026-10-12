@@ -1054,3 +1054,36 @@ Implements active heap defragmentation and physical memory compaction to elimina
   and the kernel tracker, no frame over 16 ms in any workload; worst frames 1.2 ms (stress 2 and 8 GiB) to 9.8 ms
   (500k city), against 548 ms (stress 8 GiB) and 193 ms (city) for druntime's GC. Allocation 8.6x faster with 8
   threads, 0.79x with one; `frag` 1.8x slower (open).
+
+### 11. The card window and the range-checked barrier (symgc 0039, LDC 0009; 2026-10-12)
+
+The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not depend on the platform.
+
+- **LDC 0009** (`plans/ldc-patches/0009-...`): the barrier is `if ((addr - lo) >> 9 < n) cards[(addr - lo) >> 9] = 1`
+  against three globals the collector provides (`__sd_gc_card_lo`, `__sd_gc_card_n`, `__sd_gc_card_base`), zero until
+  it starts. The pass records its requests while it walks a function and generates the code afterwards with
+  `SplitBlockAndInsertIfThen`, so it never changes the blocks it is iterating. Two stores to one object share one
+  check; a copy of unknown size calls `__sd_gc_card_range` only if its first byte is inside the window.
+- **symgc 0039**: the memory that holds pointers comes from one reserved window (`d/gc/region.d`,
+  `RegionAllocator.reserveWindow`, called from `createProcess` so it exists before `main`); `d/gc/cards.d` sets up the
+  table for it (1/512 of its size) and works on window-relative indices; `.preinit_array`, `__mod_init_func` and
+  `.CRT$XCU` hooks are gone. Window size: 256 GiB (16 GiB on Android and iOS), `SYMGC_HEAP_RESERVE_GIB`, halved down
+  to 2 GiB when the system refuses. Windows commits and decommits card pages through `cardsCommit`/`cardsDecommit`.
+- **Why**: the old table needed 256 GiB of address space, a hook that shared libraries never run, and could not tell a
+  heap pointer from a tagged `malloc` pointer (Android 11+). None of that holds on a phone.
+- **Evidence** (Linux x86-64, new LDC `ldc-build-rt3`): `mark_race` 21.8M moves, 0 violations; the same program built
+  without the barrier loses 78,837 to 84,458 per run. `finalizer_order`, `phobos_stress` x3, `thread_exit_race`, 113/113
+  unit tests, DMD with the kernel tracker unchanged (stress 2 GiB worst 1.14-1.20 ms). `cards_window.sh`: default
+  window, 4 GiB window with the whole table summed before and after, and `ulimit -v` 32 GiB where the collector falls
+  back to a 16 GiB window.
+- **Cost of the check** (`barrier_micro`, LDC -O3, medians of 5, pinned): class field 1.30 ns and linked list 1.30 ns,
+  two-field object 0.97 ns and struct 0.91 ns (all unchanged); array element 0.45 to 0.49 ns (+9%); copies of 8, 64 and
+  1,024 pointers +5%, +15%, +3%. Stress 2 GiB worst 0.67-0.72 ms (0.67-0.89 before), 8 GiB 0.89-1.35 ms (0.91-0.97 and
+  one 8.5 ms outlier before), 500k city p50 2.68-2.95 ms (2.86-3.06 before), no frame over 16 ms in any run.
+- **Compiling for other targets**: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `aarch64-linux-android` and
+  `x86_64-windows-msvc` compile the whole collector with the barrier (the last two after fixes: Windows constants from
+  the wrong module, `usleep` and a scoping error in Linux-only code, `sched_getcpu` absent below Android API 29).
+  macOS and iOS do not: no waiter, and the stop-the-world protocol exists for signals and Win32 only. Nothing was run
+  off Linux x86-64.
+- **Stock GC with a barrier runtime**: `plans/bench/core_bench/card_shim.d` is now three zero globals and an empty
+  function (the zero window turns every barrier into a no-op); the shim for the first ABI is `card_shim_v1.d`.

@@ -1840,5 +1840,28 @@ one DIP". The full plan is `plans/cross_platform_gc_plan.md`; the documentation 
   kernel tracker, oneday had no frame over 16 ms in any workload (stress 2 and 8 GiB, bullet hell, city 500k and
   100k, RTS, open world); druntime's GC reached 548 ms at 8 GiB and 193 ms in the 500k city.
 
+### ADR-11 — The card ABI: one window, a range check, no start-up hook (2026-10-12)
+
+* **Context:** the first card barrier indexed a table with the absolute address. That needed a table for the whole
+  address space (256 GiB reserved), a hook that runs before every constructor (`.preinit_array`, which shared
+  libraries do not get: an Android game is one), and it marked garbage for pointers with a tag in their top byte
+  (Android's allocator, since Android 11). It could not serve a phone.
+* **Decision:** the memory that holds pointers is one contiguous window reserved when the collector starts. The
+  barrier is `if ((addr - lo) >> 9 < n) cards[(addr - lo) >> 9] = 1`, with `lo`, `n` and the table zero until the
+  collector starts. This is the ABI the frontend barrier (ADR-10) will specify.
+* **Consequences:** a store outside the window (malloc, tagged, escaped stack) costs the compare; every barrier is a
+  no-op before the collector starts, so no start-up ordering exists to get wrong; the table is 1/512 of the window
+  (512 MiB for 256 GiB; 32 MiB for 16 GiB), so a 39-bit address space is enough; the collector settles for a smaller
+  window when the system refuses; the pointer-holding heap cannot grow past the window. Measured cost on LDC: 0% on
+  field and struct stores, +9% on array element stores, +5% to +15% on short pointer copies, nothing measurable on the
+  500k city or the stress tests. Implemented in LDC 0009 and symgc 0039; see `plans/symgc-patches/README.md`, section 11.
+
+### Progress of 2026-10-12 (step A of the cross-platform plan)
+
+The whole collector compiles with the card barrier for `aarch64-linux-gnu`, `aarch64-linux-android` and
+`x86_64-windows-msvc` (after fixing code that had only ever been compiled on Linux), and not yet for macOS and iOS
+(no waiter, no stop-the-world protocol). All the tests were run on Linux x86-64 only. Details and the next steps:
+`plans/cross_platform_gc_plan.md`, "Progress log".
+
 
 
