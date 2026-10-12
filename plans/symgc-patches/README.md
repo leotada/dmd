@@ -1035,3 +1035,22 @@ Implements active heap defragmentation and physical memory compaction to elimina
 - **Validation:**
   - `symgc_ut`: All 113 unit tests pass cleanly with zero regressions.
   - `test_defrag.d`: Validated allocation of 50,000 objects across multiple slabs, followed by sparse freeing and 100% reclamation; verified heap reduction from 3.6 MB down to 401 KB without crashes or memory corruption.
+
+### 10. Unpatched druntime, testers' guide and DMD numbers (patches 0037, 0038; 2026-10-12)
+
+- **0037** (`fix: build and run the concurrent mark on an unpatched druntime`): `GCTelemetry` is optional again
+  (0034 had made the fork require this project's druntime), and the GC thread poses as a placeholder `Thread` with
+  `m_lock` set while it calls `thread_scanAllType`, which an unpatched druntime would otherwise crash in (SIGSEGV,
+  null thread). Evidence, with an unpatched druntime built from dmd `master`: `mark_race` OK (6.8M moves, 0
+  violations); the verify build loses 11,126 objects with `SYMGC_DIRTY_SKIP=1`, so the concurrent mark is really
+  active; `finalizer_order` OK; against the patched druntime, 113/113 unit tests and `mark_race` OK. The concurrent
+  mark on Linux 6.7+ therefore needs no druntime change.
+- **0038** (`docs: guide for testers`): `symgc/guide/` (README, integration, writing-code, how-it-works, platforms,
+  benchmarks, testing). `docs/` could not be used: upstream's `.gitignore` reserves it for generated ddoc.
+- **GDC 15.3** (druntime 2.111): upstream symgc and oneday build, work with one thread, and die at the first
+  collection once a second druntime thread exists (no GC thread-init hook before 2.112: `tlsGCData` never set). The
+  legacy `Symgc_pthread_hook` mode aborts at start-up (`MonoTime` used before druntime initialised it).
+- **DMD numbers**: `plans/bench/core_bench/dmd_bench.sh`, 56 runs, results in `symgc/guide/benchmarks.md`. With DMD
+  and the kernel tracker, no frame over 16 ms in any workload; worst frames 1.2 ms (stress 2 and 8 GiB) to 9.8 ms
+  (500k city), against 548 ms (stress 8 GiB) and 193 ms (city) for druntime's GC. Allocation 8.6x faster with 8
+  threads, 0.79x with one; `frag` 1.8x slower (open).

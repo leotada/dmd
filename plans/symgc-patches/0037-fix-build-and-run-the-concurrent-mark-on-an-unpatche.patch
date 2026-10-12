@@ -1,0 +1,115 @@
+From 257e37745e3109406f7a4407533f71504df8e55b Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 12:29:06 -0300
+Subject: [PATCH 37/38] fix: build and run the concurrent mark on an unpatched
+ druntime
+
+Patch 0034 made SnazzyGC implement GCTelemetry unconditionally, so the fork
+no longer built against a druntime without this project's changes (GDC 15,
+stock DMD and LDC). The interface is now optional (`static if`), and
+frameStats exists only when druntime declares GC.FrameStats.
+
+An unpatched druntime's thread_scanAllType reads the caller's thread object
+without checking it for null, and the collector's own thread is not a
+druntime thread, so the concurrent mark crashed (SIGSEGV) at its first
+scan. While it scans, the GC thread now poses as a placeholder Thread whose
+m_lock is set, which tells druntime to leave the caller's stack bookkeeping
+alone. A patched druntime is unaffected.
+
+Checked with an unpatched druntime built from dmd master: mark_race passes
+(and loses 11,126 objects with SYMGC_DIRTY_SKIP=1 in a verify build, so the
+mark really runs beside the program), finalizer_order passes, and the 113
+unit tests pass against the patched druntime.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ source/core/thread/symthread.d | 28 ++++++++++++++++++++++++++++
+ source/symgc/gcobj.d           | 15 ++++++++++++++-
+ 2 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/source/core/thread/symthread.d b/source/core/thread/symthread.d
+index 5a38e4d..d3737de 100644
+--- a/source/core/thread/symthread.d
++++ b/source/core/thread/symthread.d
+@@ -197,9 +197,37 @@ void scanWorldPausedData(ScanDg scan) {
+ 		(cast(NoThrowScanDg)scan)(r);
+ 	}
+ 
++	// An unpatched druntime reads the caller's thread object in
++	// thread_scanAllType without checking it for null, and the collector's own
++	// thread is not a druntime thread. While it scans, it poses as a
++	// placeholder whose m_lock is set, which tells druntime to leave the
++	// caller's stack bookkeeping alone.
++	auto posing = self is null;
++	if (posing)
++		ThreadBase.setThis(scanPlaceholder());
++	scope(exit) if (posing)
++		ThreadBase.setThis(null);
++
+ 	thread_scanAllType(&scanItem);
+ }
+ 
++private Thread scanPlaceholder() nothrow
++{
++	align(16) static __gshared ubyte[__traits(classInstanceSize, Thread)] store;
++	static __gshared bool ready;
++
++	auto t = cast(Thread) cast(void*) store.ptr;
++	if (!ready) {
++		// Only ever called with the world stopped, from the collector's thread.
++		auto init = cast(const(ubyte)[]) typeid(Thread).initializer;
++		store[0 .. init.length] = init[];
++		t.m_lock = true;
++		ready = true;
++	}
++
++	return t;
++}
++
+ bool resumeDruntimeThreads(ref uint suspended) {
+ 	import d.gc.tcache;
+ 	import d.gc.tstate;
+diff --git a/source/symgc/gcobj.d b/source/symgc/gcobj.d
+index 5fe71e0..40767b8 100644
+--- a/source/symgc/gcobj.d
++++ b/source/symgc/gcobj.d
+@@ -8,6 +8,18 @@ import core.thread.threadbase : ThreadBase;
+ 
+ import core.stdc.string : memset;
+ 
++// The game-engine interface (GC.frameStats, thread exclusion, step, defrag)
++// only exists in a patched druntime. Without it the collector still builds
++// and runs; the methods are there but nothing in druntime calls them.
++enum hasGCTelemetry = is(GCTelemetry);
++
++static if (hasGCTelemetry)
++	private alias SnazzyBases = AliasSeq!(GC, GCTelemetry);
++else
++	private alias SnazzyBases = AliasSeq!(GC);
++
++private template AliasSeq(T...) { alias AliasSeq = T; }
++
+ // when running unittests and druntime is involved, set the GC to the symmetry GC
+ version(Symgc_testing) version(Symgc_druntime_hooks) {
+ 	extern(C) __gshared rt_options = ["gcopt=gc:sdc"];
+@@ -144,7 +156,7 @@ private GC initialize()
+ 	return initializeQuiet();
+ }
+ 
+-final class SnazzyGC : GC, GCTelemetry
++final class SnazzyGC : SnazzyBases
+ {
+ 	void enable()
+ 	{
+@@ -363,6 +375,7 @@ final class SnazzyGC : GC, GCTelemetry
+ 	 * Retrieve real-time frame telemetry about garbage collection.
+ 	 * Designed for game loops, profilers, and HUDs.
+ 	 */
++	static if (hasGCTelemetry)
+ 	core.memory.GC.FrameStats frameStats() nothrow @nogc @safe
+ 	{
+ 		import core.time : nsecs;
+-- 
+2.51.0
+

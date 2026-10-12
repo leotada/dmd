@@ -1,0 +1,878 @@
+From 56d2a7d5a3a7bbed5c4f852abd68bdb952e85d53 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Mon, 12 Oct 2026 12:29:06 -0300
+Subject: [PATCH 38/38] docs: guide for testers (setup, how it works,
+ platforms, benchmarks)
+
+guide/ holds the documentation for people trying the fork before it is
+upstream: choosing a setup and integrating it with dub, DMD, LDC or GDC;
+how a collection cycle and write tracking work; what to write and the rules
+for C libraries and audio threads; the compiler and OS matrix, marked
+checked, expected or unknown; the DMD and LDC numbers of 2026-10-12 with
+the commands that produced them; and how to report results. The README
+points to it. (docs/ is ignored by .gitignore for generated ddoc.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012VbUx1Wv1w4QgcvdgLK8qz
+---
+ README.md             |   4 ++
+ guide/README.md       |  81 +++++++++++++++++++++
+ guide/benchmarks.md   | 133 ++++++++++++++++++++++++++++++++++
+ guide/how-it-works.md | 154 +++++++++++++++++++++++++++++++++++++++
+ guide/integration.md  | 164 ++++++++++++++++++++++++++++++++++++++++++
+ guide/platforms.md    |  61 ++++++++++++++++
+ guide/testing.md      |  78 ++++++++++++++++++++
+ guide/writing-code.md | 114 +++++++++++++++++++++++++++++
+ 8 files changed, 789 insertions(+)
+ create mode 100644 guide/README.md
+ create mode 100644 guide/benchmarks.md
+ create mode 100644 guide/how-it-works.md
+ create mode 100644 guide/integration.md
+ create mode 100644 guide/platforms.md
+ create mode 100644 guide/testing.md
+ create mode 100644 guide/writing-code.md
+
+diff --git a/README.md b/README.md
+index 8ae5bd8..886aebb 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,9 @@
+ # SDC Garbage collector, ported to normal D
+ 
++> **This is the oneday fork** (branch `latency-p3`): symgc with a concurrent mark, a concurrent paced sweep and
++> game-engine controls, aimed at programs that must not pause, such as games. Start with [`guide/README.md`](guide/README.md).
++> The upstream text below still describes the base collector.
++
+ This is a port of the [SDC](https://github.com/snazzy-d/sdc) garbage collector to D code that builds with DMD/LDC/gdc.
+ 
+ The idea is to extract the GC portions of the SDC runtime (and everything needed) in order to be able to build using standard compilers.
+diff --git a/guide/README.md b/guide/README.md
+new file mode 100644
+index 0000000..62c2f96
+--- /dev/null
++++ b/guide/README.md
+@@ -0,0 +1,81 @@
++# oneday: a low-latency garbage collector for D
++
++oneday is a fork of [symgc](https://github.com/symmetryinvestments/symgc), the SDC garbage collector ported to
++ordinary D. It keeps symgc's allocator, which has no global lock, and moves the mark and the sweep beside the
++program. A game written the ordinary D way, with `new`, closures, `~=` and associative arrays and no pools, should not
++lose a frame to the collector.
++
++**Status, 2026-10-12: a preview for testing.** Everything is measured on Linux x86-64. Windows and macOS code exists
++but has not been built; Android and iOS need work (`platforms.md`). It is meant to be tried, measured and reported
++on, not shipped yet.
++
++## What it does, in numbers
++
++The bullet-hell stress test (2 GiB level, 100,000 bullets per second, no pools, 30 s at 60 fps) on a Ryzen 7 3800X
++under Linux 6.12, built with DMD 2.113:
++
++| Collector | p99.9 frame | Worst frame | Frames over 16 ms (of 1,800) |
++|---|---|---|---|
++| druntime's GC | 138 ms | 141 ms | 4 |
++| Upstream symgc | 24.7 ms | 28.0 ms | 3 |
++| oneday, stop-the-world mark | 10.3 ms | 11.1 ms | 0 |
++| oneday, concurrent mark (kernel tracker) | 1.1 ms | 1.3 ms | 0 |
++| oneday, LDC with the card barrier | 0.77 ms | 0.87 ms | 0 |
++| No collection at all (the game's own cost, DMD) | 0.97 ms | 0.98 ms | 0 |
++
++The rest, including game models with six job threads and 8 GiB heaps, is in `benchmarks.md`.
++
++## Which setup
++
++| You have | You get | Read |
++|---|---|---|
++| A stock DMD 2.112+ or an LDC with a 2.112+ frontend | The allocator and the concurrent sweep everywhere; on Linux 6.7+ also the concurrent mark through the kernel | `integration.md`, section 1 |
++| This project's DMD build (patched druntime) | The same, plus `GC.frameStats`, `excludeCurrentThread`, `step`, `defrag` | `integration.md`, section 4 |
++| This project's LDC build | The concurrent mark through a compiler barrier on any Linux kernel, the lowest tail | `integration.md`, section 4 |
++
++## The documents
++
++| File | What it covers |
++|---|---|
++| `integration.md` | Adding it to a project with dub, DMD, LDC or GDC; selecting it; options; checking it runs; troubleshooting |
++| `writing-code.md` | What to write and what to avoid; the frame loop, audio threads and loading screens; rules for C libraries |
++| `how-it-works.md` | The allocator, a collection cycle step by step, write tracking, what still pauses, finalizers |
++| `platforms.md` | Compilers and operating systems: what is checked, what is expected, what blocks |
++| `benchmarks.md` | All numbers, with the commands that produced them |
++| `testing.md` | How to help: what to run, the correctness battery, the report template |
++
++## Five-minute start (Linux, DMD 2.112+)
++
++```sh
++cat > dub.sdl <<'EOF'
++name "trygc"
++targetType "executable"
++dependency "symgc" path="<your clone of the fork>"
++EOF
++mkdir -p source && cat > source/app.d <<'EOF'
++import symgc.gcobj;
++import std.stdio;
++
++class Node { Node next; int[8] payload; }
++
++void main()
++{
++    Node head;
++    foreach (i; 0 .. 20_000_000)
++    {
++        auto n = new Node;
++        n.next = (i % 1000) ? head : null;   // the newest chain stays alive, older ones become garbage
++        head = n;
++    }
++    writeln("done");
++}
++EOF
++dub build -b release
++./trygc --DRT-gcopt=gc:sdc     # prints "using SYM GC!"
++./trygc                         # the same binary with druntime's GC
++```
++
++## Credits and licence
++
++The collector is SDC's, by Amaury Sachet, ported to D by Steven Schveighoffer (symgc, MIT licence). The latency
++work in this fork is documented patch by patch in `plans/symgc-patches/` of the dmd repository it was developed in.
+diff --git a/guide/benchmarks.md b/guide/benchmarks.md
+new file mode 100644
+index 0000000..41074a1
+--- /dev/null
++++ b/guide/benchmarks.md
+@@ -0,0 +1,133 @@
++# Benchmarks
++
++All numbers on this page come from one session on 2026-10-12, produced by `plans/bench/core_bench/dmd_bench.sh` of
++the dmd repository, so the collectors and the two compilers are compared under the same conditions. Older numbers,
++from the development of each patch, are in `plans/symgc-patches/README.md`.
++
++## Conditions
++
++* AMD Ryzen 7 3800X (8 cores, 16 threads), 31 GiB RAM, openSUSE Leap 16, Linux 6.12.
++* CPU frequency: `amd-pstate-epp`, governor `powersave`, energy preference `power`. A performance setting would lower
++  every frame time; it would not change the comparison.
++* DMD 2.113.0-beta.1 from the dmd repository (its druntime includes the faster associative arrays of
++  `plans/ldc-patches/0005`, which also speed up druntime's own GC in the game models). Flags
++  `-O -release -inline`.
++* LDC 1.43-git from the `gc-card-marking` branch, `-O3 -release -gc-card-marking -d-version=Symgc_cards`, runtime
++  built with the barrier.
++* Frames are 60 fps; "worst" is the longest frame of the run; "frames over 16 ms" counts frames that missed 60 fps.
++  Frame time is the game's own work plus whatever the collector costs it.
++
++| Label | Collector | Write tracking |
++|---|---|---|
++| druntime GC | druntime's conservative GC (same binary, no `gcopt`) | — |
++| upstream symgc | symgc at `4a4cb2b`, before this work | — (stop-the-world) |
++| oneday, STW mark | oneday, `SYMGC_CONCURRENT_MARK=0` | none: the mark stops the program, the sweep does not |
++| oneday | oneday, concurrent mark | Linux kernel dirty pages |
++| oneday, LDC + cards | oneday, concurrent mark | the compiler's card barrier |
++
++## Bullet-hell stress: lots of garbage, few live objects
++
++`bullet_hell_stress.d 30 <level MiB> 100000 0.05 256`: 100,000 bullets per second, each with a closure and 256 bytes of
++extra garbage, short lives, a level of 2 or 8 GiB kept alive. 30 s, 1,800 frames.
++
++**2 GiB level** (two runs for druntime GC and oneday, one for the others):
++
++| Collector | p50 | p99 | p99.9 | Worst | Frames over 16 ms | Peak RSS |
++|---|---|---|---|---|---|---|
++| druntime GC (DMD) | 0.18 ms | 0.70 ms | 138 ms | 139-141 ms | 4 | 4.4 GB |
++| upstream symgc (DMD) | 0.20 ms | 0.99 ms | 24.7 ms | 28.0 ms | 3 | 3.0 GB |
++| oneday, STW mark (DMD) | 0.21 ms | 0.94 ms | 10.3 ms | 11.1 ms | 0 | 3.0 GB |
++| oneday (DMD) | 0.22 ms | 0.97-0.98 ms | 1.11-1.15 ms | 1.19-1.27 ms | 0 | 3.0 GB |
++| No collection (DMD, the game's own cost) | 0.18 ms | 0.80 ms | 0.97 ms | 0.98 ms | 0 | 4.8 GB, growing |
++| oneday, LDC + cards | 0.11 ms | 0.63 ms | 0.77 ms | 0.87 ms | 0 | 3.0 GB |
++
++**8 GiB level** (one run each):
++
++| Collector | p50 | p99 | p99.9 | Worst | Frames over 16 ms | Peak RSS |
++|---|---|---|---|---|---|---|
++| druntime GC (DMD) | 0.18 ms | 0.74 ms | 539 ms | 548 ms | 2 | 16.9 GB |
++| upstream symgc (DMD) | 0.20 ms | 0.93 ms | 1.25 ms | 63.6 ms | 1 | 10.9 GB |
++| oneday, STW mark (DMD) | 0.21 ms | 0.95 ms | 1.11 ms | 35.3 ms | 1 | 11.3 GB |
++| oneday (DMD) | 0.21 ms | 0.95 ms | 1.19 ms | 1.22 ms | 0 | 11.3 GB |
++| oneday, LDC + cards | 0.11 ms | 0.64 ms | 0.84 ms | 0.84 ms | 0 | 11.3 GB |
++
++Reading: under DMD, without any compiler change, oneday's worst frame is within 0.3 ms of the game run with no
++collection at all, at 2 and at 8 GiB. druntime's GC stops the game for 0.14 s at 2 GiB and over half a second at
++8 GiB. At 8 GiB only one or two collections happen in 30 s, so a stop-the-world collector's p99.9 looks fine and its
++worst frame does not: the worst frame is the number that matters.
++
++## Bullet hell: a heavy game frame
++
++`bullet_hell.d 30 2048 40000`: the same game with long-lived bullets (45,000 alive), each updated every frame, so
++the game's own cost dominates. 30 s, 1,800 frames, one run each.
++
++| Collector | p50 | p99 | p99.9 | Worst | Frames over 16 ms | Peak RSS |
++|---|---|---|---|---|---|---|
++| druntime GC (DMD) | 1.21 ms | 1.55 ms | 1.75 ms | 151 ms | 1 | 5.4 GB |
++| upstream symgc (DMD) | 1.45 ms | 2.11 ms | 24.5 ms | 25.4 ms | 7 | 3.0 GB |
++| oneday, STW mark (DMD) | 1.45 ms | 2.05 ms | 13.2 ms | 13.3 ms | 0 | 3.1 GB |
++| oneday (DMD) | 1.48 ms | 2.53 ms | 4.05 ms | 4.26 ms | 0 | 3.1 GB |
++| oneday, LDC + cards | 0.65 ms | 0.99 ms | 1.24 ms | 1.30 ms | 0 | 3.1 GB |
++
++Reading: this is the kernel tracker's worst case. Every frame writes to the pages of 45,000 live bullets, and the
++first write to each page in a cycle costs a fault, so oneday under DMD pays about 0.3 ms at the median and 2 ms at
++p99.9 over druntime's GC in exchange for removing the 151 ms stop. The card barrier has no faults: LDC's frames are
++half of DMD's, mostly because LDC's code is faster.
++
++## Game models: six job threads, 2 GiB of assets
++
++`aaa_sim.d <mode> 60 2048 6 0 <population>`: models of big games, 60 s (3,600 frames), six job threads allocating
++the careless way (classes, closures, rebuilt arrays, associative arrays, strings), 2 GiB of resident assets.
++
++**City builder, 500,000 citizens**, the reference workload (two runs for druntime GC, upstream and oneday):
++
++| Collector | p50 | p99 | p99.9 | Worst | Frames over 16 ms | Peak RSS |
++|---|---|---|---|---|---|---|
++| druntime GC (DMD) | 9.1-9.2 ms | 79-81 ms | 131-152 ms | 137-193 ms | 37 | 3.0 GB |
++| upstream symgc (DMD) | 3.8-3.9 ms | 97-98 ms | 107-109 ms | 107-113 ms | 40 | 2.8 GB |
++| oneday, STW mark (DMD) | 3.6 ms | 5.8 ms | 57.9 ms | 60.7 ms | 25 | 3.3 GB |
++| oneday (DMD) | 4.3 ms | 7.0-7.1 ms | 8.6-8.9 ms | 9.7-9.8 ms | 0 | 3.6 GB |
++| oneday, LDC + cards | 3.1 ms | 4.7 ms | 5.8 ms | 6.9 ms | 0 | 3.1 GB |
++
++**The other models**, one run each (p50 / p99.9 / worst / frames over 16 ms):
++
++| Collector (DMD) | City, 100,000 citizens | RTS, 4,000 units | Open world, streaming |
++|---|---|---|---|
++| druntime GC | 1.74 / 31.9 / 40.4 ms / 18 | 2.60 / 10.8 / 13.2 ms / 0 | 0.29 / 14.9 / 16.6 ms / 2 |
++| upstream symgc | 1.12 / 45.0 / 48.5 ms / 14 | 2.21 / 33.5 / 36.9 ms / 14 | 0.29 / 0.64 / 14.1 ms / 0 |
++| oneday, STW mark | 1.00 / 17.0 / 17.5 ms / 10 | 2.24 / 9.8 / 11.0 ms / 0 | 0.29 / 1.90 / 8.8 ms / 0 |
++| oneday | 1.13 / 2.73 / 3.68 ms / 0 | 2.45 / 4.13 / 4.71 ms / 0 | 0.30 / 0.64 / 1.34 ms / 0 |
++
++Reading: with six threads allocating, the allocator matters as much as the pauses. druntime's GC serialises every
++allocation behind one lock, and its median city frame is twice oneday's. Upstream symgc fixes the median but stops
++the program for about 0.1 s at 500k. oneday under DMD, with no compiler change, keeps every frame of every model
++under 10 ms. The price is memory: 3.6 GB against 3.0 GB in the 500k city, because the heap keeps growing while a
++cycle runs beside the program.
++
++## Allocator throughput and fragmentation
++
++`gcb.d`, one binary run with and without `gcopt`, medians of three runs (DMD):
++
++| Workload | druntime GC | oneday | Ratio |
++|---|---|---|---|
++| `alloc 1 8000000`: one thread allocating small objects | 19.6 M allocs/s, 5.5 MB peak | 15.5 M allocs/s, 84 MB peak | 0.79x |
++| `alloc 8 4000000`: eight threads | 4.2 M allocs/s (8.1 s), 5.9 MB peak | 36.0 M allocs/s (0.94 s), 132 MB peak | 8.6x |
++| `frag 3000000 100000`: mixed sizes, long and short lives | 2.08 s, 1.00 GB | 3.83 s, 0.91 GB | 0.54x speed, 9% less memory |
++
++Reading: with one thread, druntime's GC allocates faster and keeps a much smaller heap: it collects 552 times where
++oneday collects 15, so oneday trades memory for fewer cycles. With eight threads druntime's single lock collapses
++and oneday is 8.6 times faster. The fragmentation workload is the weak spot: oneday takes 1.8 times as long, and spends
++about 3 s in collection work against 0.11 s for druntime's GC; where that time goes has not been measured yet.
++Single-thread throughput and `frag` are both open items.
++
++## Reproducing
++
++```sh
++# in the dmd repository root, with this project's dmd, Phobos and LDC built (integration.md, section 4)
++git -C symgc archive 4a4cb2b source | tar -x -C /tmp/upstream-symgc
++plans/bench/core_bench/dmd_bench.sh /tmp/bench-out /tmp/upstream-symgc/source
++cat /tmp/bench-out/results.txt
++```
++
++The run takes about an hour. Each line of `results.txt` is one run: the frame statistics in microseconds, the peak
++RSS in KiB and the exit code; the full output of each run sits beside it.
+diff --git a/guide/how-it-works.md b/guide/how-it-works.md
+new file mode 100644
+index 0000000..94767c2
+--- /dev/null
++++ b/guide/how-it-works.md
+@@ -0,0 +1,154 @@
++# How oneday works
++
++oneday is a fork of [symgc](https://github.com/symmetryinvestments/symgc) (the SDC garbage collector ported to
++ordinary D, by Steven Schveighoffer and Amaury Sachet). Its allocator comes from symgc unchanged. What the fork
++changes is *when* the program has to stop: the mark and the sweep run beside the program, and the only stops left
++are two short pauses per cycle.
++
++This page explains the design well enough to reason about pauses, costs and the rules your code has to follow. The
++patch-by-patch history, with the measurement behind each change, is in `plans/symgc-patches/README.md` of the dmd
++repository this work lives in.
++
++## Where it plugs in
++
++druntime has a pluggable GC interface (`core.gc.gcinterface.GC`) and a registry of collectors
++(`core.gc.registry`). Importing `symgc.gcobj` links the collector in. A `pragma(crt_constructor)` registers it under
++two names before `main` runs:
++
++* `sdc`, which prints `using SYM GC!` at start-up;
++* `sdcq`, the same collector without the message.
++
++druntime only uses it when asked, through `--DRT-gcopt=gc:sdcq` on the command line or through
++`extern(C) __gshared string[] rt_options = ["gcopt=gc:sdcq"];` in the program. Otherwise the program keeps
++druntime's conservative GC, even with symgc linked in. That makes A/B comparisons easy: one binary, two collectors.
++
++With `-version=Symgc_druntime_hooks` (set by the dub package), symgc also takes over druntime's array hooks
++(appending, capacity, `assumeSafeAppend`), so `~=` uses symgc's own size classes.
++
++## The allocator (from symgc)
++
++* **No global lock on the fast path.** Each thread allocates from its own thread cache. Small sizes are served from
++  per-thread bins; a thread only takes a lock to refill a bin or to get a new slab.
++* **Size classes and slabs.** Small objects live in slabs, runs of pages cut into equal slots. Large objects get
++  their own extent of pages.
++* **Arenas by kind.** Memory with pointers and memory without (`NO_SCAN`) live in different arenas, so the mark never
++  touches pixels, meshes or audio buffers. Objects with finalizers carry metadata and live apart too.
++* **Blocks and pages.** Address space is taken from the OS in 2 MiB blocks of 4 KiB pages, and pages are committed
++  and returned to the OS as the heap grows and shrinks.
++
++The allocator is why upstream symgc already makes the median frame of a multi-threaded game up to 5x faster than
++druntime's GC, whose single allocation lock serialises every thread. Upstream symgc still stops the whole program
++for the mark and the sweep, which is what the fork removes.
++
++## A collection cycle
++
++A cycle starts when the heap passes a target derived from what survived the last cycle. A GC thread runs it; the
++thread that crossed the target carries on.
++
++```
++program threads  ===========|=|=================================|=|=========================
++                            start                          remark
++                            pause                           pause
++GC thread                     [ mark, beside the program ][rounds]  [ finalize ][ sweep, paced ]
++mark threads (2-6)            [ mark ................... ]
++```
++
++1. **Arm write tracking.** Clear the card table, or arm the kernel's dirty-page tracker (see below).
++2. **Start pause.** Stop the threads, list the roots, the stacks and the thread-local storage as work, start a new
++   epoch, restart the threads. The ranges are read and traced after the restart; only the listing needs the stop.
++3. **Concurrent mark.** Mark threads trace the heap while the program runs. By default a quarter of the cores, at
++   least 2 and at most 6 (`SYMGC_MARK_THREADS`), at a nice value of 10 on Linux so that game threads win a shared
++   core. Objects allocated during the mark are *born live*: they are not traced and not freed this cycle.
++4. **Dirty rounds.** The program kept writing while the mark ran. The GC rescans what was written since, in rounds,
++   until fewer than 512 pages are dirty.
++5. **Remark pause.** Stop the threads again, rescan the roots, stacks, thread-local storage and the last dirty
++   memory, restart. Typically 0.1 to 0.6 ms at 2 GiB of live data. After it, everything reachable is marked.
++6. **Finalize.** Every finalizer of the cycle runs, in every arena, before any dead slot is reused. A destructor
++   may therefore read another dead object, which many programs do even though the spec forbids it.
++7. **Sweep, paced.** The GC thread returns dead slots to their slabs and slabs to their bins, one block at a time,
++   holding a lock for about 10 µs per step. It runs at most half of the time (`SYMGC_SWEEP_DUTY`). A thread that
++   allocates while the heap is past 1.25x the target helps with the sweep, so the heap cannot run away. Free pages
++   are kept warm up to the target and returned to the OS in small chunks.
++
++The mark is the algorithm of Boehm, Demers and Shenker ("Mostly parallel garbage collection", PLDI 1991): mark while
++the program runs, then fix up what it changed. Pauses depend mostly on the number of threads and on how much was
++written during the last round. Only the remark's read of the card table grows with the heap, slowly (about 0.2 ms
++at 2 GiB).
++
++## Write tracking: why the barrier matters
++
++While the mark runs, the program can store a pointer to an object the GC has not reached into an object the GC has
++already scanned, then drop the other path to it. Without help the GC would never see that object again and would
++free it while it is in use. Write tracking finds every memory region written during the mark so it can be scanned
++again. oneday has three ways, chosen once, at the first collection:
++
++| Mode | How it knows what was written | Needs | Cost to the program |
++|---|---|---|---|
++| **Card barrier** | The compiler emits `cards[address >> 9] = 1` after each pointer store; one byte per 512 bytes of memory | LDC built from the `gc-card-marking` branch, everything compiled with `-gc-card-marking`, symgc built with `-version=Symgc_cards` | One byte store per pointer store (0.5 to 1.4 ns in microbenchmarks). Pointer-free stores and copies cost nothing |
++| **Kernel dirty pages** | Linux write-protects the pointer-holding heap asynchronously (`userfaultfd` write-protect) and reports written pages (`PAGEMAP_SCAN`) | Linux 6.7 or newer, x86-64; any compiler | A fault of about 1.5 µs on the first write to each page in each cycle |
++| **None** | Nothing: the mark stops the program | Nothing | No barrier cost; the pause is the whole mark, which grows with the heap |
++
++Even with no tracking, the sweep still runs beside the program, so the pause is the mark alone. In the DMD stress
++benchmark at 2 GiB that is 10.3 ms against 24.7 ms for upstream symgc's stop-the-world cycle (`benchmarks.md`).
++
++What the card barrier cannot see: pointer writes made by code compiled without `-gc-card-marking`, which includes C
++libraries. C code may hold pointers to GC memory and read through them; that is fine. C code that *writes* a GC
++pointer into GC memory while a mark runs is not seen. The kernel tracker sees every write, C included.
++
++## What still stops your threads
++
++* The start and remark pauses (sub-millisecond at 2 GiB with tracking).
++* Handshakes: each thread is stopped with a signal (Posix) or `SuspendThread` (Windows) and must reach a safe state.
++  A thread descheduled by the OS delays the pause; on an overloaded machine that is the long tail.
++* An allocating thread that finds the heap far past its target waits or helps with the sweep. This is the
++  back-pressure that keeps memory bounded when the program allocates faster than the GC can collect.
++
++## Threads the GC never stops
++
++`GC.excludeCurrentThread()` puts the calling thread in a *detached* state: it is not stopped in the pauses and its
++stack is not scanned. It is meant for audio callbacks and other real-time threads. The rules that come with it:
++
++* **Its stack is not a root.** An object reachable only from a local variable of an excluded thread can be freed.
++  Keep what the thread uses reachable from somewhere else: a global, a field of a long-lived object, `GC.addRoot`, or
++  memory from `malloc`.
++* It must not allocate on the GC heap (the contract of `GC.excludeCurrentThread` in `core.memory`). Pre-allocate
++  what the callback needs, or use `malloc`. The collector does not enforce this today: an excluded thread that
++  allocates never starts a collection, but its allocations can take locks.
++* `GC.includeCurrentThread()` undoes it. The stacks of up to 8 excluded threads are skipped; more threads can be
++  excluded, but their stacks are scanned.
++
++## Finalizers
++
++Finalizers (class destructors, struct destructors of GC arrays) run on the GC thread, not on the thread that
++allocated the object, and before any memory of the cycle is reused. Allocating from a finalizer throws
++`InvalidMemoryOperationError`, as with druntime's GC.
++
++## Game-engine controls
++
++These need the druntime from this project (they live in `core.memory.GC`); see `integration.md`.
++
++| Call | What it does |
++|---|---|
++| `GC.frameStats()` | Time this thread lost to the GC (allocation slow paths, assists, pauses), totals for all threads, whether a cycle is running, live heap, number of collections. Cheap enough to read every frame for a HUD |
++| `GC.excludeCurrentThread()` / `includeCurrentThread()` / `isThreadExcluded()` | The detached state above |
++| `GC.step(Duration maxTime)` | Gives spare frame time (for example before waiting for vsync) to the sweep |
++| `GC.defrag()` / `GC.minimize()` | Finishes the running sweep, returns completely empty slabs and every free page to the OS; returns the number of pages returned |
++
++Under druntime's own GC these calls fall back: `frameStats` reports `GC.stats()`, `defrag` calls `minimize()`, and
++the others do nothing.
++
++## Diagnostics built in
++
++| Build flag | Effect |
++|---|---|
++| `-version=Symgc_verify` | Verifier mode: freed slots are poisoned and checked when handed out again. Slower; use it when you suspect the GC |
++| `-version=Symgc_phase_trace` | Prints the duration of each phase of each cycle |
++| `-version=Symgc_gctime` | Per-thread counters of time lost to memory management (what `frameStats` reads) |
++
++## Limits worth knowing
++
++* Measured on Linux x86-64 only. See `platforms.md` for the other systems.
++* With cards, the table reserves 256 GiB (+2 GiB summary) of address space with `MAP_NORESERVE`; this needs
++  `vm.overcommit_memory` 0 or 1, and it does not fit the smaller address spaces of phones yet.
++* Objects never move. Slices, interior pointers and pointers held by C stay valid; fragmentation is handled by
++  returning empty slabs and pages, not by compaction.
+diff --git a/guide/integration.md b/guide/integration.md
+new file mode 100644
+index 0000000..4db6063
+--- /dev/null
++++ b/guide/integration.md
+@@ -0,0 +1,164 @@
++# Using oneday in a project
++
++This guide gets oneday into a D program with DMD, LDC or GDC, shows how to select it, and how to check it is the
++collector actually running. Read `platforms.md` first if you are not on Linux x86-64.
++
++## 1. Pick a setup
++
++| Setup | Compiler | What you install | What you get |
++|---|---|---|---|
++| **Plugin** | Stock DMD 2.112+, or LDC with a 2.112+ frontend | Nothing; oneday is a dub dependency | The allocator without a global lock, the concurrent paced sweep, and on Linux 6.7+ the concurrent mark through the kernel tracker. Elsewhere the mark is a pause |
++| **Plugin + this project's druntime** | DMD 2.113 built from this project | A dmd and Phobos build | The same, plus the game-engine calls (`GC.frameStats`, `excludeCurrentThread`, `step`, `defrag`) |
++| **Card barrier** | LDC built from this project's `gc-card-marking` branch | An LDC build with its runtime | The concurrent mark on any Linux kernel without page faults, the lowest tail, and the game-engine calls |
++
++GDC: GDC 15 (druntime 2.111) cannot run symgc in a program with more than one thread yet; see `platforms.md`.
++
++The concurrent mark on a stock druntime was checked on 2026-10-12 with an unpatched druntime built from dmd's
++`master` (2.113 in development): `mark_race.d` passes, and fails with 11,126 lost objects when the tracker is
++disabled on purpose, so the mark really runs beside the program. A released 2.112 has not been tried; please report.
++
++Where the sources are: the fork is not on a public package registry yet. This guide assumes a clone of the fork
++(branch `latency-p3`) at `$SYMGC`. The same changes are kept as patches in `plans/symgc-patches/` of the dmd
++repository, and apply to upstream symgc (`github.com/symmetryinvestments/symgc`, commit `4a4cb2b`) with
++`git am plans/symgc-patches/*.patch`.
++
++## 2. Add it to the program
++
++### With dub
++
++`dub.sdl`:
++
++```sdl
++name "mygame"
++targetType "executable"
++dependency "symgc" path="$SYMGC"
++```
++
++`source/app.d`:
++
++```d
++import symgc.gcobj;                                            // links the collector in
++extern(C) __gshared string[] rt_options = ["gcopt=gc:sdcq"];   // and selects it
++
++void main() { /* ... */ }
++```
++
++Build optimized. The collector is compiled with your project's settings, and a debug build of a collector is slow:
++
++```sh
++dub build -b release --compiler=dmd     # or ldc2, or gdc
++./mygame
++```
++
++### Without dub
++
++The collector is a set of D sources compiled with the program:
++
++```sh
++# DMD
++dmd -O -release -inline -version=Symgc_druntime_hooks -I$SYMGC/source \
++    mygame.d $(find $SYMGC/source -name '*.d')
++
++# LDC
++ldc2 -O3 -release -d-version=Symgc_druntime_hooks -I$SYMGC/source \
++    mygame.d $(find $SYMGC/source -name '*.d')
++
++# GDC (single-threaded programs only on GDC 15)
++gdc -O2 -frelease -fversion=Symgc_druntime_hooks -I$SYMGC/source \
++    mygame.d $(find $SYMGC/source -name '*.d') -o mygame
++```
++
++`-version=Symgc_druntime_hooks` lets symgc take over druntime's array hooks (`~=`, capacity); the dub package sets
++it for you.
++
++## 3. Select the collector
++
++Linking it in is not enough: druntime uses its own GC unless told otherwise. Either in the program:
++
++```d
++extern(C) __gshared string[] rt_options = ["gcopt=gc:sdcq"];
++```
++
++or on the command line, which overrides the program: `./mygame --DRT-gcopt=gc:sdcq`.
++
++* `gc:sdc` is the same collector and prints `using SYM GC!` at start-up: the quickest check that it is active.
++* `gc:sdcq` is quiet.
++* Leaving both out runs druntime's conservative GC. One binary can therefore compare the two collectors.
++
++## 4. The setups that need a build
++
++### This project's DMD (concurrent mark with the kernel tracker, game-engine calls)
++
++```sh
++git clone <dmd repository of this project> dmd && cd dmd
++git checkout gc-phase0-discovery
++make -j$(nproc)                                      # the compiler and druntime
++git clone --depth 1 --branch v2.113.0-beta.1 https://github.com/dlang/phobos ../phobos
++make -C ../phobos -j$(nproc) BUILD=release           # Phobos against this druntime
++```
++
++Use `generated/linux/release/64/dmd` as the compiler (`dub --compiler=<path>`). Phobos embeds a copy of druntime,
++so rebuild Phobos after every druntime change, or programs link the old one.
++
++### This project's LDC with the card barrier
++
++You need the LLVM 19 development package and a D compiler to bootstrap. In the dmd repository root, with the LDC
++checkout at `ldc/` (branch `gc-card-marking`) and Phobos beside it:
++
++```sh
++cmake -G Ninja -S ldc -B ldc-build-rt2 -DCMAKE_BUILD_TYPE=Release \
++  -DLLVM_CONFIG=$(which llvm-config) -DD_COMPILER=$(which ldmd2) \
++  -DPHOBOS2_DIR=<phobos checkout> -DBUILD_SHARED_LIBS=OFF -DLDC_DYNAMIC_COMPILE=OFF \
++  -DD_EXTRA_FLAGS="-gc-card-marking"
++ninja -C ldc-build-rt2
++```
++
++`-DD_EXTRA_FLAGS=-gc-card-marking` builds druntime and Phobos with the barrier, which is required: every piece of D
++code that stores pointers into the GC heap must carry it. Then a wrapper, saved as `ldc2` in a directory of its own:
++
++```sh
++#!/bin/sh
++R=<dmd repository>/ldc-build-rt2
++exec $R/bin/ldc2 -conf=$R/etc/ldc2.conf -I<phobos checkout> \
++  -gc-card-marking -d-version=Symgc_cards "$@"
++```
++
++and build with `PATH=<wrapper dir>:$PATH dub build -b release --compiler=ldc2`. `-d-version=Symgc_cards` makes the
++collector read the card table instead of asking the kernel. The LDC changes are also kept as patches in
++`plans/ldc-patches/` of the dmd repository.
++
++## 5. Runtime options
++
++Environment variables, read at start-up:
++
++| Variable | Default | Meaning |
++|---|---|---|
++| `SYMGC_CONCURRENT_MARK=0` | on where tracking exists | Use the stop-the-world mark (the safe fallback, and the baseline for comparisons) |
++| `SYMGC_DIRTY=0` | on | Do not use the kernel tracker |
++| `SYMGC_MARK_THREADS=n` | a quarter of the cores, 2 to 6 (all cores for a stop-the-world mark) | Threads that mark |
++| `SYMGC_MARK_NICE=n` | 10 | Nice value of the mark threads (Linux) |
++| `SYMGC_SWEEP_DUTY=n` | 50 | Percent of the time the background sweeper may run |
++| `SYMGC_SWEEP_NICE=n` | 10 | Nice value of the sweeper (Linux) |
++| `SYMGC_CARD_SUMMARY=1` | off | With cards: also keep a summary byte per 64 KiB (faster remark at 8 GiB, slower stores with many threads) |
++
++druntime's own options still apply where they make sense: `--DRT-gcopt=parallel:N` sets the mark threads too.
++
++## 6. Check that it works
++
++* `--DRT-gcopt=gc:sdc` prints `using SYM GC!`.
++* With cards, `nm mygame | grep __sd_gc_card_base` must find the card table. If it does not, the program was built
++  without `-d-version=Symgc_cards` and falls back to the kernel tracker or a stop-the-world mark.
++* Frame times: `GC.frameStats()` (this project's druntime) gives per-thread GC time; see `writing-code.md`.
++* `-version=Symgc_phase_trace` prints every phase of every cycle, with its duration.
++
++## 7. Troubleshooting
++
++| Symptom | Cause | Fix |
++|---|---|---|
++| `no property tlsGCData for ThreadBase` | Compiler older than 2.111 | Use DMD 2.112+ or an LDC with a 2.112+ frontend |
++| `tlsGCData was not set for this thread!` (or `SIGILL` in `suspendDruntimeThreads`) | druntime 2.111 (GDC 15) and a second thread | Use a compiler with druntime 2.112+ |
++| `undefined identifier GCTelemetry` | An older checkout of the fork | Update the fork; it builds without this project's druntime since 2026-10-12 |
++| Programs run slower than with druntime's GC | A debug build of the collector | Build with `-b release` (dub) or `-O -release` |
++| The card table cannot be mapped at start-up | `vm.overcommit_memory=2` | Use 0 or 1, or build without cards |
++| Long pauses that grow with the heap | No write tracking: kernel older than 6.7, no cards, or `SYMGC_CONCURRENT_MARK=0` | Check the setup table above |
++| A crash or a corrupted object only under oneday | A bug, or C code writing GC pointers into GC memory | Rebuild with `-version=Symgc_verify` and report it (`testing.md`) |
+diff --git a/guide/platforms.md b/guide/platforms.md
+new file mode 100644
+index 0000000..ef4b089
+--- /dev/null
++++ b/guide/platforms.md
+@@ -0,0 +1,61 @@
++# Platforms and compilers
++
++State on 2026-10-12. "Checked" means run on the project's test machine (openSUSE Leap 16, Linux 6.12, Ryzen 7
++3800X). Everything else is marked as expected or unknown. Reports from other systems are what this preview is for;
++see `testing.md`.
++
++## Compilers
++
++| Compiler | Frontend | Upstream symgc | oneday | Concurrent mark | Card barrier | Status |
++|---|---|---|---|---|---|---|
++| DMD 2.109 and older | ≤ 2.109 | Does not build (no `ThreadBase.tlsGCData`) | Same | — | — | Checked |
++| LDC 1.40 | 2.110 | Does not build (same) | Same | — | — | Checked |
++| GDC 15.3 | 2.111 | Builds; works with one thread; dies at the first collection once a second druntime thread exists | Same | Same crash | — | Checked |
++| Unpatched druntime from dmd `master` (2.113 in development) | 2.113 | Not tried | Works | Kernel tracker, Linux 6.7+ (`mark_race`, `finalizer_order` pass) | — | Checked |
++| DMD 2.112 or newer, stock release | ≥ 2.112 | Supported by upstream | Builds | Kernel tracker expected, as above | — | Expected; please report |
++| LDC with a 2.112+ frontend, stock | ≥ 2.112 | Supported by upstream | Builds | Kernel tracker expected, as above | — | Expected; please report |
++| DMD 2.113 from this project (patched druntime) | 2.113 | Works | Works | Kernel tracker, Linux 6.7+ | — | Checked |
++| LDC 1.43-git from this project (`gc-card-marking`) | 2.113 | Does not run on this runtime | Works | Cards, or the kernel tracker | Yes | Checked |
++
++**Why GDC 15 fails:** its druntime (2.111) has `tlsGCData` but not the GC's thread-init hook, which druntime gained
++in April 2025 (2.112). The collector never learns about the threads druntime starts and asserts when it tries to
++stop them. Supporting 2.111 inside the fork is planned (attach a thread on its first allocation). Until then, GDC
++needs a release whose druntime is 2.112 or newer.
++
++**The druntime from this project** adds two things: the game-engine calls in `core.memory.GC` (`frameStats`,
++`excludeCurrentThread`, `step`, `defrag`, ...) and a 2-line fix that lets a collector stop the world from its own
++thread. oneday needs neither: without the calls it simply does not offer them, and without the fix its GC thread
++poses as a placeholder thread while it scans (`core/thread/symthread.d`), which an unpatched druntime accepts.
++
++## Operating systems
++
++| OS | Upstream symgc | oneday | Write tracking available | Known blockers |
++|---|---|---|---|---|
++| Linux x86-64 | Supported | Measured (every number in `benchmarks.md`) | Cards (patched LDC); kernel tracker on 6.7+ | None |
++| Linux arm64 | Tested upstream (4 KiB pages) | Never built | Cards expected to work; the kernel tracker hard-codes x86-64 syscall numbers | The syscall numbers in `d/gc/dirty.d` |
++| Windows x64 | Supported with DMD 2.112+ | Code written (card table with `VirtualAlloc`, `.CRT$XCU` start-up), never built | Cards (patched LDC); a `GetWriteWatch` tracker is planned | Untested |
++| macOS (Intel, Apple Silicon) | Unknown | Code written (`__mod_init_func` start-up, Darwin `mmap`), never built | Cards (patched LDC) | Untested; DMD only targets Intel |
++| Android arm64 | Unknown | Never built | Cards (patched LDC) | The barrier does not mask tagged pointers (Android 11+); the card table is set up from `.preinit_array`, which shared libraries ignore; the 256 GiB table does not fit 39-bit address spaces |
++| iOS | Unknown | Never built | Cards (patched LDC), after the Android fixes | Same as Android, plus Apple's limits on virtual memory |
++
++Without write tracking the collector still works everywhere it builds: the mark stops the program, and the sweep
++runs beside it.
++
++## Which compiler for which target
++
++| | Linux x86-64 | Linux arm64 | Windows x64 | macOS Intel | macOS Apple Silicon | Android | iOS |
++|---|---|---|---|---|---|---|---|
++| DMD | Yes | No | Yes | Yes | Through Rosetta | No | No |
++| LDC | Yes | Yes | Yes | Yes | Yes | Yes | Yes, less tested |
++| GDC | Yes | Yes | MinGW | Unknown | Unknown | No | No |
++
++Phones mean LDC. The plan to make the barrier come from the shared D frontend, so that DMD, LDC and GDC all emit it
++for every target they support, is in `plans/cross_platform_gc_plan.md` of the dmd repository.
++
++## Machine requirements
++
++* With cards: the card table reserves 256 GiB (+2 GiB summary) of address space with `MAP_NORESERVE`, so
++  `vm.overcommit_memory` must be 0 or 1.
++* Kernel tracker: Linux 6.7+ with `userfaultfd` available to unprivileged processes in user mode
++  (`UFFD_USER_MODE_ONLY`, the default on most distributions). If it is not available, the collector falls back to the
++  stop-the-world mark without telling you; `SYMGC_DIRTY=0` forces that fallback for comparisons.
+diff --git a/guide/testing.md b/guide/testing.md
+new file mode 100644
+index 0000000..5c1b00b
+--- /dev/null
++++ b/guide/testing.md
+@@ -0,0 +1,78 @@
++# Helping test oneday
++
++This is a preview. What it needs most is reports from programs and machines other than the one it was developed on:
++other operating systems, other CPUs, other compilers, and real games. This page says what to run and what to send.
++
++## Try it on your own program
++
++The cheapest useful test: build your program once with oneday linked in (`integration.md`), then run the same binary
++twice.
++
++```sh
++./mygame                          # druntime's GC
++./mygame --DRT-gcopt=gc:sdc       # oneday (prints "using SYM GC!")
++```
++
++Compare what you care about: frame times (p50, p99, worst, frames over 16.7 ms), memory, load times. If your program
++has a test suite, run it under oneday too (`--DRT-gcopt=gc:sdcq`), and once with the collector built in verifier
++mode (`-version=Symgc_verify`), which catches use-after-free in the collector or in your program.
++
++## The benchmark kit
++
++The programs live in `plans/bench/core_bench/` of the dmd repository. They are written the careless way on purpose
++(no pools, `new` everywhere, closures, rebuilt arrays, formatted strings) and print one line of frame statistics.
++
++| Program | What it models | Arguments used for the published numbers |
++|---|---|---|
++| `bullet_hell_stress.d` | A shooter that churns garbage with few live objects | `30 2048 100000 0.05 256 0` (30 s, 2 GiB level, 100k bullets/s, +256 B per shot); the last argument `1` disables collection, as the reference for the game's own cost |
++| `bullet_hell.d` | The same game with a heavy per-frame cost | `30 2048 40000` |
++| `aaa_sim.d` | City builder, RTS and open world with 6 job threads and 2 GiB of assets | `city 60 2048 6 0 500000`, `rts 60 2048 6 0 100000`, `openworld 60 2048 6 0 100000` |
++| `gcb.d` | Allocation throughput and fragmentation | `alloc 1 8000000`, `alloc 8 4000000`, `frag 3000000 100000` |
++
++`dmd_bench.sh` builds all of them with DMD (druntime's GC, upstream symgc, oneday with and without the concurrent
++mark) and with the card-barrier LDC, runs them, and writes one line per run to `results.txt`. Read it before running
++it: the paths at the top point at the build locations of the project.
++
++Run benchmarks on an idle machine, plugged in, and note the CPU frequency setting
++(`/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` and `energy_performance_preference` on Linux): a
++power-saving setting moves frame times a lot.
++
++## The correctness battery, for anyone porting to a new OS
++
++In `plans/bench/core_bench/`:
++
++| Test | Passes when |
++|---|---|
++| `mark_race.d` | Pointers moved through locals during collections are never lost. Crashes when write tracking is missing, which makes it the canary for any port of the barrier or a tracker |
++| `finalizer_order.d` | A destructor never sees another dead object's memory reused |
++| `phobos_stress.d` | A mix of Phobos code allocating from several threads runs clean |
++| `thread_exit_race.d` | Threads exiting during a concurrent mark do not crash it |
++
++And the collector's unit tests, from the dmd repository root:
++
++```sh
++D=generated/linux/release/64/dmd
++$D -unittest -main -g -version=Symgc_testing -version=Symgc_druntime_hooks \
++   -Isymgc/source -Idruntime/import -defaultlib= -L-L$PWD/generated/linux/release/64 \
++   -L-ldruntime -of=symgc_ut $(find symgc/source -name "*.d") && ./symgc_ut
++```
++
++All 113 pass on Linux x86-64.
++
++## What to send
++
++Copy this, fill it in, and attach the full output of the runs:
++
++```markdown
++**Machine:** CPU, cores/threads, RAM
++**OS:** name, version, kernel (uname -r)
++**CPU frequency setting:** governor / energy preference, or "default"
++**Compiler:** dmd/ldc2/gdc --version (first line)
++**Setup:** plugin / plugin + project druntime / card barrier
++**Flags:** compiler flags and --DRT-gcopt options; SYMGC_* environment variables
++**Program:** benchmark name and arguments, or your project (what it does, threads, live heap size)
++**Result:** the frame_p50_us line (or your own numbers) for druntime's GC and for oneday
++**Problems:** crash output, backtrace (gdb/lldb `bt`), whether -version=Symgc_verify reports anything
++```
++
++Until the fork has a public issue tracker, send reports to the maintainer of this work.
+diff --git a/guide/writing-code.md b/guide/writing-code.md
+new file mode 100644
+index 0000000..d84f935
+--- /dev/null
++++ b/guide/writing-code.md
+@@ -0,0 +1,114 @@
++# Writing code for oneday
++
++The point of a collector that does not stop the program is that game code can be written the ordinary D way. This
++page lists what that means in practice, the few things that still cost more than the collector, how to use the
++game-engine calls, and the rules for C libraries.
++
++## Allocate normally
++
++* Use `new`, closures, `~=`, associative arrays, `format`, `.array`, ranges that allocate. No pools are needed.
++* Do not call `GC.collect()` in the frame loop, and do not wrap levels in `GC.disable()`. The collector paces itself;
++  forcing a full collection is the one way to get a long pause back. A `GC.collect()` at a loading screen is fine.
++* Large pointer-free buffers cost the collector almost nothing: arrays of types without pointers (`ubyte[]`,
++  `float[]`, `Vertex[]` where `Vertex` holds only numbers) are allocated `NO_SCAN` automatically and are never
++  scanned. Keep textures, meshes, audio and level data in such arrays. Indices into arrays instead of pointers in big
++  tables help twice: less to mark, and no barrier on the stores.
++
++## What still costs more than the collector
++
++These are the language's costs, not the GC's, and they show up in profiles of carelessly written games:
++
++* **Shrink, then append.** `a = a[0 .. $ - 1]; a ~= x;` reallocates on every append, because the runtime cannot know
++  nobody else uses the cut-off slot. Keep an index, or call `a.assumeSafeAppend()` after shrinking when you own the
++  array. An A* written the naive way allocated 8 GiB/s in one of our tests.
++* **Associative arrays allocate one node per entry.** In hot loops prefer arrays indexed by an id.
++* **Closures that capture loop variables** allocate a context per iteration when they escape.
++
++## The frame loop
++
++With the druntime from this project, `core.memory.GC` has calls made for game loops. Guard them with `static if` so
++the same code still builds with a stock compiler, where they do not exist:
++
++```d
++import core.memory : GC;
++import core.time : Duration, MonoTime, msecs;
++
++enum hasFrameStats = __traits(hasMember, GC, "frameStats");
++
++struct GcHud
++{
++    Duration lastAlloc, lastCollect, lastPause;
++    Duration frameAlloc, frameCollect, framePause; // this frame, this thread
++}
++
++void endOfFrame(ref GcHud hud, MonoTime frameStart, Duration frameBudget)
++{
++    static if (hasFrameStats)
++    {
++        // The times are totals since start-up: take the difference per frame.
++        auto fs = GC.frameStats();
++        hud.frameAlloc = fs.threadAllocTime - hud.lastAlloc;
++        hud.frameCollect = fs.threadCollectTime - hud.lastCollect;
++        hud.framePause = fs.threadPauseTime - hud.lastPause;
++        hud.lastAlloc = fs.threadAllocTime;
++        hud.lastCollect = fs.threadCollectTime;
++        hud.lastPause = fs.threadPauseTime;
++        // fs.isCycleActive, fs.usedSize and fs.numCollections are useful on a HUD too.
++    }
++
++    // Before waiting for vsync, give the time left in the frame to the sweep.
++    static if (__traits(hasMember, GC, "step"))
++    {
++        auto left = frameBudget - (MonoTime.currTime - frameStart);
++        if (left > 1.msecs)
++            GC.step(left - 1.msecs);
++    }
++}
++```
++
++`GC.step` is optional: the sweep runs on its own thread anyway. It helps most on machines with few cores, where the
++sweeper competes with the game for a core.
++
++## Audio and other real-time threads
++
++An audio callback must never wait for the GC. Exclude its thread once, when it starts:
++
++```d
++static if (__traits(hasMember, GC, "excludeCurrentThread"))
++    GC.excludeCurrentThread();
++```
++
++The contract: an excluded thread is never stopped and its stack is never scanned, so
++
++* it must not allocate on the GC heap: allocate its buffers before it starts, or with `malloc`;
++* it must not hold the only reference to GC memory in a local variable: keep its data reachable from a global or a
++  long-lived object.
++
++In our test, a 1,000 Hz audio thread ran 28,556 ticks with no underrun through 27 collections.
++
++## Loading screens and memory pressure
++
++`GC.defrag()` (or the standard `GC.minimize()`) waits for the running sweep, returns completely empty slabs and every
++free page to the OS, and returns the number of pages it gave back. Call it after unloading a level, or when the OS
++reports memory pressure (on Android, `onTrimMemory`).
++
++## C libraries
++
++C libraries such as SDL, OpenGL, OpenAL and raylib have run under oneday, with D pointers held by C code. The rules:
++
++* **Holding and reading D pointers from C is fine**, as long as the object is also reachable from D (a global, a
++  field, `GC.addRoot`), exactly as with druntime's GC.
++* **C code writing a pointer to GC memory into GC memory**, while a collection may be running, is the one case the
++  card barrier cannot see, because the C compiler did not emit it. A callback that stores a D object into a D array
++  is D code and is fine; a C library filling a GC-allocated array of pointers is not. Give such libraries `malloc`
++  memory and copy into D after the call, or register the memory with `GC.addRange` so it is scanned as a root in each
++  pause. The kernel tracker (setup without cards) sees every write, C included.
++* Do not hide pointers in integers or xor them; druntime's spec already forbids it, and a concurrent mark is less
++  forgiving than a stop-the-world one.
++
++## Checking that your program behaves
++
++* `-version=Symgc_verify` builds the collector in verifier mode: freed memory is poisoned and checked when it is
++  handed out again. Run your test suite with it once.
++* The `mark_race.d` test in `plans/bench/core_bench/` is the canary for write tracking: it passes with cards or the
++  kernel tracker and crashes when tracking is missing.
+-- 
+2.51.0
+

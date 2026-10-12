@@ -1804,5 +1804,41 @@ The subsequent phases build upon the validated SymGC + LDC Card-Marking architec
 5. **Step 5 / Opção 5 (Planejado): Marathon Soak 4–8 GiB & Endurance Verification**
    - Execução de 30–60 minutos ininterruptos de `bullet_hell_stress` e simulações complexas (`aaa_sim`) com heaps de 4 a 8 GiB com `-version=Symgc_verify` ativo para garantia empírica de estabilidade de longo prazo.
 
+## 16. Cross-Platform and Multi-Compiler Track (2026-10-12)
+
+The goal widens from "fast on Linux with a patched LDC" to "the same collector, fast, under DMD, LDC and GDC, on
+Windows, Linux, macOS and Android (iOS later), reaching the official toolchain through druntime pull requests and
+one DIP". The full plan is `plans/cross_platform_gc_plan.md`; the documentation for community testers is in
+`symgc/guide/`; the DMD measurements are `plans/bench/core_bench/dmd_bench.sh` and `symgc/guide/benchmarks.md`.
+
+### ADR-10 — The write barrier belongs in the shared frontend
+
+* **Context:** the concurrent mark needs write tracking. Today it is an LLVM pass (LDC only) or the Linux 6.7+
+  kernel tracker (x86-64 only). DMD and GDC have neither on any OS; phones have neither for any compiler.
+* **Decision:** lower pointer stores into heap memory to a druntime intrinsic in the frontend that DMD, LDC and GDC
+  share, behind an opt-in switch (proposed `-gc-barrier`), and let each backend expand the intrinsic inline. The card
+  ABI becomes range-checked against the GC's reservation: `i = (addr - heapBase) >> 9; if (i < cardCount) cards[i] = 1`.
+  OS trackers remain the fallback for code built without the barrier, and a stop-the-world mark the last resort.
+* **Consequences:** one implementation of *where* barriers go, with full type information (pointer-free copies are
+  skipped without guessing); three small backend expansions; Android tagged pointers, 39-bit address spaces and iOS
+  memory limits handled by one compare; the DIP covers the lowering, the ABI and the rules for C code.
+
+### Findings of 2026-10-12
+
+* GDC 15.3 (druntime 2.111) builds upstream symgc but dies at the first collection once a second druntime thread
+  exists: druntime 2.111 has `tlsGCData` but not the GC thread-init hook (2.112).
+* Since patch 0034 the fork did not build against an unpatched druntime (`GCTelemetry` used unconditionally). Fixed in
+  the fork: the interface is optional.
+* DMD 2.109 and LDC 1.40 cannot build symgc at all (no `tlsGCData`).
+* On an unpatched druntime the concurrent mark crashed (SIGSEGV): `thread_scanAllType` dereferences the caller's
+  thread object, and the GC thread has none. Fixed inside the fork: while it scans, the GC thread poses as a
+  placeholder `Thread` whose `m_lock` is set. Checked with an unpatched druntime built from `master`: `mark_race`
+  passes, and loses 11,126 objects when the tracker is disabled on purpose (verify build, `SYMGC_DIRTY_SKIP=1`);
+  `finalizer_order` passes; the 113 unit tests pass. The concurrent mark on Linux 6.7+ therefore needs no druntime
+  change at all; the 2-line druntime fix stays worth upstreaming as the clean solution.
+* DMD benchmarks (`plans/bench/core_bench/dmd_bench.sh`, results in `symgc/guide/benchmarks.md`): with DMD and the
+  kernel tracker, oneday had no frame over 16 ms in any workload (stress 2 and 8 GiB, bullet hell, city 500k and
+  100k, RTS, open world); druntime's GC reached 548 ms at 8 GiB and 193 ms in the 500k city.
+
 
 

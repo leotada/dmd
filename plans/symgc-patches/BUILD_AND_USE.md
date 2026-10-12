@@ -170,3 +170,9 @@ runs with druntime's default conservative GC.
   stress bullet hell had one 7.1 ms frame at 8 GiB; the first did not repeat in 28 reruns, the second
   has not been rerun yet.
 * No large real game has been run yet; the workloads are models (`plans/bench/core_bench/aaa_sim.d`).
+
+## Newer documentation (2026-10-12)
+
+The fork now carries its own documentation for testers in `symgc/guide/`: setups for DMD, LDC and GDC, how the
+collector works, platform status, rules for writing code and C libraries, DMD and LDC numbers, and a report template.
+The cross-platform plan is `plans/cross_platform_gc_plan.md`.
