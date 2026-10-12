@@ -24,10 +24,18 @@ import core.stdc.stdio : printf;
 import core.stdc.stdlib : malloc, free, getenv, atoi;
 import core.stdc.string : memcpy;
 
-extern(C) __gshared size_t __sd_gc_card_lo;
-extern(C) __gshared size_t __sd_gc_card_n;
-extern(C) __gshared ubyte* __sd_gc_card_base;
-extern(C) void __sd_gc_card_range(void* dst, size_t size);
+// Declared, not defined: symgc defines them (LDC's barrier) or druntime does
+// (DMD's, -version=Symgc_druntime_cards).
+extern(C) extern __gshared size_t __sd_gc_card_lo;
+extern(C) extern __gshared size_t __sd_gc_card_n;
+extern(C) extern __gshared ubyte* __sd_gc_card_base;
+// The range function of the barrier in use: symgc's for LDC, druntime's for DMD.
+version(Symgc_druntime_cards) {
+	extern(C) void _d_gcBarrierRange(void* dst, size_t size);
+	alias __sd_gc_card_range = _d_gcBarrierRange;
+} else {
+	extern(C) void __sd_gc_card_range(void* dst, size_t size);
+}
 
 enum CardShift = 9;
 enum Block = size_t(2) << 20;

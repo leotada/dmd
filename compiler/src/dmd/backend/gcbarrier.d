@@ -203,10 +203,49 @@ void retypeVoid(elem* e)
 @trusted
 bool isVariableAddress(elem* a)
 {
-    while (a.Eoper == OPadd || a.Eoper == OPmin)
-        a = a.E1;
+    switch (a.Eoper)
+    {
+        case OPrelconst:
+            return true;
 
-    return a.Eoper == OPrelconst;
+        case OPaddr:
+            // &variable (the optimizer turns it into OPrelconst later); &*p is p
+            return a.E1.Eoper == OPvar || (a.E1.Eoper == OPind && isVariableAddress(a.E1.E1));
+
+        case OPvar:
+            /* With position independent code a global is reached through the GOT:
+             * the code generator makes `g = v` into `*(var g) = v`, where `var g`
+             * is the address of g. In code that is not position independent the
+             * same tree is the dereference of the pointer g holds, which does
+             * need the barrier, so this only holds for PIC and PIE.
+             */
+            if (!(config.flags3 & (CFG3pic | CFG3pie)))
+                return false;
+
+            switch (a.Vsym.Sclass)
+            {
+                case SC.global:
+                case SC.static_:
+                case SC.locstat:
+                case SC.comdat:
+                case SC.comdef:
+                case SC.extern_:
+                    return true;
+
+                default:
+                    return false;
+            }
+
+        case OPadd:
+            // base + offset, in either order: the base is the pointer operand
+            return isVariableAddress(a.E1) || isVariableAddress(a.E2);
+
+        case OPmin:
+            return isVariableAddress(a.E1);
+
+        default:
+            return false;
+    }
 }
 
 /**
@@ -248,6 +287,7 @@ elem* store(elem* e, bool used)
         elem* lhs = e.E1;
         if (lhs.Eoper != OPind || isVariableAddress(lhs.E1))
             return e;
+
 
         paddr = &lhs.E1;
         const ty = tybasic(e.Ety);

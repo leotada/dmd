@@ -33,6 +33,22 @@ import core.internal.atomic;
 import core.internal.attributes : betterC;
 import core.internal.traits : hasUnsharedIndirections;
 
+// -preview=gcbarrier: the compiler calls the GC write barrier after the stores it
+// generates, but not after the ones made by the assembly or intrinsics below. A
+// pointer stored by an atomic operation reports itself.
+version (D_GCBarrier)
+    private extern (C) void _d_gcBarrier(const(void)* addr) pure nothrow @nogc @trusted;
+
+private void gcBarrierAfterAtomic(T)(T* here) pure nothrow @nogc @trusted
+{
+    version (D_GCBarrier)
+    {
+        import core.internal.traits : hasIndirections;
+        static if (hasIndirections!T)
+            _d_gcBarrier(here);
+    }
+}
+
 // Low-level atomic helpers still need to hand shared reference payloads to the
 // backend intrinsics under `-preview=nosharedaccess`.
 private T unsharedLoadRef(T)(scope ref shared T value) pure nothrow @nogc @trusted
@@ -138,6 +154,7 @@ void atomicStore(MemoryOrder ms = MemoryOrder.seq, T, V)(ref T val, V newval) pu
     T arg = newval;
 
     core.internal.atomic.atomicStore!ms(&val, arg);
+    gcBarrierAfterAtomic(&val);
 }
 
 /// Ditto
@@ -162,6 +179,7 @@ void atomicStore(MemoryOrder ms = MemoryOrder.seq, T, V)(ref shared T val, auto 
     static assert (is (V : T), "Can't assign `newval` of type `shared " ~ V.stringof ~ "` to `shared " ~ T.stringof ~ "`.");
 
     core.internal.atomic.atomicStore!ms(cast(T*)&val, *cast(V*)&newval);
+    gcBarrierAfterAtomic(cast(T*)&val);
 }
 
 /**
@@ -240,7 +258,9 @@ in (atomicPtrIsProperlyAligned(here), "Argument `here` is not properly aligned")
     // resolve implicit conversions
     T arg = exchangeWith;
 
-    return core.internal.atomic.atomicExchange!ms(here, arg);
+    auto old = core.internal.atomic.atomicExchange!ms(here, arg);
+    gcBarrierAfterAtomic(here);
+    return old;
 }
 
 /// Ditto
@@ -266,7 +286,9 @@ in (atomicPtrIsProperlyAligned(here), "Argument `here` is not properly aligned")
 {
     static assert (is (V : T), "Can't assign `exchangeWith` of type `" ~ shared(V).stringof ~ "` to `" ~ shared(T).stringof ~ "`.");
 
-    return cast(shared)core.internal.atomic.atomicExchange!ms(cast(T*)here, unsharedLoadRef(exchangeWith));
+    auto old = core.internal.atomic.atomicExchange!ms(cast(T*)here, unsharedLoadRef(exchangeWith));
+    gcBarrierAfterAtomic(cast(T*)here);
+    return cast(shared) old;
 }
 
 /**
@@ -301,7 +323,9 @@ template cas(MemoryOrder succ = MemoryOrder.seq, MemoryOrder fail = MemoryOrder.
         const T arg1 = ifThis;
         T arg2 = writeThis;
 
-        return atomicCompareExchangeStrongNoResult!(succ, fail)(here, arg1, arg2);
+        const stored = atomicCompareExchangeStrongNoResult!(succ, fail)(here, arg1, arg2);
+        gcBarrierAfterAtomic(here);
+        return stored;
     }
 
     /// Compare-and-set for shared value type
@@ -332,8 +356,10 @@ template cas(MemoryOrder succ = MemoryOrder.seq, MemoryOrder fail = MemoryOrder.
     if (is(T == class))
     in (atomicPtrIsProperlyAligned(here), "Argument `here` is not properly aligned")
     {
-        return atomicCompareExchangeStrongNoResult!(succ, fail)(
+        const stored = atomicCompareExchangeStrongNoResult!(succ, fail)(
             cast(T*)here, unsharedLoadRef(ifThis), unsharedLoadRef(writeThis));
+        gcBarrierAfterAtomic(cast(T*)here);
+        return stored;
     }
 
     /// Compare-and-exchange for non-`shared` types
@@ -344,7 +370,9 @@ template cas(MemoryOrder succ = MemoryOrder.seq, MemoryOrder fail = MemoryOrder.
         // resolve implicit conversions
         T arg1 = writeThis;
 
-        return atomicCompareExchangeStrong!(succ, fail)(here, ifThis, writeThis);
+        const stored = atomicCompareExchangeStrong!(succ, fail)(here, ifThis, writeThis);
+        gcBarrierAfterAtomic(here);
+        return stored;
     }
 
     /// Compare and exchange for mixed-`shared`ness types
@@ -384,8 +412,10 @@ template cas(MemoryOrder succ = MemoryOrder.seq, MemoryOrder fail = MemoryOrder.
     if (is(T == class))
     in (atomicPtrIsProperlyAligned(here), "Argument `here` is not properly aligned")
     {
-        return atomicCompareExchangeStrong!(succ, fail)(
+        const stored = atomicCompareExchangeStrong!(succ, fail)(
             cast(T*)here, cast(T*)ifThis, unsharedLoadRef(writeThis));
+        gcBarrierAfterAtomic(cast(T*)here);
+        return stored;
     }
 }
 
@@ -419,7 +449,11 @@ in (atomicPtrIsProperlyAligned(here), "Argument `here` is not properly aligned")
         return atomicCompareExchangeWeakNoResult!(succ, fail)(cast(IntTy*)here, *cast(IntTy*)&arg1, *cast(IntTy*)&arg2);
     }
     else
-        return atomicCompareExchangeWeakNoResult!(succ, fail)(here, arg1, arg2);
+    {
+        const stored = atomicCompareExchangeWeakNoResult!(succ, fail)(here, arg1, arg2);
+        gcBarrierAfterAtomic(here);
+        return stored;
+    }
 }
 
 /// Ditto
@@ -447,7 +481,9 @@ bool casWeak(MemoryOrder succ = MemoryOrder.seq,MemoryOrder fail = MemoryOrder.s
     if (is(T == class))
 in (atomicPtrIsProperlyAligned(here), "Argument `here` is not properly aligned")
 {
-    return atomicCompareExchangeWeakNoResult!(succ, fail)(cast(T*)here, cast(V1)ifThis, cast(V2)writeThis);
+    const stored = atomicCompareExchangeWeakNoResult!(succ, fail)(cast(T*)here, cast(V1)ifThis, cast(V2)writeThis);
+    gcBarrierAfterAtomic(cast(T*)here);
+    return stored;
 }
 
 /**
@@ -480,7 +516,11 @@ in (atomicPtrIsProperlyAligned(here), "Argument `here` is not properly aligned")
         return atomicCompareExchangeWeak!(succ, fail)(cast(IntTy*)here, cast(IntTy*)ifThis, *cast(IntTy*)&writeThis);
     }
     else
-        return atomicCompareExchangeWeak!(succ, fail)(here, ifThis, writeThis);
+    {
+        const stored = atomicCompareExchangeWeak!(succ, fail)(here, ifThis, writeThis);
+        gcBarrierAfterAtomic(here);
+        return stored;
+    }
 }
 
 /// Ditto
@@ -513,7 +553,9 @@ bool casWeak(MemoryOrder succ = MemoryOrder.seq,MemoryOrder fail = MemoryOrder.s
     if (is(T == class))
 in (atomicPtrIsProperlyAligned(here), "Argument `here` is not properly aligned")
 {
-    return atomicCompareExchangeWeak!(succ, fail)(cast(T*)here, cast(T*)ifThis, cast(V)writeThis);
+    const stored = atomicCompareExchangeWeak!(succ, fail)(cast(T*)here, cast(T*)ifThis, cast(V)writeThis);
+    gcBarrierAfterAtomic(cast(T*)here);
+    return stored;
 }
 
 /**

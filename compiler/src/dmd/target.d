@@ -124,6 +124,8 @@ void addDefaultVersionIdentifiers(const ref Param params, const ref Target tgt)
         VersionCondition.addPredefinedGlobalIdent("D_Ddoc");
     if (params.cov)
         VersionCondition.addPredefinedGlobalIdent("D_Coverage");
+    if (params.gcBarrier)
+        VersionCondition.addPredefinedGlobalIdent("D_GCBarrier");  // -preview=gcbarrier
     if (driverParams.pic != PIC.fixed)
         VersionCondition.addPredefinedGlobalIdent(driverParams.pic == PIC.pic ? "D_PIC" : "D_PIE");
     if (params.useUnitTests)
