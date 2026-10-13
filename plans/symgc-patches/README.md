@@ -1186,4 +1186,7 @@ The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not de
   other-thread/tail. H2 madvise ~60 calls/run dropped; `Symgc_sync_sweep` worse; `SWEEP_DUTY=1` no mean win.
 - **Evidence** (16-core Linux, DMD 2.113): --worst mean from ~1.55× druntime to ~1.23–1.27×; worst frame often ≤
   druntime; --worst-safe mean ties; bullet_hell_stress concurrent worst ~2.1 ms, 0 over 16 ms, RSS ~2.9 GB;
-  `correctness.sh` OK. openworld still ~1.3× — acceptance ≤1.2× not closed on openworld/mean yet.
+  `correctness.sh` OK. openworld still ~1.3× — acceptance ≤1.2× **not met** (failed criteria: `--worst` and
+  `--openworld` mean ratios). Further attempted knobs (metadata bit batching, trailer-only NO_SCAN, quiet-path
+  non-atomic `enableMetadata`) did not close the gap without regressing `--worst-safe` spikes.
+- **0057**: `BENCHMARKS.md` / guide section with the table above.
