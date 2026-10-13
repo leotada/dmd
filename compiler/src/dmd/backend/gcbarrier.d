@@ -420,7 +420,12 @@ void clusterList(elem**[] list, size_t n)
                 a = el_bin(OPadd, a.Ety, a, el_long(TYsize_t, lo));
             elem* barrier = lo == hi ? inlineBarrier(a) : inlineBarrierSpan(a, hi - lo);
             elem** last = list[lastMember];
-            *last = el_combine(*last, barrier);
+            // Negative control for the test suite: a cluster that forgets its barrier must make
+            // mark_race_glue fail. Never set outside that check (see ../../../../plans/bench/core_bench).
+            version (GCBarrierBrokenCluster)
+                el_free(barrier);
+            else
+                *last = el_combine(*last, barrier);
         }
         i = lastMember + 1;
     }
