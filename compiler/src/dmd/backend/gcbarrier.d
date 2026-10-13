@@ -55,6 +55,9 @@ nothrow:
 /// Set by `backend_init` from `-preview=gcbarrier`.
 __gshared bool gcBarrierEnabled;
 
+/// Largest constant-size copy whose barrier is expanded in place (it spans at most two 512-byte cards).
+enum maxInlineRange = 512;
+
 /**
  * Add the barrier to a function's blocks.
  * Called before the backend lowers the elements, so that the elements it adds
@@ -511,6 +514,7 @@ elem* store(elem* e, bool used)
     elem** paddr;           // where the address of the destination is
     elem* nbytes = null;    // the size, for a copy
     bool range = false;
+    long inlineSpan = -1;   // >= 0: the range is small and constant, expanded in place
 
     if (op == OPmemcpy)
     {
@@ -562,7 +566,12 @@ elem* store(elem* e, bool used)
             return e;       // not something that holds a pointer
 
         if (range)
+        {
             nbytes = el_long(TYsize_t, size);
+            // A copy of a known, small size is two card tests in place, not a call.
+            if (size > 0 && size <= maxInlineRange)
+                inlineSpan = cast(long) size - 1;
+        }
     }
 
     // The address is used twice, by the store and by the barrier.
@@ -570,7 +579,12 @@ elem* store(elem* e, bool used)
     elem* again = used ? el_copytree(addr) : null;
 
     elem* call;
-    if (range)
+    if (range && inlineSpan >= 0)
+    {
+        el_free(nbytes);
+        call = inlineBarrierSpan(addr, inlineSpan);
+    }
+    else if (range)
     {
         call = el_bin(OPcall, TYvoid, el_var(getRtlsym(RTLSYM.GCBARRIERRANGE)),
                       el_params(nbytes, addr, null));

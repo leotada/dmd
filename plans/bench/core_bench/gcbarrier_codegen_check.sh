@@ -32,6 +32,8 @@ void throughGlobalPointer(void* v) { *gpp = v; }
 void throughGlobalSlice(N a, size_t i) { garr[i] = a; }
 void localVar(N a) { N l = a; l = a; }
 void structCopy(P* d, P* s) { *d = *s; }
+struct Big { void*[100] p; }
+void bigStructCopy(Big* d, Big* s) { *d = *s; }
 void pointerFreeCopy(Q* d, Q* s) { *d = *s; }
 void sliceCopy(N[] d, N[] s) { d[] = s[]; }
 void intSliceCopy(int[] d, int[] s) { d[] = s[]; }
@@ -97,20 +99,21 @@ check intField         0 0   # not a pointer
 check global           0 0   # a global is a root
 check globalElem       0 0
 check localVar         0 0   # a local is a root
-check structCopy       0 1   # a struct with pointers: the range
+check structCopy       2 0   # a small struct with pointers: two card tests in place (its span may cross a card)
+check bigStructCopy    0 1   # over 512 bytes: the range call
 check pointerFreeCopy  0 0   # ... without pointers: nothing
-check sliceCopy        0 1   # memcpy of pointers: the range
+check sliceCopy        0 1   # memcpy of pointers, size unknown: the range
 check intSliceCopy     0 0
-check sliceStore       0 1   # a slice is two words
+check sliceStore       2 0   # a slice is two words: in place
 check valueUsed        1 0   # the value of the store is used: still one call
 check arrayLiteral     2 0   # the elements are stored by the code generator, not by an assignment
 check viaRef           1 0
-check delegateStore    0 1
+check delegateStore    2 0
 check newWithLiteral   1 0
 check globalElemIdx    0 0   # a global array, indexed
 check throughGlobalPointer 1 0   # PIC and not: the tree is the same shape as a global's address in PIC
 check throughGlobalSlice   1 0
-check closure          1 1   # the frame field holding a (stored by the code generator; a null field needs none) and the delegate
+check closure          3 0   # the frame field holding a (stored by the code generator; a null field needs none) and the delegate (two tests)
 
 [ $fail -eq 0 ] && echo "ALL OK" || echo "FAILED"
 exit $fail
