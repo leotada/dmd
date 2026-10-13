@@ -1174,3 +1174,16 @@ The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not de
   violations in 10 s.
 - **Not done**: GDC clustering and a `barrier_micro` run; the unified range entry point; 8 GiB stress, bullet hell and soak
   after the card change; anything off Linux x86-64.
+
+## 16. Small-heap CPU vs paced engine GC (patches 0055-0056)
+
+- **0055**: paced `bench/engine_gc_benchmark.d` (vendored from game-engine `88f28dfe`) with `engine_core/`,
+  `engine_gc_build.sh` / `engine_gc_compare.sh` (two binaries), `alloc_micro.d`.
+- **0056**: mutator-path cuts for the quiet-frame gap: zeroed-slot skip on pointer alloc, `writeNewSlotMetadata`,
+  page-descriptor cache, `GC.qalloc` last-BlkInfo cache, appendable `realloc` keeps metadata, `GC.extend` for large,
+  NO_SCAN appendable size floor 64, optional trailer-only metadata (no extent-bit atomic) for NO_SCAN.
+- **Attribution**: quiet residual ≈ whole mean gap; `threadAllocTime` tiny; markers/`totalCollectionTime` are
+  other-thread/tail. H2 madvise ~60 calls/run dropped; `Symgc_sync_sweep` worse; `SWEEP_DUTY=1` no mean win.
+- **Evidence** (16-core Linux, DMD 2.113): --worst mean from ~1.55× druntime to ~1.23–1.27×; worst frame often ≤
+  druntime; --worst-safe mean ties; bullet_hell_stress concurrent worst ~2.1 ms, 0 over 16 ms, RSS ~2.9 GB;
+  `correctness.sh` OK. openworld still ~1.3× — acceptance ≤1.2× not closed on openworld/mean yet.

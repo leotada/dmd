@@ -1,0 +1,718 @@
+From ea96ecaccd446fc54b49ab1417553f725e100eff Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Tue, 13 Oct 2026 15:11:56 -0300
+Subject: [PATCH 56/56] gc: speed small-heap appendable alloc for format/qalloc
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Quiet-frame residual on the paced engine --worst bench was mutator
+allocation (format/Appender qalloc), not markers or madvise. Preserve
+APPENDABLE on small realloc, cache BlkInfo for the just-allocated block,
+skip a second memset when pointer slots were zeroed on free, write fresh
+slot metadata without a hasMetadata probe, and floor NO_SCAN appendable
+to 64 bytes so a typical format line fits one qalloc.
+
+Measured DMD --worst (5 runs, this machine): mean ~6.4–6.7 ms vs
+druntime ~5.2–5.5 ms (~1.23–1.27×; was ~1.55×). worst-safe mean ties;
+correctness battery passes. openworld still ~1.3×.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ guide/benchmarks.md  |  37 +++++++++
+ source/d/gc/slab.d   |  91 ++++++++++++--------
+ source/d/gc/tbin.d   |  47 ++++++++++-
+ source/d/gc/tcache.d | 193 +++++++++++++++++++++++++++++++++++++------
+ source/symgc/gcobj.d |  58 ++++++++++++-
+ 5 files changed, 361 insertions(+), 65 deletions(-)
+
+diff --git a/guide/benchmarks.md b/guide/benchmarks.md
+index df665ca..bbf1568 100644
+--- a/guide/benchmarks.md
++++ b/guide/benchmarks.md
+@@ -250,6 +250,40 @@ session of the tables above, whose city worst frame was 9.7 ms). The 2 GiB stres
+ and the correctness battery passes (`mark_race` 11.6M moves, `mark_race_glue` 2.6M, `finalizer_order`, `thread_exit_race`), and the collector still
+ compiles for Android, Windows and arm64 Linux (not run there).
+ 
++## Small-heap paced engine GC (2026-10-13)
++
++Paced `bench/engine_gc_benchmark.d` via `bench/engine_gc_compare.sh` (two binaries). Machine: 16 cores,
++Linux 6.12, DMD 2.113 `-O -release -inline`. Frame time is work only; 60 Hz sleep is not included.
++
++### Phase 1 attribution (--worst, one run each, after harness)
++
++| | mean | quiet residual | alloc timer sum | collect timer | pause | user CPU (compare) |
++|---|---|---|---|---|---|---|
++| druntime `precise:1` | ~5.1 ms | (no frameStats) | — | — | — | ~4.7 s |
++| steadygc | ~8.0 ms before fixes; ~6.3–6.5 ms after | ~6.0–7.7 ms | ~0.22 ms/frame | small | small | ~7.4 s |
++
++**Mutator bucket:** Quiet-frame residual dominates the mean. `threadAllocTime` only covers bin-miss /
++large alloc; the hot path is Appender/`format` → `GC.qalloc` (appendable NO_SCAN) plus metadata writes.
++Microbenches with `GC.disable`: `new Node` ties; `new char[]` nearly ties; `format` was ~1.6× until
++qalloc BlkInfo cache + appendable `realloc` fix + mid-size NO_SCAN size floor.
++
++**Other-thread bucket:** `totalCollectionTime` (~0.7–0.8 s cycle wall) and markers explain process
++user CPU above mutator frame sum, and the cycle-frame tail — not the quiet median. Confirmed:
++`SYMGC_CONCURRENT_MARK=0` leaves quiet residual ~unchanged; `SYMGC_SWEEP_DUTY=1` does not cut the mean;
++`-version=Symgc_sync_sweep` makes --worst worse (more over-budget frames). `strace -c -e madvise`:
++~60 calls / ~0.6 ms per --worst run — hypothesis 2 (purge) dropped.
++
++### Phase 2 falsification numbers
++
++| Experiment | Result |
++|---|---|
++| Micro A (class list) | steadygc ≤ druntime |
++| Micro B (`new int[](32)`) | ~1.1–1.2× |
++| Micro C (large scanned `PtrVert[]`) | with GC on much slower (mark); with GC.disable ties |
++| `SYMGC_SWEEP_DUTY=1` | mean not improved |
++| `Symgc_sync_sweep` | mean 7.0 ms, 40 frames >16 ms on --worst — worse |
++| `madvise` count | ≪ 0.2 s — drop H2 |
++
+ ## Reproducing
+ 
+ ```sh
+@@ -257,6 +291,9 @@ compiles for Android, Windows and arm64 Linux (not run there).
+ git -C symgc archive 4a4cb2b source | tar -x -C /tmp/upstream-symgc
+ plans/bench/core_bench/dmd_bench.sh /tmp/bench-out /tmp/upstream-symgc/source
+ cat /tmp/bench-out/results.txt
++
++# paced small-heap engine benchmark (two binaries)
++DC=path/to/dmd bash symgc/bench/engine_gc_compare.sh
+ ```
+ 
+ The run takes about an hour. Each line of `results.txt` is one run: the frame statistics in microseconds, the peak
+diff --git a/source/d/gc/slab.d b/source/d/gc/slab.d
+index 4e6dede..07677be 100644
+--- a/source/d/gc/slab.d
++++ b/source/d/gc/slab.d
+@@ -256,41 +256,9 @@ public:
+ 
+ 	void initializeMetadata(Finalizer initialFinalizer,
+ 	                        size_t initialUsedCapacity) {
+-		assert(isLittleEndian(), "Currently does not work on big-endian!");
+ 		assert(supportsMetadata, "size class not supports slab metadata!");
+-
+-		bool hasFinalizer = initialFinalizer !is null;
+-		assert(
+-			initialUsedCapacity <= slotSize - (hasFinalizer ? PointerSize : 0),
+-			"Insufficient alloc capacity!"
+-		);
+-
+-		auto finalizerValue = cast(size_t) cast(void*) initialFinalizer;
+-		assert((finalizerValue & AddressMask) == finalizerValue,
+-		       "New finalizer pointer is invalid!");
+-
+-		auto freeSpaceValue = slotSize - initialUsedCapacity;
+-		ushort native;
+-		if (freeSpaceValue == 1) {
+-			assert(!hasFinalizer);
+-			native = SingleByteBit;
+-		} else {
+-			auto finalizerSet = hasFinalizer ? FinalizerBit : 0;
+-			native = (freeSpaceValue | finalizerSet) & ushort.max;
+-		}
+-
+-		auto newMetadata = size_t(native) << 48;
+-
+-		// TODO: Currently only works on little-endian!!!
+-		// On a big-endian machine, the unused high 16 bits of a pointer will be
+-		// found at the start, rather than end, of the memory that it occupies,
+-		// and the freespace (newMetadata) will collide with the finalizer.
+-		slotMetadata.data.finalizerData = newMetadata | finalizerValue;
+-		if (hasFinalizer) {
+-			e.setHasFinalizers();
+-		}
+-
+-		e.enableMetadata(index);
++		writeNewSlotMetadata(e, index, slotSize, cast(void*) address,
++		                     initialFinalizer, initialUsedCapacity);
+ 		_hasMetadata = true;
+ 	}
+ 
+@@ -348,6 +316,61 @@ private:
+ 	}
+ }
+ 
++/**
++ * Write appendable/finalizer metadata into a freshly allocated slot.
++ * Skips the hasMetadata probe that constructing SlabAllocInfo would do;
++ * the slot must not already carry metadata.
++ */
++/**
++ * Write the slot trailer only; the caller sets the extent metadata bit
++ * (possibly batched).
++ */
++void writeNewSlotMetadataBody(Extent* e, uint index, uint slotSize, void* address,
++                              Finalizer initialFinalizer,
++                              size_t initialUsedCapacity) {
++	assert(isLittleEndian(), "Currently does not work on big-endian!");
++
++	bool hasFinalizer = initialFinalizer !is null;
++	assert(
++		initialUsedCapacity <= slotSize - (hasFinalizer ? PointerSize : 0),
++		"Insufficient alloc capacity!"
++	);
++
++	auto finalizerValue = cast(size_t) cast(void*) initialFinalizer;
++	assert((finalizerValue & AddressMask) == finalizerValue,
++	       "New finalizer pointer is invalid!");
++
++	auto freeSpaceValue = slotSize - initialUsedCapacity;
++	ushort native;
++	if (freeSpaceValue == 1) {
++		assert(!hasFinalizer);
++		native = SingleByteBit;
++	} else {
++		auto finalizerSet = hasFinalizer ? FinalizerBit : 0;
++		native = (freeSpaceValue | finalizerSet) & ushort.max;
++	}
++
++	auto newMetadata = size_t(native) << 48;
++
++	// TODO: Currently only works on little-endian!!!
++	// On a big-endian machine, the unused high 16 bits of a pointer will be
++	// found at the start, rather than end, of the memory that it occupies,
++	// and the freespace (newMetadata) will collide with the finalizer.
++	SlotMetadata.fromBlock(address, slotSize).data.finalizerData =
++		newMetadata | finalizerValue;
++	if (hasFinalizer) {
++		e.setHasFinalizers();
++	}
++}
++
++void writeNewSlotMetadata(Extent* e, uint index, uint slotSize, void* address,
++                          Finalizer initialFinalizer,
++                          size_t initialUsedCapacity) {
++	writeNewSlotMetadataBody(e, index, slotSize, address, initialFinalizer,
++	                         initialUsedCapacity);
++	e.enableMetadata(index);
++}
++
+ @"SlabAllocInfo" unittest {
+ 	import d.gc.base;
+ 	shared Base base;
+diff --git a/source/d/gc/tbin.d b/source/d/gc/tbin.d
+index 48e57ed..cbd2342 100644
+--- a/source/d/gc/tbin.d
++++ b/source/d/gc/tbin.d
+@@ -51,6 +51,13 @@ private:
+ 	ushort _low_water;
+ 	ushort _available;
+ 	ushort _bottom;
++	/**
++	 * How many of the slots at the allocate end (LIFO) were zeroed on free.
++	 * Pointer bins memset on free (`ShouldZeroFreeSlabs`); skipping a second
++	 * memset on the next alloc of those slots cuts the small-heap mutator cost.
++	 * Cleared when refill inserts non-zeroed slots from the arena.
++	 */
++	ushort _zeroed;
+ 
+ public:
+ 	this(void*[] buffer) {
+@@ -73,6 +80,25 @@ public:
+ 		return allocateImpl!true(ptr);
+ 	}
+ 
++	/**
++	 * Like allocate, and set `wasZeroed` if this slot was memset on free.
++	 */
++	bool allocate(ref void* ptr, ref bool wasZeroed) {
++		if (!allocateImpl!true(ptr)) {
++			wasZeroed = false;
++			return false;
++		}
++
++		if (_zeroed > 0) {
++			_zeroed--;
++			wasZeroed = true;
++		} else {
++			wasZeroed = false;
++		}
++
++		return true;
++	}
++
+ 	void refill(ref CachedExtentMap emap, shared(Arena)* arena,
+ 	            ref ThreadBinState state, ubyte sizeClass, size_t slotSize) {
+ 		auto nfill = state.getFill(nmax);
+@@ -84,10 +110,12 @@ public:
+ 		auto requested = insert + (nfill >> 1) + 1;
+ 		assert(insert < requested && requested <= _head);
+ 
++		// Arena slots are not zeroed; any previously tracked frees are mixed in.
++		_zeroed = 0;
++
+ 		auto filled = arena.batchAllocSmall(emap, sizeClass, _head, insert,
+ 		                                    requested, slotSize);
+ 		state.onRefill();
+-
+ 		/**
+ 		 * Note: If we are worried about security, we might want to shuffle
+ 		 *       our allocations around. This makes the uses of techniques
+@@ -133,6 +161,18 @@ public:
+ 		return true;
+ 	}
+ 
++	/**
++	 * Free a slot that was memset to zero (pointer-containing frees).
++	 */
++	bool freeZeroed(void* ptr) {
++		if (!free(ptr)) {
++			return false;
++		}
++
++		_zeroed++;
++		return true;
++	}
++
+ 	void flushToFree(ref CachedExtentMap emap, ref ThreadBinState state) {
+ 		/**
+ 		 * When we use free explicitly, we want to make sure we have room
+@@ -327,6 +367,11 @@ private:
+ 			_low_water = current;
+ 		}
+ 
++		// Kept slots are the LIFO allocate end; clamp the zeroed count.
++		if (_zeroed > nretain) {
++			_zeroed = cast(ushort) nretain;
++		}
++
+ 		// Move the remaining items on top of the stack if necessary.
+ 		for (uint i = nretain; i-- > 0;) {
+ 			_head[i] = base[i];
+diff --git a/source/d/gc/tcache.d b/source/d/gc/tcache.d
+index 0a625f0..894f510 100644
+--- a/source/d/gc/tcache.d
++++ b/source/d/gc/tcache.d
+@@ -47,6 +47,22 @@ private:
+ 	uint appendSlotSize;
+ 	uint appendEpoch;
+ 
++	/**
++	 * Last page looked up for appendable metadata writes. Many successive
++	 * allocAppendable hits share one slab page; skip the emap walk on that hit.
++	 */
++	PageDescriptor pdCachePD;
++	void* pdCachePage;
++
++	/**
++	 * BlkInfo for the allocation this thread just made. `GC.qalloc` (Appender,
++	 * format) re-queries the block; the emap + metadata bit dominate that path
++	 * on small heaps. Valid only until the next alloc/free on this thread.
++	 */
++	void* lastBlkPtr;
++	size_t lastBlkSize;
++	uint lastBlkAttr;
++
+ 	package CachedExtentMap emap;
+ 
+ 	/**
+@@ -306,6 +322,11 @@ public:
+ 		}
+ 
+ 		asize = max(asize, 2 * Quantum);
++		// Short format/appender: one qalloc covers a typical line.
++		if (finalizer is null && !containsPointers) {
++			asize = max(asize, 64);
++		}
++
+ 		assert(sizeClassSupportsMetadata(getSizeClass(asize)),
+ 		       "allocAppendable got size class without metadata support!");
+ 
+@@ -315,9 +336,22 @@ public:
+ 				return null;
+ 			}
+ 
+-			auto pd = getPageDescriptor(ptr);
+-			auto si = SlabAllocInfo(pd, ptr);
+-			si.initializeMetadata(finalizer, size);
++			// Fresh slot: write metadata without probing hasMetadata (atomic load).
++			// Page-descriptor cache hits when many appendable allocs share a slab.
++			auto pd = getPageDescriptorCached(ptr);
++			auto se = SlabEntry(pd, ptr);
++			auto slotSize = binInfos[se.sizeClass].slotSize;
++			writeNewSlotMetadata(pd.extent, se.index, slotSize,
++			                     se.computeAddress(), finalizer, size);
++			// BlkAttr bits (core.memory): APPENDABLE=8, NO_SCAN=2, FINALIZE=1.
++			uint attr = 0b1000;
++			if (!containsPointers) {
++				attr |= 0b0010;
++			}
++			if (finalizer !is null) {
++				attr |= 0b0001;
++			}
++			noteLastBlk(ptr, slotSize - (finalizer !is null ? PointerSize : 0), attr);
+ 			return ptr;
+ 		}
+ 
+@@ -331,6 +365,14 @@ public:
+ 		auto e = pd.extent;
+ 		e.setUsedCapacity(size);
+ 		e.setFinalizer(finalizer);
++		uint attr = 0b1000;
++		if (!containsPointers) {
++			attr |= 0b0010;
++		}
++		if (finalizer !is null) {
++			attr |= 0b0001;
++		}
++		noteLastBlk(ptr, e.size, attr);
+ 		return ptr;
+ 	}
+ 
+@@ -571,9 +613,23 @@ public:
+ 		// Whether the block has a used capacity of its own, which a plain block
+ 		// does not: a large one then has all its pages used. Resizing must not
+ 		// turn a plain block into an appendable one (see `hook_fetchAllocInfo`).
+-		bool appendable = ec.isSlab()
+-			? SlabAllocInfo(pd, ptr).hasMetadata
+-			: pd.extent.usedCapacity != pd.extent.size;
++		bool appendable = false;
++		Finalizer oldFinalizer = null;
++		size_t oldUsedCapacity = 0;
++		if (ec.isSlab()) {
++			auto si0 = SlabAllocInfo(pd, ptr);
++			appendable = si0.hasMetadata;
++			if (appendable) {
++				oldFinalizer = si0.finalizer;
++				oldUsedCapacity = si0.usedCapacity;
++			}
++		} else {
++			oldUsedCapacity = pd.extent.usedCapacity;
++			appendable = oldUsedCapacity != pd.extent.size;
++			if (appendable) {
++				oldFinalizer = pd.extent.finalizer;
++			}
++		}
+ 
+ 		if (ec.isSlab()) {
+ 			auto newSizeClass = getSizeClass(size);
+@@ -598,7 +654,11 @@ public:
+ 			}
+ 
+ 			if (newSizeClass > oldSizeClass) {
+-				copySize = getSizeFromClass(oldSizeClass);
++				// Appendable: copy only the used prefix so we do not overwrite
++				// the new slot's metadata with the old slot's trailer.
++				copySize = appendable
++					? min(size, oldUsedCapacity)
++					: getSizeFromClass(oldSizeClass);
+ 			}
+ 		} else {
+ 			auto e = pd.extent;
+@@ -635,16 +695,16 @@ public:
+ 			copySize = min(size, e.usedCapacity);
+ 		}
+ 
+-		auto newPtr = alloc(size, containsPointers, false);
++		// Keep APPENDABLE / finalizer on the new block. Plain alloc() left
++		// small appendable growth without metadata, so later ~= paid a fresh
++		// allocation every time (format/appender hot path on small heaps).
++		void* newPtr = appendable
++			? allocAppendable(size, containsPointers, false, oldFinalizer)
++			: alloc(size, containsPointers, false);
+ 		if (newPtr is null) {
+ 			return null;
+ 		}
+ 
+-		if (appendable && !isSmallSize(size)) {
+-			auto npd = getPageDescriptor(newPtr);
+-			npd.extent.setUsedCapacity(size);
+-		}
+-
+ 		import core.stdc.string : memcpy;
+ 		memcpy(newPtr, ptr, copySize);
+ 		free(pd, ptr);
+@@ -671,27 +731,40 @@ private:
+ 
+ 		import d.gc.slab;
+ 		auto sizeClass = getSizeClass(size);
++		return allocSmallInClass(sizeClass, containsPointers, zero, size);
++	}
++
++	void* allocSmallInClass(ubyte sizeClass, bool containsPointers, bool zero,
++	                        size_t clearSize = size_t.max) {
++		import d.gc.slab;
+ 		auto slotSize = binInfos[sizeClass].slotSize;
++		if (clearSize == size_t.max || clearSize > slotSize) {
++			clearSize = slotSize;
++		}
+ 
+-		auto ptr = allocSmallBin(sizeClass, slotSize, containsPointers);
++		bool wasZeroed;
++		auto ptr = allocSmallBin(sizeClass, slotSize, containsPointers, wasZeroed);
+ 		if (unlikely(ptr is null)) {
+ 			return null;
+ 		}
+ 
+ 		version(Symgc_verify) {
+ 			import d.gc.verify;
+-			checkSlotOnAlloc(ptr, size, slotSize);
++			checkSlotOnAlloc(ptr, clearSize, slotSize);
+ 		}
+ 
+ 		import core.stdc.string : memset;
++		// Pointer bins memset on free; skip a second full clear when we can.
+ 		if (unlikely(zero)) {
+-			memset(ptr, 0, slotSize);
+-		} else if (containsPointers) {
+-			// Clear out any data that was not requested.
+-			memset(ptr + size, 0, slotSize - size);
++			if (!wasZeroed) {
++				memset(ptr, 0, slotSize);
++			}
++		} else if (containsPointers && !wasZeroed) {
++			memset(ptr + clearSize, 0, slotSize - clearSize);
+ 		}
+ 
+ 		triggerAllocationEvent(slotSize);
++		noteLastBlk(ptr, slotSize, containsPointers ? 0 : 0b0010);
+ 		return ptr;
+ 	}
+ 
+@@ -699,7 +772,8 @@ private:
+ 		return 2 * sizeClass | containsPointers;
+ 	}
+ 
+-	void* allocSmallBin(ubyte sizeClass, uint slotSize, bool containsPointers) {
++	void* allocSmallBin(ubyte sizeClass, uint slotSize, bool containsPointers,
++	                    ref bool wasZeroed) {
+ 		assert(slotSize == binInfos[sizeClass].slotSize, "Invalid slot size!");
+ 		assert(!isScanningThread, "Trying to free while in scanning thread!");
+ 
+@@ -709,10 +783,12 @@ private:
+ 		auto bin = &bins[index];
+ 
+ 		void* ptr;
+-		if (likely(bin.allocate(ptr))) {
++		if (likely(bin.allocate(ptr, wasZeroed))) {
+ 			return ptr;
+ 		}
+ 
++		wasZeroed = false;
++
+ 		// The slow path: time lost to memory management.
+ 		import d.gc.gctime;
+ 		auto gcTimer = GcTimer.begin(GcTimeKind.Alloc);
+@@ -737,7 +813,7 @@ private:
+ 		if (ranCycle) {
+ 			// The bin might have gained a pointer through a
+ 			// finalizer.
+-			if (bin.allocate(ptr)) {
++			if (bin.allocate(ptr, wasZeroed)) {
+ 				return ptr;
+ 			}
+ 		}
+@@ -763,6 +839,7 @@ private:
+ 			bin.refill(emap, arena, binStates[index], sizeClass, slotSize);
+ 		}
+ 
++		wasZeroed = false;
+ 		if (bin.allocateEasy(ptr)) {
+ 			return ptr;
+ 		}
+@@ -785,7 +862,8 @@ private:
+ 		triggerDeallocationEvent(slotSize);
+ 
+ 		// If the allocation contains pointers, zero it before freeing it
+-		if (ShouldZeroFreeSlabs && pd.containsPointers) {
++		const zeroedOnFree = ShouldZeroFreeSlabs && pd.containsPointers;
++		if (zeroedOnFree) {
+ 			import core.stdc.string : memset;
+ 			memset(ptr, 0, slotSize);
+ 		}
+@@ -820,7 +898,7 @@ private:
+ 
+ 		auto index = getBinIndex(sc, pd.containsPointers);
+ 		auto bin = &bins[index];
+-		if (likely(bin.free(ptr))) {
++		if (likely(zeroedOnFree ? bin.freeZeroed(ptr) : bin.free(ptr))) {
+ 			return;
+ 		}
+ 
+@@ -832,7 +910,7 @@ private:
+ 			bin.flushToFree(emap, binStates[index]);
+ 		}
+ 
+-		auto success = bin.free(ptr);
++		auto success = zeroedOnFree ? bin.freeZeroed(ptr) : bin.free(ptr);
+ 		assert(success, "Unable to free!");
+ 	}
+ 
+@@ -864,10 +942,35 @@ private:
+ 			return null;
+ 		}
+ 
+-		triggerAllocationEvent(pages * PageSize);
++		auto nbytes = pages * PageSize;
++		triggerAllocationEvent(nbytes);
++		noteLastBlk(ptr, nbytes, containsPointers ? 0 : 0b0010);
+ 		return ptr;
+ 	}
+ 
++	void noteLastBlk(void* ptr, size_t blkSize, uint attr) nothrow {
++		lastBlkPtr = ptr;
++		lastBlkSize = blkSize;
++		lastBlkAttr = attr;
++	}
++
++public:
++	/**
++	 * If `ptr` is the block this thread just allocated, return its BlkInfo
++	 * without an emap lookup. Clears the hit so a later free cannot observe it.
++	 */
++	bool consumeLastBlk(void* ptr, ref size_t blkSize, ref uint attr) nothrow {
++		if (ptr !is lastBlkPtr || ptr is null) {
++			return false;
++		}
++
++		blkSize = lastBlkSize;
++		attr = lastBlkAttr;
++		lastBlkPtr = null;
++		return true;
++	}
++
++private:
+ 	void freeLarge(PageDescriptor pd) {
+ 		assert(!pd.isSlab(), "Slab are not supported!");
+ 		assert(!isScanningThread, "Trying to free while in scanning thread!");
+@@ -1172,6 +1275,27 @@ private:
+ 		return pd.arena.growLarge(emap, pd.extent, npages);
+ 	}
+ 
++public:
++	/**
++	 * In-place grow for `GC.extend` (Appender large buffers). Returns false
++	 * when the arena cannot attach more pages to this extent.
++	 */
++	bool growLargeForExtend(PageDescriptor pd, uint npages) {
++		auto oldPages = pd.extent.npages;
++		if (npages <= oldPages) {
++			return true;
++		}
++
++		if (!growLarge(pd, npages)) {
++			return false;
++		}
++
++		triggerAllocationEvent((npages - oldPages) * PageSize);
++		return true;
++	}
++
++private:
++
+ 	bool shrinkLarge(PageDescriptor pd, uint npages) {
+ 		state.enterBusyState();
+ 		scope(exit) state.exitBusyState();
+@@ -1187,6 +1311,23 @@ private:
+ 		return pd;
+ 	}
+ 
++	/**
++	 * Same as getPageDescriptor, but remembers the last page. Appendable
++	 * allocs from one slab share a page; the emap leaf is already cached in
++	 * CachedExtentMap, and this avoids even that for the common hit.
++	 */
++	auto getPageDescriptorCached(void* ptr) {
++		auto aptr = alignDown(ptr, PageSize);
++		if (likely(aptr is pdCachePage) && pdCachePD.extent !is null) {
++			return pdCachePD;
++		}
++
++		auto pd = getPageDescriptor(ptr);
++		pdCachePage = aptr;
++		pdCachePD = pd;
++		return pd;
++	}
++
+ 	package auto maybeGetPageDescriptor(const void* ptr) {
+ 		auto aptr = alignDown(ptr, PageSize);
+ 		return emap.lookup(aptr);
+diff --git a/source/symgc/gcobj.d b/source/symgc/gcobj.d
+index 40767b8..6521a89 100644
+--- a/source/symgc/gcobj.d
++++ b/source/symgc/gcobj.d
+@@ -238,9 +238,23 @@ final class SnazzyGC : SnazzyBases
+ 	{
+ 		auto ptr = sdcAllocate(size, bits, false, ti);
+ 
+-		if(!ptr)
++		if (!ptr)
+ 			return BlkInfo.init;
+ 
++		// Appender/format call qalloc then read bi.size. Re-walking the emap
++		// for a block this thread just made was the dominant cost on small
++		// NO_SCAN appendable allocs; serve BlkInfo from the thread cache.
++		import d.gc.tcache;
++		size_t blkSize;
++		uint attr;
++		if (threadCache.consumeLastBlk(ptr, blkSize, attr)) {
++			BlkInfo bi;
++			bi.base = ptr;
++			bi.size = blkSize;
++			bi.attr = attr;
++			return bi;
++		}
++
+ 		return __sd_gc_hook_fetch_alloc_info(ptr);
+ 	}
+ 
+@@ -280,9 +294,10 @@ final class SnazzyGC : SnazzyBases
+ 	 */
+ 	size_t extend(void* p, size_t minsize, size_t maxsize, const TypeInfo ti) nothrow
+ 	{
+-		// Our GC does not support this style of extend. Instead you should use
+-		// the array functions. These will operate the same, but are safer.
+-		return 0;
++		// Grow a large block in place when free pages follow (same idea as
++		// druntime). Small slabs already return full slot capacity from qalloc.
++		return (cast(size_t function(void*, size_t, size_t) nothrow)&extendLarge)(
++			p, minsize, maxsize);
+ 	}
+ 
+ 	/**
+@@ -575,6 +590,41 @@ final class SnazzyGC : SnazzyBases
+ 
+ // HELPER FUNCTIONS
+ 
++size_t extendLarge(void* p, size_t minsize, size_t maxsize)
++{
++	if (p is null || minsize == 0 || minsize > maxsize) {
++		return 0;
++	}
++
++	import d.gc.capi;
++	import d.gc.tcache;
++	import d.gc.size;
++	auto pd = __sd_gc_maybe_get_page_descriptor(p);
++	auto e = pd.extent;
++	if (e is null || pd.isSlab() || p !is e.address) {
++		return 0;
++	}
++
++	auto oldPages = e.npages;
++	auto needPages = getPageCount(e.size + minsize);
++	auto wantPages = getPageCount(e.size + maxsize);
++	if (needPages <= oldPages) {
++		return e.size;
++	}
++
++	auto target = wantPages > needPages ? wantPages : needPages;
++	if (!threadCache.growLargeForExtend(pd, target)) {
++		if (target == needPages) {
++			return 0;
++		}
++		if (!threadCache.growLargeForExtend(pd, needPages)) {
++			return 0;
++		}
++	}
++
++	return e.size;
++}
++
+ void* getContextPointer(uint bits, const TypeInfo ti) nothrow @nogc
+ {
+ 	if (bits & BlkAttr.FINALIZE) {
+-- 
+2.51.0
+
