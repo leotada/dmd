@@ -1148,3 +1148,8 @@ The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not de
 - **Not done**: the unpaced overload still stalls (worst 3.8 s against 5.4 s before, one run each); the 8 GiB stress, RTS
   and open world were not re-run; no Windows list change was tested; recipes for stock DMD 2.112, stock LDC and GDC in
   `usage.md` were not run (only the project's DMD).
+- **0051**: the project is called steadygc in the documentation and in the labels the bench scripts print (it was
+  "oneday"); `usage.md` gets a "Where the code is" section with the three public repositories (leotada/symgc,
+  leotada/dmd branch `gc-phase0-discovery`, leotada/ldc branch `gc-card-marking`) and the README the clone URL. The
+  run-time option is unchanged (`gc:sdc` / `gc:sdcq`); `gc:concurrent` was only a suggestion. The old name remains in
+  the historical logs under `plans/bench/core_bench/results/`.
