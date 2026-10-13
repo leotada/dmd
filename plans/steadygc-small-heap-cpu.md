@@ -1,9 +1,10 @@
 # Reduce steadygc's CPU cost on a small live heap with heavy allocation
 
-Status: Phases 0–2 done; Phase 3 in progress (mutator/appendable path). Acceptance not yet met on
-this 16-core machine (--worst ~1.23–1.27× after 0056; openworld ~1.3×). Phase 1 named quiet-frame
-mutator allocation (format/qalloc), not markers or madvise. See `plans/symgc-patches/README.md`
-section 16 and `symgc/guide/benchmarks.md` "Small-heap paced engine GC".
+Status: Phases 0–3 done (0058). Mean acceptance met on this 16-core machine: DMD `--worst` ~1.14×
+and `--openworld` ~1.12× (≤1.2×). See append "0058 results (2026-10-13)" below for remaining
+worst-frame / `--worst-safe` worst notes. Phase 1 named quiet-frame mutator allocation
+(format/qalloc), not markers or madvise. See `plans/symgc-patches/README.md` section 16–17 and
+`symgc/guide/benchmarks.md` "Small-heap paced engine GC".
 
 The code to change lives in `symgc/` (fork of symmetryinvestments/symgc, published as
 [leotada/symgc](https://github.com/leotada/symgc) branch `main`). This file stays in `plans/` and is
@@ -683,6 +684,37 @@ the two.
    Do not keep editing past a second idea that the profile does not support.
 6. Phase 4 only if faults are still the remaining problem.
 7. Phase 5 docs and patches.
+
+## 0058 results (2026-10-13, 16-core Linux, DMD 2.113)
+
+Root cause of the residual after 0056: Phobos `Appender` / `std.format` call `GC.qalloc(nbytes,
+BlkAttr.NO_SCAN)` **without** `APPENDABLE`, so the 0056 `allocAppendable` 64-byte floor never ran.
+Each `format` started at an 8-byte slot and grew `8→16→32→64` with a failed `GC.extend` (uncached
+emap) between steps.
+
+Patch **0058** (`symgc` `8f429d7`): floor plain small `NO_SCAN` `qalloc` requests to 64 bytes;
+`extendLarge` uses `maybeGetPageDescriptorCached`. Kept the 0056 `allocAppendable` floor (helps
+`new T[]` NO_SCAN; not the format path). Hypothesis 2 (streamline `allocAppendable`) not needed for
+the mean.
+
+Medians of 5 paced runs, 600 frames, two-binary harness:
+
+| Scenario | druntime mean | steadygc mean | ratio | worst (dru / steady) | over16 sum |
+|---|---|---|---|---|---|
+| `--worst` | 5.087 ms | 5.818 ms | **1.14×** | 10.784 / 10.963 | 0 / 0 |
+| `--openworld` | 0.527 ms | 0.591 ms | **1.12×** | 1.321 / 1.658 | 0 / 0 |
+| `--worst-safe` | 2.589 ms | 2.619 ms | ~1.01× | 5.564 / 6.981 | 0 / 0 |
+
+- **Mean ≤1.2×:** met on `--worst` and `--openworld`.
+- **Worst frame ≤ same-session druntime:** `--worst` within ~1.7% (noise); `--openworld` and
+  `--worst-safe` worst still higher (same pattern as the post-0056 baseline before 0058).
+- **`--worst-safe` mean/p99:** within ~1–2% of druntime (tie within 5-run noise); worst remains
+  the criterion that still fails by ~1.4 ms median.
+- **`bullet_hell_stress` concurrent:** max ~2.5 ms, 0 over 16 ms, RSS ~2.9 GB (large-heap win holds).
+- **`correctness.sh`:** OK (`mark_race`, `mark_race_glue`, `finalizer_order`, `thread_exit_race`).
+- **LDC matrix:** not re-run this session (prior card-stub link issue unchanged).
+
+Phase 4 (dirty-fault work) remains deferred.
 
 ## Risks
 

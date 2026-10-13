@@ -1190,3 +1190,12 @@ The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not de
   `--openworld` mean ratios). Further attempted knobs (metadata bit batching, trailer-only NO_SCAN, quiet-path
   non-atomic `enableMetadata`) did not close the gap without regressing `--worst-safe` spikes.
 - **0057**: `BENCHMARKS.md` / guide section with the table above.
+
+## 17. Close mean gap: Appender qalloc floor (patch 0058)
+
+- **Cause**: Phobos `Appender`/`format` use `GC.qalloc` with `NO_SCAN` only (never `APPENDABLE`), so the
+  0056 floor in `allocAppendable` never ran; each format grew `8→16→32→64` with failed `GC.extend`.
+- **0058** (`8f429d7`): floor plain small `NO_SCAN` `qalloc` to 64B; `extendLarge` soft pd-cache.
+- **Evidence** (16-core, DMD 2.113, medians of 5): `--worst` **1.14×**, `--openworld` **1.12×** (mean
+  ≤1.2× **met**); `--worst-safe` mean/p99 ~tie; worst frame on `--openworld`/`--worst-safe` still above
+  druntime; bullet_hell concurrent max ~2.5 ms, 0 over 16 ms, RSS ~2.9 GB; `correctness.sh` OK.
