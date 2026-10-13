@@ -1199,3 +1199,11 @@ The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not de
 - **Evidence** (16-core, DMD 2.113, medians of 5): `--worst` **1.14×**, `--openworld` **1.12×** (mean
   ≤1.2× **met**); `--worst-safe` mean/p99 ~tie; worst frame on `--openworld`/`--worst-safe` still above
   druntime; bullet_hell concurrent max ~2.5 ms, 0 over 16 ms, RSS ~2.9 GB; `correctness.sh` OK.
+
+## 18. Appendable alloc without redundant emap (patch 0060)
+
+- **0060** (`5995376`): small `allocAppendable` uses known size class + slot ptr (no `SlabEntry`);
+  `allocLarge` returns `Extent*` so large appendable skips a second emap lookup.
+- **Evidence** (medians of 5): `--worst` **1.14×** (worst 8.49 < dru 9.67); `--openworld` **1.11×**
+  (worst 1.27 ≤ dru 1.28); `--worst-safe` mean **0.99×**, p99 ~tie, **worst still +1.2 ms**
+  (6.56 vs 5.35); bullet_hell concurrent max **1.5 ms**, 0 over 16 ms, RSS ~2.9 GB; `correctness.sh` OK.

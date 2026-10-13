@@ -1,10 +1,10 @@
 # Reduce steadygc's CPU cost on a small live heap with heavy allocation
 
-Status: Phases 0–3 done (0058). Mean acceptance met on this 16-core machine: DMD `--worst` ~1.14×
-and `--openworld` ~1.12× (≤1.2×). See append "0058 results (2026-10-13)" below for remaining
-worst-frame / `--worst-safe` worst notes. Phase 1 named quiet-frame mutator allocation
-(format/qalloc), not markers or madvise. See `plans/symgc-patches/README.md` section 16–17 and
-`symgc/guide/benchmarks.md` "Small-heap paced engine GC".
+Status: Phases 0–3 done (0058–0060). Mean acceptance met: DMD `--worst`/`--openworld` ~1.11–1.14×.
+After 0060, `--worst`/`--openworld` worst ≤ same-session druntime; remaining open criterion is
+`--worst-safe` worst (~+1.2 ms). See appends "0058 results" and "0060 results" below. Phase 1
+named quiet-frame mutator allocation (format/qalloc), not markers or madvise. See
+`plans/symgc-patches/README.md` section 16–18 and `symgc/guide/benchmarks.md`.
 
 The code to change lives in `symgc/` (fork of symmetryinvestments/symgc, published as
 [leotada/symgc](https://github.com/leotada/symgc) branch `main`). This file stays in `plans/` and is
@@ -715,6 +715,25 @@ Medians of 5 paced runs, 600 frames, two-binary harness:
 - **LDC matrix:** not re-run this session (prior card-stub link issue unchanged).
 
 Phase 4 (dirty-fault work) remains deferred.
+
+## 0060 results (2026-10-13, 16-core Linux, DMD 2.113)
+
+Patch **0060** (`symgc` `5995376`): streamline `allocAppendable` — skip `SlabEntry` rebuild on
+small; return `Extent*` from `allocLarge` for large (no second emap lookup).
+
+Medians of 5 paced runs, 600 frames, two-binary harness:
+
+| Scenario | druntime mean | steadygc mean | ratio | worst (dru / steady) | over16 |
+|---|---|---|---|---|---|
+| `--worst` | 4.832 ms | 5.483 ms | **1.14×** | 9.671 / **8.490** | 0 |
+| `--openworld` | 0.481 ms | 0.534 ms | **1.11×** | 1.278 / **1.266** | 0 |
+| `--worst-safe` | 2.419 ms | 2.392 ms | **0.99×** | 5.348 / **6.556** | 0 |
+
+- Mean ≤1.2×: still met. `--worst`/`--openworld` worst: **met** this session.
+- `--worst-safe` mean/p99: met (mean better; p99 within ~0.6%); **worst still fails** (~+1.2 ms,
+  stable across all 5 runs ≈6.5–6.6 ms — not run-to-run noise).
+- `bullet_hell_stress` concurrent: max **1.5 ms**, 0 over 16 ms, RSS ~2.9 GB (run).
+- `correctness.sh`: OK (run).
 
 ## Risks
 
