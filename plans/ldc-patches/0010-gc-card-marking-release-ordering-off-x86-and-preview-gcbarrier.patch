@@ -1,0 +1,156 @@
+From 69820f4595582ab11f68f754a256f5b2d9563928 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leonardotada@gmail.com>
+Date: Tue, 13 Oct 2026 10:54:34 -0300
+Subject: [PATCH] gc-card-marking: release ordering off x86; -preview=gcbarrier
+ as the shared switch
+
+- The card byte (and the summary byte) is stored with release ordering on every
+  target but x86, where a release store is a plain mov and the output is unchanged
+  (the asm of barrier_micro differs only in the .ident line). On aarch64 it is stlrb.
+  Without it a weakly ordered CPU may show the collector the card before the pointer.
+- -preview=gcbarrier (the switch DMD has) turns the pass on and predefines
+  D_GCBarrier. -gc-card-marking stays as the hidden spelling. Param.gcBarrier is
+  mirrored in dmd/globals.d and dmd/globals.h, and the preview in dmd/cli.d.
+
+Verified on Linux x86-64 with the battery (mark_race, mark_race_glue,
+finalizer_order, phobos_stress, thread_exit_race, cards_precision, cards_window).
+The aarch64 output was only compiled and read, not run.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dmd/cli.d                    |  3 +++
+ dmd/globals.d                |  1 +
+ dmd/globals.h                |  1 +
+ driver/main.cpp              |  4 ++++
+ gen/optimizer.cpp            |  5 +++--
+ gen/passes/GCCardMarking.cpp | 21 +++++++++++++++++----
+ 6 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/dmd/cli.d b/dmd/cli.d
+index 51b8d47b78..6ca81dd367 100644
+--- a/dmd/cli.d
++++ b/dmd/cli.d
+@@ -1086,6 +1086,9 @@ dmd -cov -unittest myprog.d
+             "https://dlang.org/spec/attribute.html#system-variables"),
+         Feature("fastdfa", "useFastDFA",
+             "Fast dataflow analysis engine, experimental"),
++        Feature("gcbarrier", "gcBarrier",
++            "call the GC write barrier after each store of a pointer to memory that is not a local, for concurrent collectors, experimental",
++            "https://dlang.org/spec/garbage.html"),
+     ];
+ }
+ 
+diff --git a/dmd/globals.d b/dmd/globals.d
+index 11c71ffd2e..4c06a5d894 100644
+--- a/dmd/globals.d
++++ b/dmd/globals.d
+@@ -254,6 +254,7 @@ extern (C++) struct Param
+                                  // https://issues.dlang.org/show_bug.cgi?id=14246
+     FeatureState systemVariables; // limit access to variables marked @system from @safe code
+     bool useFastDFA;                 // Use fast data flow analysis engine
++    bool gcBarrier;                  // mark the GC card after pointer stores to non-local memory (-preview=gcbarrier)
+ 
+     CHECKENABLE useInvariants  = CHECKENABLE._default;  // generate class invariant checks
+     CHECKENABLE useIn          = CHECKENABLE._default;  // generate precondition checks
+diff --git a/dmd/globals.h b/dmd/globals.h
+index 9ba04b049b..d641d56ed4 100644
+--- a/dmd/globals.h
++++ b/dmd/globals.h
+@@ -268,6 +268,7 @@ struct Param
+                                  // https://issues.dlang.org/show_bug.cgi?id=14246
+     FeatureState systemVariables; // limit access to variables marked @system from @safe code
+     d_bool useFastDFA;             // Use fast data flow analysis engine
++    d_bool gcBarrier;              // mark the GC card after pointer stores to non-local memory (-preview=gcbarrier)
+ 
+     CHECKENABLE useInvariants;     // generate class invariant checks
+     CHECKENABLE useIn;             // generate precondition checks
+diff --git a/driver/main.cpp b/driver/main.cpp
+index c63052d550..3ebd74e185 100644
+--- a/driver/main.cpp
++++ b/driver/main.cpp
+@@ -1030,6 +1030,10 @@ void registerPredefinedVersions() {
+     VersionCondition::addPredefinedGlobalIdent("D_Coverage");
+   }
+ 
++  if (global.params.gcBarrier) {
++    VersionCondition::addPredefinedGlobalIdent("D_GCBarrier");
++  }
++
+   if (global.params.useUnitTests) {
+     VersionCondition::addPredefinedGlobalIdent("unittest");
+   }
+diff --git a/gen/optimizer.cpp b/gen/optimizer.cpp
+index e9c34ae9cd..b11423c7d8 100644
+--- a/gen/optimizer.cpp
++++ b/gen/optimizer.cpp
+@@ -585,7 +585,8 @@ void runOptimizationPasses(llvm::Module *M, llvm::TargetMachine *TM) {
+     mpm = pb.buildPerModuleDefaultPipeline(level);
+   }
+ 
+-  if (gcCardMarking) {
++  // -preview=gcbarrier is the switch shared with DMD; -gc-card-marking stays as the hidden spelling.
++  if (gcCardMarking || global.params.gcBarrier) {
+     mpm.addPass(GCCardMarkingPass());
+   }
+ 
+@@ -662,7 +663,7 @@ void outputOptimizationSettings(llvm::raw_ostream &hash_os) {
+   hash_os << disableSimplifyDruntimeCalls;
+   hash_os << disableSimplifyLibCalls;
+   hash_os << disableGCToStack;
+-  hash_os << gcCardMarking;
++  hash_os << (gcCardMarking || global.params.gcBarrier);
+   hash_os << stripDebug;
+   hash_os << disableLoopUnrolling;
+   hash_os << disableLoopVectorization;
+diff --git a/gen/passes/GCCardMarking.cpp b/gen/passes/GCCardMarking.cpp
+index 2bdb02b222..0e30bf0cf9 100644
+--- a/gen/passes/GCCardMarking.cpp
++++ b/gen/passes/GCCardMarking.cpp
+@@ -19,6 +19,7 @@
+ #include "llvm/IR/IntrinsicInst.h"
+ #include "llvm/IR/MDBuilder.h"
+ #include "llvm/Support/CommandLine.h"
++#include "llvm/TargetParser/Triple.h"
+ #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+ 
+ using namespace llvm;
+@@ -205,20 +206,32 @@ struct Marker {
+     return L;
+   }
+ 
++  /// The byte that marks a card (or a summary). The collector must not find it
++  /// set before the pointer that was stored is visible, or it could scan the
++  /// memory, clear the card, and miss the pointer: on a CPU that reorders
++  /// stores (ARM) that takes a release store. On x86 a release store is a plain
++  /// `mov`, so there the ordinary store is kept and LLVM stays free to treat it
++  /// as one (the compiler barrier above already orders it against the compiler).
++  void markByte(IRBuilder<> &B, Value *Ptr) {
++    auto *SI = B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1), Ptr);
++    if (!Triple(M.getTargetTriple()).isX86()) {
++      SI->setAlignment(Align(1));
++      SI->setAtomic(AtomicOrdering::Release);
++    }
++  }
++
+   void storeCard(IRBuilder<> &B, Value *Addr, Value *Lo) {
+     auto *Rel = B.CreateSub(B.CreatePtrToInt(Addr, IntPtrTy), Lo);
+     auto *Idx = B.CreateLShr(Rel, ConstantInt::get(IntPtrTy, CardShift));
+     auto *Base = invariantLoad(B, PointerType::getUnqual(C), CardBase);
+-    B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1),
+-                  B.CreateGEP(Type::getInt8Ty(C), Base, Idx));
++    markByte(B, B.CreateGEP(Type::getInt8Ty(C), Base, Idx));
+ 
+     // One byte per 64 KiB, so that finding the dirty cards of a big heap does
+     // not mean reading all of the card table.
+     if (EmitCardSummary && SummaryBase) {
+       auto *SIdx = B.CreateLShr(Rel, ConstantInt::get(IntPtrTy, SummaryShift));
+       auto *SBase = invariantLoad(B, PointerType::getUnqual(C), SummaryBase);
+-      B.CreateStore(ConstantInt::get(Type::getInt8Ty(C), 1),
+-                    B.CreateGEP(Type::getInt8Ty(C), SBase, SIdx));
++      markByte(B, B.CreateGEP(Type::getInt8Ty(C), SBase, SIdx));
+     }
+   }
+ 
+-- 
+2.51.0
+

@@ -1,0 +1,756 @@
+From 60e4a42c7786909e6a68d2de871f363c3605ca58 Mon Sep 17 00:00:00 2001
+From: Leonardo Tada Antunes <leotada523@gmail.com>
+Date: Tue, 13 Oct 2026 11:29:34 -0300
+Subject: [PATCH] gcbarrier: the GC write barrier as a GCC plugin for GDC
+
+A GIMPLE pass, run before the lowering passes, that marks the 512-byte card of every
+store of a pointer into memory that is not a variable or a global: inline
+range-checked card store with release ordering, or a call to __sd_gc_card_range for
+copies over 512 bytes or of unknown size. Defines version (D_GCBarrier) through the
+frontend's exported function (gdc reserves D_* for -fversion). Same card ABI as LDC's
+-gc-card-marking and DMD's -preview=gcbarrier.
+
+With GCC 15.3.0 built from source, Linux x86-64: codegen_check.sh passes, and the
+correctness battery passes with the instrumented libgphobos (mark_race: 0 violations
+with the plugin, 17,936 without).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .gitignore       |   1 +
+ Makefile         |  24 +++
+ README.md        |  75 ++++++++
+ codegen_check.sh | 112 +++++++++++
+ gcbarrier.cc     | 481 +++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 693 insertions(+)
+ create mode 100644 .gitignore
+ create mode 100644 Makefile
+ create mode 100644 README.md
+ create mode 100755 codegen_check.sh
+ create mode 100644 gcbarrier.cc
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..c79eb9a
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1 @@
++gcbarrier.so
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..39d2760
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,24 @@
++# The GC write barrier as a GCC plugin (for GDC).
++#
++#   make GCC_PREFIX=$HOME/opt/gcc-15.3        build gcbarrier.so against that GCC's plugin headers
++#
++# The plugin must be built with the same GCC that loads it (the plugin checks the version
++# and the configuration). The distribution's GCC usually ships no plugin headers; see README.md.
++GCC_PREFIX ?= $(HOME)/opt/gcc-15.3
++HOSTCXX    ?= $(GCC_PREFIX)/bin/g++
++PLUGINDIR  := $(shell $(GCC_PREFIX)/bin/gcc -print-file-name=plugin)
++# GCC's headers include gmp.h, mpfr.h and mpc.h. With a distribution's -devel packages they are in
++# /usr/include; with a GCC built from source (prerequisites downloaded into its tree) they are in
++# GCC_BUILD (the build directory) and GCC_SRC (the source directory).
++GCC_BUILD  ?= $(HOME)/Projetos/gcc15/build
++GCC_SRC    ?= $(HOME)/Projetos/gcc15/src
++EXTRA_INC  := $(wildcard $(GCC_BUILD)/gmp) $(wildcard $(GCC_SRC)/mpfr/src) $(wildcard $(GCC_SRC)/mpc/src)
++
++gcbarrier.so: gcbarrier.cc
++	$(HOSTCXX) -std=gnu++17 -fno-rtti -fPIC -shared -O2 -g -Wall -Wno-unused-parameter \
++		-I$(PLUGINDIR)/include $(addprefix -I,$(EXTRA_INC)) -o $@ $<
++
++clean:
++	rm -f gcbarrier.so
++
++.PHONY: clean
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..a126916
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,75 @@
++# gcbarrier: the GC write barrier as a GCC plugin (for GDC)
++
++After each store of a pointer into memory that is not a variable of the function or a global, the plugin marks the
++512-byte card of the written address, exactly as LDC's `-gc-card-marking` pass and DMD's `-preview=gcbarrier` do. A
++concurrent collector in card mode (steadygc, `symgc/`) then rescans what the program wrote during a mark.
++
++```
++*p = q;     =>   *p = q;
++                 if (((uintptr_t) p - __sd_gc_card_lo) >> 9 < __sd_gc_card_n)
++                     __atomic_store_n (__sd_gc_card_base + idx, 1, __ATOMIC_RELEASE);
++```
++
++A copy or a store of a slice, delegate or struct that holds pointers marks the one or two cards it covers (up to 512
++bytes); anything larger, or of a size known only at run time, calls `__sd_gc_card_range` (symgc's). Both come from the
++collector: the three card variables are zero until it starts, so every barrier is a no-op until then.
++
++## Why a GIMPLE pass, and why that early
++
++The code generator makes pointer stores that never exist as assignments in the frontend: the elements of a heap array
++literal, the fields of a struct literal, the captured variables of a closure (ADR-12). A pass over GIMPLE sees them all.
++It runs before the first lowering pass because once the control-flow graph is built GCC folds a 16-byte `memcpy` into
++an integer-typed move (`uint128_t`), and the type that said "these are pointers" is gone. At that point the barrier
++would have to be added to every integer move through a `ref-all` pointer, or miss the copies.
++
++## What is covered, what is not
++
++Covered: stores through pointers of a type that holds pointers (pointer, class reference, slice, delegate, structs and
++arrays of those); results of calls stored into memory; `memcpy`/`memmove` unless the typed destination pointer is to a
++type without pointers (`int[]` copies are free); word-sized atomic store, exchange and compare-and-swap builtins
++(`core.atomic`). Exempt: variables of the function and globals (roots), stores of null, zero fills, clobbers, and the
++collector's own code (modules `d.gc`, `d.sync`, `symgc.*`, `core.thread.symthread`, `__sd_gc_*`).
++
++Not covered: stores made by inline assembly or by C code (the documented limit of the barrier). There is no clustering of
++adjacent stores yet (DMD and LDC share one barrier among three or more stores to one object); each pointer store has its
++own test.
++
++## Build
++
++The plugin must be built with the GCC that loads it, and a distribution's GCC usually ships no plugin headers. The
++reference setup is GCC 15.3.0 built from source with D and plugin support:
++
++```
++../src/configure --prefix=$HOME/opt/gcc-15.3 --enable-languages=c,c++,d --disable-multilib \
++    --disable-bootstrap --enable-plugin --with-system-zlib --disable-nls --enable-checking=release
++make -j && make install
++make -C gdc-gcbarrier GCC_PREFIX=$HOME/opt/gcc-15.3     # gcbarrier.so
++```
++
++GCC's headers include `gmp.h`, `mpfr.h` and `mpc.h`; with the prerequisites unpacked inside the GCC tree the Makefile
++finds them through `GCC_BUILD` and `GCC_SRC`.
++
++## Use
++
++```
++gdc -O2 -fplugin=gcbarrier.so  ...                       # the plugin also defines version (D_GCBarrier)
++gdc -fplugin=gcbarrier.so -fplugin-arg-gcbarrier-verbose ...   # print the functions it instrumented
++```
++
++`D_GCBarrier` cannot be set with `-fversion` (gdc reserves every `D_*` identifier), so the plugin declares it through
++the frontend's own function, which `d21` exports.
++
++The barrier has to be in everything that stores pointers into the GC heap, druntime and Phobos included. Rebuild the
++target library with the plugin (`make -C <build>/x86_64-pc-linux-gnu/libphobos GDCFLAGS="-g -O2 -fplugin=..."`) and link
++it statically (`-static-libphobos -L...`). A program built without the barrier, or against the stock library, loses
++objects under a concurrent mark: `mark_race` shows it (17,936 violations in a 10 s run on GDC without the plugin, 0 with).
++
++## Tests
++
++- `codegen_check.sh`: counts the card stores and range calls in small functions (the same sample as DMD's
++  `gcbarrier_codegen_check.sh`).
++- The correctness battery of `symgc/bench` and `plans/bench/core_bench` (`mark_race`, `mark_race_glue`,
++  `finalizer_order`, `phobos_stress`, `thread_exit_race`, `cards_window`, `cards_precision`), built with the plugin.
++  `plans/bench/core_bench/gdc_cards.sh` builds one test that way.
++
++Linux x86-64 only. Nothing here has been run on another OS or CPU.
+diff --git a/codegen_check.sh b/codegen_check.sh
+new file mode 100755
+index 0000000..4041d96
+--- /dev/null
++++ b/codegen_check.sh
+@@ -0,0 +1,112 @@
++#!/bin/bash
++# Checks WHERE the plugin puts barriers, by counting the card stores (`movb $1, (...)`) and the calls
++# to __sd_gc_card_range in the assembly of small functions: the same sample as
++# plans/bench/core_bench/gcbarrier_codegen_check.sh (DMD), with GDC's counts. There is no clustering
++# here: every pointer store has its own test, so three adjacent fields are three.
++#
++#   GCC_PREFIX=$HOME/opt/gcc-15.3 ./codegen_check.sh
++set -u
++HERE=$(cd "$(dirname "$0")" && pwd)
++GCC_PREFIX=${GCC_PREFIX:-$HOME/opt/gcc-15.3}
++GDC=${GDC:-$GCC_PREFIX/bin/gdc}
++WORK=$(mktemp -d)
++trap 'rm -rf "$WORK"' EXIT
++
++cat > "$WORK/t.d" <<'EOD'
++class N { N next; N other; int x; }
++struct P { void* a; void* b; long c; }
++struct Q { int a; int b; }
++struct Big { void*[100] p; }
++struct Wrap { N n; }
++__gshared N gslot;
++__gshared N[4] gslots;
++
++void twoFields(N a, N b) { a.next = b; a.other = b; }
++void intField(N a) { a.x = 5; }
++void global(N a) { gslot = a; }
++void globalElem(N a) { gslots[1] = a; }
++void globalElemIdx(N a, size_t i) { gslots[i] = a; }
++__gshared void** gpp;
++__gshared N[] garr;
++void throughGlobalPointer(void* v) { *gpp = v; }
++void throughGlobalSlice(N a, size_t i) { garr[i] = a; }
++void localVar(N a) { N l = a; l = a; }
++void structCopy(P* d, P* s) { *d = *s; }
++void bigStructCopy(Big* d, Big* s) { *d = *s; }
++void pointerFreeCopy(Q* d, Q* s) { *d = *s; }
++void sliceCopy(N[] d, N[] s) { d[] = s[]; }
++void intSliceCopy(int[] d, int[] s) { d[] = s[]; }
++void sliceStore(N[]* d, N[] s) { *d = s; }
++N valueUsed(N a, N b) { return a.next = b; }
++N[] arrayLiteral(N a, N b) { return [a, b]; }
++class Wide { N a; ubyte[600] pad; N b; N c; }
++class Tri { N a; N b; N c; N d; }
++void threeFields(Tri t, N v) { t.a = v; t.b = v; t.c = v; }
++void fourFields(Tri t, N v) { t.a = v; t.b = v; t.c = v; t.d = v; }
++void twoSame(N a, N v) { a.next = v; a.next = v; }
++void farFields(Wide w, N v) { w.a = v; w.b = v; }
++void mixedBases(N a, N b, N v) { a.next = v; b.next = v; a.other = v; }
++void afterCall(N a, N v) { a.next = v; afterCall(a, v); a.other = v; }
++void sideEffectValue(N a, N v, N function() f) { a.next = v; a.other = f(); }
++void threeAdjacent(N a, N v) { a.next = v; a.other = v; a.next = v; }
++void viaRef(ref N slot, N v) { slot = v; }
++void delegateStore(void delegate()* d, void delegate() v) { *d = v; }
++Wrap* newWithLiteral(N a) { return new Wrap(a); }
++void closure(N a, void delegate()* d) { *d = () { cast(void) a.x; }; }
++version (D_GCBarrier) {} else static assert(0, "the plugin did not define D_GCBarrier");
++EOD
++
++$GDC -O2 -fplugin="$HERE/gcbarrier.so" ${EXTRA:-} -c "$WORK/t.d" -o "$WORK/t.o" || exit 1
++
++count() { # function  CARDSTORE|range
++	objdump -dr --no-show-raw-insn "$WORK/t.o" |
++		awk -v fn="_D1t$(printf '%d' ${#1})$1" -v kind="$2" '
++			/^[0-9a-f]+ <.*>:$/ { infn = index($0, fn "F") > 0 }
++			infn && kind == "CARDSTORE" && /movb +\$0x1,\(/ { n++ }
++			infn && kind == "range" && /R_X86_64_.*__sd_gc_card_range/ { n++ }
++			END { print n + 0 }'
++}
++
++fail=0
++check() { # function  cardstores  rangecalls
++	local one range
++	one=$(count "$1" CARDSTORE); range=$(count "$1" range)
++	if [ "$one" -eq "$2" ] && [ "$range" -eq "$3" ]; then
++		printf "ok    %-22s card stores x%d, range calls x%d\n" "$1" "$one" "$range"
++	else
++		printf "FAIL  %-22s got x%d and x%d, expected x%d and x%d\n" "$1" "$one" "$range" "$2" "$3"
++		fail=1
++	fi
++}
++
++check twoFields           2 0
++check threeFields         3 0
++check fourFields          4 0
++check twoSame             2 0
++check farFields           2 0
++check threeAdjacent       3 0
++check mixedBases          3 0
++check afterCall           2 0
++check sideEffectValue     2 0
++check intField            0 0   # not a pointer
++check global              0 0   # a global is a root
++check globalElem          0 0
++check globalElemIdx       0 0
++check localVar            0 0   # a local is a root
++check structCopy          2 0   # 24 bytes: the cards of the first and the last byte
++check bigStructCopy       0 1   # over 512 bytes: the range call
++check pointerFreeCopy     0 0
++check sliceCopy           0 1   # size known only at run time: the range call
++check intSliceCopy        0 0   # typed pointers to int: nothing
++check sliceStore          2 0   # a slice is two words
++check valueUsed           1 0
++check arrayLiteral        2 0   # the elements are copied from a temporary by the code generator
++check viaRef              1 0
++check delegateStore       2 0
++check newWithLiteral      1 0
++check throughGlobalPointer 1 0
++check throughGlobalSlice  1 0
++check closure             3 0   # the frame field holding a, and the delegate (two words)
++
++[ $fail -eq 0 ] && echo "ALL OK" || echo "FAILED"
++exit $fail
+diff --git a/gcbarrier.cc b/gcbarrier.cc
+new file mode 100644
+index 0000000..a0d0610
+--- /dev/null
++++ b/gcbarrier.cc
+@@ -0,0 +1,481 @@
++/* GC write barrier for concurrent collectors, as a GCC plugin (for GDC).
++
++   After each store of a pointer to memory that is not a variable of the function or a
++   global, mark the card of the written address, exactly as LDC's -gc-card-marking pass and
++   DMD's -preview=gcbarrier do:
++
++       *p = q;       =>   *p = q;
++                          if (((uintptr_t) p - __sd_gc_card_lo) >> 9 < __sd_gc_card_n)
++                            __atomic_store_n (__sd_gc_card_base + idx, 1, __ATOMIC_RELEASE);
++
++   A copy or a store of a slice, delegate or struct that holds pointers marks the one or two
++   cards it covers (up to 512 bytes), or calls __sd_gc_card_range (anything else).
++
++   It is a pass over GIMPLE, run first of the lowering passes (before the control-flow graph
++   exists), so every store the code generator makes is seen: the elements of an array literal,
++   the fields of a struct literal, the captured variables of a closure never exist as
++   assignments in the frontend (ADR-12). It has to be that early: once the CFG is built, GCC
++   folds a 16-byte memcpy into an integer-typed move, and the type that said "pointers" is gone.
++
++   Usage:  gdc -fplugin=./gcbarrier.so -fversion=D_GCBarrier ...
++   The runtime part (the card variables and __sd_gc_card_range) is symgc's, in card mode.
++
++   Licence: GPL-3.0-or-later (a GCC plugin must be GPL compatible: plugin_is_GPL_compatible). */
++
++#include "gcc-plugin.h"
++#include "config.h"
++#include "system.h"
++#include "coretypes.h"
++#include "backend.h"
++#include "tree.h"
++#include "gimple.h"
++#include "tree-pass.h"
++#include "ssa.h"
++#include "gimple-iterator.h"
++#include "gimple-pretty-print.h"
++#include "tree-cfg.h"
++#include "cfgloop.h"
++#include "builtins.h"
++#include "stringpool.h"
++#include "attribs.h"
++#include "context.h"
++#include "varasm.h"
++#include "cgraph.h"
++#include "diagnostic.h"
++#include "fold-const.h"
++#include "stor-layout.h"
++#include "tree-nested.h"
++#include "tree-eh.h"
++#include "gimple-walk.h"
++#include "plugin-version.h"
++
++int plugin_is_GPL_compatible;
++
++/* gdc reserves every version identifier that starts with "D_" (-fversion=D_GCBarrier is an
++   error), so the plugin declares it the way the compiler declares D_Coverage and the others:
++   through the frontend's own function, which d21 exports. Weak, so the plugin still loads in a
++   compiler that is not d21 (it then does nothing about the version). */
++extern "C" void gcb_predefine_version (const char *)
++  __asm__ ("_ZN16VersionCondition24addPredefinedGlobalIdentEPKc") __attribute__ ((weak));
++
++namespace {
++
++const unsigned CARD_SHIFT = 9;             /* 512-byte cards */
++const HOST_WIDE_INT MAX_INLINE_RANGE = 512; /* a range of up to this many bytes spans at most 2 cards */
++
++bool opt_verbose = false;
++
++/* ---- what is a store the collector must hear about ---- */
++
++/* Can a value of this type hold a pointer? */
++bool
++type_has_pointers (tree t)
++{
++  if (t == NULL_TREE || t == error_mark_node)
++    return false;
++  switch (TREE_CODE (t))
++    {
++    case POINTER_TYPE:
++    case REFERENCE_TYPE:
++      return true;
++    case RECORD_TYPE:
++    case UNION_TYPE:
++    case QUAL_UNION_TYPE:
++      for (tree f = TYPE_FIELDS (t); f; f = DECL_CHAIN (f))
++	if (TREE_CODE (f) == FIELD_DECL && type_has_pointers (TREE_TYPE (f)))
++	  return true;
++      return false;
++    case ARRAY_TYPE:
++      return type_has_pointers (TREE_TYPE (t));
++    default:
++      return false;
++    }
++}
++
++/* Is the store to LHS one the collector may not see by other means? A variable of the
++   function or a global is a root (scanned with the stacks and the data segments); memory
++   reached through a pointer may be in the GC heap. */
++bool
++heap_store_target (tree lhs)
++{
++  if (lhs == NULL_TREE || TREE_CODE (lhs) == SSA_NAME)
++    return false;
++
++  tree base = get_base_address (lhs);
++  if (base == NULL_TREE)
++    return false;
++
++  if (TREE_CODE (base) == MEM_REF || TREE_CODE (base) == TARGET_MEM_REF)
++    {
++      tree ptr = TREE_OPERAND (base, 0);
++      if (TREE_CODE (ptr) == ADDR_EXPR)
++	{
++	  tree d = get_base_address (TREE_OPERAND (ptr, 0));
++	  if (d && DECL_P (d))
++	    return false;	/* MEM_REF[&var]: the variable itself */
++	}
++      return true;
++    }
++
++  if (TREE_CODE (base) == INDIRECT_REF)
++    return true;
++
++  return false;
++}
++
++/* The collector and its synchronization store into their own metadata, never into the
++   memory the collector manages: not instrumented. (The mangled names of the modules d.gc,
++   d.sync, symgc.* and core.thread.symthread, and the C entry points.) */
++bool
++collector_code (const char *name)
++{
++  static const char *const prefixes[] = {
++    "_D1d2gc", "_D1d4sync", "_D5symgc", "_D4core6thread9symthread",
++    "__sd_gc_", "_d_gcBarrier",
++  };
++  for (const char *p : prefixes)
++    if (strncmp (name, p, strlen (p)) == 0)
++      return true;
++  return false;
++}
++
++/* ---- declarations the barrier uses ---- */
++
++struct decls
++{
++  tree uintptr;
++  tree card_lo, card_n, card_base;
++  tree range_fn;
++} D;
++
++tree
++extern_var (const char *name, tree type)
++{
++  tree v = build_decl (UNKNOWN_LOCATION, VAR_DECL, get_identifier (name), type);
++  DECL_EXTERNAL (v) = 1;
++  TREE_PUBLIC (v) = 1;
++  TREE_STATIC (v) = 0;
++  DECL_ARTIFICIAL (v) = 1;
++  varpool_node::get_create (v);
++  return v;
++}
++
++void
++init_decls ()
++{
++  if (D.uintptr)
++    return;
++  D.uintptr = build_nonstandard_integer_type (POINTER_SIZE, 1);
++  tree ubyte_ptr = build_pointer_type (unsigned_char_type_node);
++  D.card_lo = extern_var ("__sd_gc_card_lo", D.uintptr);
++  D.card_n = extern_var ("__sd_gc_card_n", D.uintptr);
++  D.card_base = extern_var ("__sd_gc_card_base", ubyte_ptr);
++
++  tree fntype = build_function_type_list (void_type_node, ptr_type_node, D.uintptr, NULL_TREE);
++  D.range_fn = build_fn_decl ("__sd_gc_card_range", fntype);
++  DECL_EXTERNAL (D.range_fn) = 1;
++  TREE_PUBLIC (D.range_fn) = 1;
++}
++
++/* ---- what to do at each store ---- */
++
++struct request
++{
++  tree lhs;		/* the memory written (null when only its address is known) */
++  tree addr;		/* the address, when LHS is null: the destination of a copy */
++  HOST_WIDE_INT size;	/* bytes written; -1 if only known at run time */
++  tree size_tree;	/* for a variable-size copy */
++};
++
++/* Is the argument of a memcpy-like call pointer-free? Looks back in the block for the
++   conversion that made the void * from a typed pointer. Conservative: false when unsure. */
++bool
++dest_pointer_free (gimple_stmt_iterator at, tree arg)
++{
++  if (TREE_CODE (arg) == ADDR_EXPR)
++    {
++      tree t = TREE_TYPE (TREE_OPERAND (arg, 0));
++      return !type_has_pointers (t);
++    }
++  /* The argument keeps the type of the pointer it came from (calls accept any pointer
++     for the void * parameter). */
++  if (POINTER_TYPE_P (TREE_TYPE (arg)))
++    {
++      tree pointee = TREE_TYPE (TREE_TYPE (arg));
++      if (pointee != void_type_node && TREE_CODE (pointee) != VOID_TYPE
++	  && !type_has_pointers (pointee))
++	return true;
++    }
++  if (TREE_CODE (arg) != VAR_DECL && TREE_CODE (arg) != SSA_NAME)
++    return false;
++
++  gimple_stmt_iterator gsi = at;
++  for (int back = 0; back < 12; back++)
++    {
++      gsi_prev (&gsi);
++      if (gsi_end_p (gsi))
++	break;
++      gimple *s = gsi_stmt (gsi);
++      if (!is_gimple_assign (s) || gimple_assign_lhs (s) != arg)
++	continue;
++      if (!CONVERT_EXPR_CODE_P (gimple_assign_rhs_code (s)))
++	return false;
++      tree from = TREE_TYPE (gimple_assign_rhs1 (s));
++      if (!POINTER_TYPE_P (from))
++	return false;
++      tree pointee = TREE_TYPE (from);
++      return pointee != void_type_node && !type_has_pointers (pointee);
++    }
++  return false;
++}
++
++/* What, if anything, the statement at *GSI stores that the collector must hear about. */
++bool
++find_store (gimple_stmt_iterator gsi, request &out)
++{
++  gimple *s = gsi_stmt (gsi);
++
++  if (is_gimple_assign (s))
++    {
++      if (gimple_clobber_p (s))
++	return false;
++      tree lhs = gimple_assign_lhs (s);
++      if (!heap_store_target (lhs))
++	return false;
++      tree type = TREE_TYPE (lhs);
++      if (!type_has_pointers (type))
++	return false;
++      /* A store of null cannot hide an object from the collector. */
++      tree rhs = gimple_assign_rhs1 (s);
++      if (gimple_assign_single_p (s) && POINTER_TYPE_P (type) && integer_zerop (rhs))
++	return false;
++      if (gimple_assign_single_p (s) && TREE_CODE (rhs) == CONSTRUCTOR
++	  && CONSTRUCTOR_NELTS (rhs) == 0)
++	return false;		/* zero fill */
++      HOST_WIDE_INT size = int_size_in_bytes (type);
++      if (size == 0)
++	return false;
++      out = request {lhs, NULL_TREE, size, NULL_TREE};
++      return true;
++    }
++
++  if (!is_gimple_call (s))
++    return false;
++
++  /* The result of a call stored straight into memory. */
++  tree clhs = gimple_call_lhs (s);
++  if (clhs && heap_store_target (clhs) && type_has_pointers (TREE_TYPE (clhs)))
++    {
++      out = request {clhs, NULL_TREE, int_size_in_bytes (TREE_TYPE (clhs)), NULL_TREE};
++      return true;
++    }
++
++  if (!gimple_call_builtin_p (s, BUILT_IN_NORMAL))
++    return false;
++
++  switch (DECL_FUNCTION_CODE (gimple_call_fndecl (s)))
++    {
++    case BUILT_IN_MEMCPY:
++    case BUILT_IN_MEMMOVE:
++      {
++	tree dest = gimple_call_arg (s, 0);
++	tree n = gimple_call_arg (s, 2);
++	if (integer_zerop (n) || dest_pointer_free (gsi, dest))
++	  return false;
++	HOST_WIDE_INT size = tree_fits_uhwi_p (n) ? tree_to_uhwi (n) : -1;
++	out = request {NULL_TREE, dest, size, size < 0 ? n : NULL_TREE};
++	return true;
++      }
++    /* Atomic stores, exchanges and compare-and-swaps of a word: core.atomic's stores of
++       pointers.  The type is not known here, so every one of word size is marked. */
++    case BUILT_IN_ATOMIC_STORE_8:
++    case BUILT_IN_ATOMIC_EXCHANGE_8:
++    case BUILT_IN_ATOMIC_COMPARE_EXCHANGE_8:
++    case BUILT_IN_SYNC_VAL_COMPARE_AND_SWAP_8:
++    case BUILT_IN_SYNC_BOOL_COMPARE_AND_SWAP_8:
++      out = request {NULL_TREE, gimple_call_arg (s, 0), (HOST_WIDE_INT) (POINTER_SIZE / 8), NULL_TREE};
++      return true;
++    default:
++      return false;
++    }
++}
++
++/* tmp = value; returns tmp (a fresh register of TYPE). */
++tree
++emit (gimple_seq *seq, tree type, tree_code code, tree a, tree b = NULL_TREE)
++{
++  tree tmp = create_tmp_reg (type, "gcb");
++  gimple *g = b ? gimple_build_assign (tmp, code, a, b) : gimple_build_assign (tmp, code, a);
++  gimple_seq_add_stmt (seq, g);
++  return tmp;
++}
++
++tree
++load (gimple_seq *seq, tree var)
++{
++  tree tmp = create_tmp_reg (TREE_TYPE (var), "gcb");
++  gimple_seq_add_stmt (seq, gimple_build_assign (tmp, var));
++  return tmp;
++}
++
++/* The address of a store's target, as a gimple value. */
++tree
++address_of (gimple_seq *seq, tree lhs)
++{
++  tree tmp = create_tmp_reg (ptr_type_node, "gcb_addr");
++  gimple_seq_add_stmt (seq, gimple_build_assign (tmp, build_fold_addr_expr (lhs)));
++  return tmp;
++}
++
++/* card = base + idx; __atomic_store_1 (card, 1, release) */
++void
++mark_card (gimple_seq *seq, tree idx)
++{
++  tree base = load (seq, D.card_base);
++  tree idx_s = emit (seq, sizetype, NOP_EXPR, idx);
++  tree p = emit (seq, TREE_TYPE (D.card_base), POINTER_PLUS_EXPR, base, idx_s);
++  tree fn = builtin_decl_explicit (BUILT_IN_ATOMIC_STORE_1);
++  gimple_seq_add_stmt (seq, gimple_build_call (fn, 3, p, build_int_cst (unsigned_char_type_node, 1),
++					       build_int_cst (integer_type_node, 3 /* __ATOMIC_RELEASE */)));
++}
++
++/* Add the barrier after the statement at *GSI. The control flow does not exist yet, so the
++   test is a conditional jump over labels; the lowering passes build the blocks. If the
++   statement is a call that can throw, lowering puts the barrier on its normal path. */
++void
++rewrite (gimple_stmt_iterator *gsi, const request &r)
++{
++  gimple_seq seq = NULL;
++  tree addr = r.lhs ? address_of (&seq, r.lhs) : r.addr;
++
++  if (r.size < 0 || r.size > MAX_INLINE_RANGE)
++    {
++      tree n = r.size >= 0 ? build_int_cst (D.uintptr, r.size)
++			   : emit (&seq, D.uintptr, NOP_EXPR, r.size_tree);
++      gimple_seq_add_stmt (&seq, gimple_build_call (D.range_fn, 2, addr, n));
++      gsi_insert_seq_after (gsi, seq, GSI_CONTINUE_LINKING);
++      return;
++    }
++
++  /* in the window?  idx = ((uintptr) addr - lo) >> 9;  idx < n */
++  tree a = emit (&seq, D.uintptr, NOP_EXPR, addr);
++  tree lo = load (&seq, D.card_lo);
++  tree rel = emit (&seq, D.uintptr, MINUS_EXPR, a, lo);
++  tree idx = emit (&seq, D.uintptr, RSHIFT_EXPR, rel, build_int_cst (integer_type_node, CARD_SHIFT));
++  tree n = load (&seq, D.card_n);
++
++  tree then_label = create_artificial_label (UNKNOWN_LOCATION);
++  tree end_label = create_artificial_label (UNKNOWN_LOCATION);
++  gimple_seq_add_stmt (&seq, gimple_build_cond (LT_EXPR, idx, n, then_label, end_label));
++  gimple_seq_add_stmt (&seq, gimple_build_label (then_label));
++
++  /* the cards, when the address is in the window: the first and, if the range reaches it,
++     the next. Both are in the window whenever the first is (objects do not straddle its edge). */
++  mark_card (&seq, idx);
++  if (r.size > (HOST_WIDE_INT) (POINTER_SIZE / 8))
++    {
++      tree last = emit (&seq, D.uintptr, PLUS_EXPR, rel, build_int_cst (D.uintptr, r.size - 1));
++      tree idx2 = emit (&seq, D.uintptr, RSHIFT_EXPR, last,
++			build_int_cst (integer_type_node, CARD_SHIFT));
++      mark_card (&seq, idx2);
++    }
++  gimple_seq_add_stmt (&seq, gimple_build_label (end_label));
++
++  gsi_insert_seq_after (gsi, seq, GSI_CONTINUE_LINKING);
++}
++
++/* ---- the pass ---- */
++
++unsigned stores_seen;
++
++/* walk_gimple_seq_mod callback: nested bodies (bind, try, catch) are entered by the walker. */
++tree
++visit_stmt (gimple_stmt_iterator *gsi, bool *handled, struct walk_stmt_info *)
++{
++  *handled = false;
++  request r;
++  if (find_store (*gsi, r))
++    {
++      stores_seen++;
++      rewrite (gsi, r);
++    }
++  return NULL_TREE;
++}
++
++const pass_data gcbarrier_pass_data = {
++  GIMPLE_PASS,		/* type */
++  "gcbarrier",		/* name */
++  OPTGROUP_NONE,	/* optinfo_flags */
++  TV_NONE,		/* tv_id */
++  PROP_gimple_any,	/* properties_required */
++  0, 0, 0, 0		/* provided, destroyed, todo_flags_start, todo_flags_finish */
++};
++
++class pass_gcbarrier : public gimple_opt_pass
++{
++public:
++  pass_gcbarrier (gcc::context *ctxt) : gimple_opt_pass (gcbarrier_pass_data, ctxt) {}
++
++  bool gate (function *) final override
++  {
++    const char *name = IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (current_function_decl));
++    return !collector_code (name);
++  }
++
++  unsigned int execute (function *fun) final override
++  {
++    init_decls ();
++    stores_seen = 0;
++
++    struct walk_stmt_info wi;
++    memset (&wi, 0, sizeof wi);
++    gimple_seq body = gimple_body (current_function_decl);
++    walk_gimple_seq_mod (&body, visit_stmt, NULL, &wi);
++    gimple_set_body (current_function_decl, body);
++
++    if (opt_verbose && stores_seen)
++      fprintf (stderr, "gcbarrier: %s: %u store(s)\n",
++	       IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (fun->decl)), stores_seen);
++    return 0;
++  }
++};
++
++
++/* Before the frontend parses the unit: version (D_GCBarrier) is true. */
++void
++start_unit (void *, void *)
++{
++  if (opt_verbose)
++    fprintf (stderr, "gcbarrier: predefine D_GCBarrier (%s)\n", gcb_predefine_version ? "found" : "not found");
++  if (gcb_predefine_version)
++    gcb_predefine_version ("D_GCBarrier");
++}
++
++} // anonymous namespace
++
++int
++plugin_init (struct plugin_name_args *info, struct plugin_gcc_version *version)
++{
++  if (!plugin_default_version_check (version, &gcc_version))
++    {
++      fprintf (stderr, "gcbarrier: built for GCC %s, loaded into GCC %s\n",
++	       gcc_version.basever, version->basever);
++      return 1;
++    }
++
++  for (int i = 0; i < info->argc; i++)
++    if (strcmp (info->argv[i].key, "verbose") == 0)
++      opt_verbose = true;
++
++  start_unit (NULL, NULL);
++  register_callback (info->base_name, PLUGIN_START_UNIT, start_unit, NULL);
++  register_callback (info->base_name, PLUGIN_ATTRIBUTES, start_unit, NULL);
++
++  struct register_pass_info pass_info;
++  pass_info.pass = new pass_gcbarrier (g);
++  pass_info.reference_pass_name = "lower";
++  pass_info.ref_pass_instance_number = 1;
++  pass_info.pos_op = PASS_POS_INSERT_BEFORE;
++  register_callback (info->base_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
++  return 0;
++}
+-- 
+2.51.0
+

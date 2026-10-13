@@ -1153,3 +1153,24 @@ The first step of `plans/cross_platform_gc_plan.md`: a card ABI that does not de
   leotada/dmd branch `gc-phase0-discovery`, leotada/ldc branch `gc-card-marking`) and the README the clone URL. The
   run-time option is unchanged (`gc:sdc` / `gc:sdcq`); `gc:concurrent` was only a suggestion. The old name remains in
   the historical logs under `plans/bench/core_bench/results/`.
+
+## 15. Phase 2: the barrier in DMD, LDC and GDC (patches 0052-0054, LDC 0010, GDC 0001)
+
+- **dmd** (`e5d60aecdd`, `3a10b8d761`, `d1ed9fe45e`, local): small constant-size copies expanded in place;
+  `gcbarrier_negative_control.sh` (a DMD built with `-version=GCBarrierBrokenCluster` must fail the codegen check and
+  `mark_race_glue`); `gcbarrier_dmd_suite.sh` (DMD's runnable and compilable tests with the flag, a stub object for the
+  collector's globals passed with `-L`, not as a C source).
+- **LDC 0010**: card byte with release ordering off x86; `-preview=gcbarrier` as the shared switch.
+- **GDC 0001** (`plans/gdc-patches/`): the GIMPLE plugin. Runs before the lowering passes; defines `D_GCBarrier` through
+  the frontend's exported `VersionCondition::addPredefinedGlobalIdent`.
+- **0052-0053**: symgc on a druntime without the thread-init hook (GDC 15 ships 2.111). 0052 attached threads in the
+  module's thread-local constructor and raced (a thread is on the list before its constructors run: SIGILL on
+  `assert(tlsGCData)`); stopping such a thread with druntime alone deadlocked (it can be inside `createThread` holding a
+  collector lock). 0053 registers under the thread list's lock (`thread_preStopTheWorld`/`thread_postRestartTheWorld`),
+  which the stop takes before its own, and skips not-yet-attached threads. `thread_exit_race`: 16 of 16 runs on GDC.
+- **0054**: `guide/usage.md` recipe G.
+- **Evidence** (`plans/bench/core_bench/conformance.sh 10 60`): the six correctness tests pass under DMD, LDC and GDC;
+  500k city, 60 s: 0 frames over 16 ms with each (worst 8.5, 8.3 and 10.3 ms). GDC without the plugin: `mark_race` 17,936
+  violations in 10 s.
+- **Not done**: GDC clustering and a `barrier_micro` run; the unified range entry point; 8 GiB stress, bullet hell and soak
+  after the card change; anything off Linux x86-64.

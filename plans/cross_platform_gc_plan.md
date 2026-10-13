@@ -191,3 +191,31 @@ Everything below was run on Linux x86-64; nothing was run on another OS.
 
 Next for phase 1: run the battery on the Android emulator (build instructions in `symgc/guide/android.md`, untested),
 then Windows. For phase 2: a first prototype of the frontend lowering on DMD.
+
+### 2026-10-13: phase 2, the barrier in all three compilers (done on Linux x86-64)
+
+The mechanism changed from the plan above (ADR-12): the barrier is one backend pass per compiler, not a frontend
+lowering, because the code generator makes pointer stores (array literal elements, struct literals, closure frames)
+that never exist as frontend assignments. What the compilers share is the `-preview=gcbarrier` switch, the
+range-checked card ABI, the version `D_GCBarrier` and the rules for what is exempt.
+
+* **DMD**: `backend/gcbarrier.d`. Small constant-size copies (up to 512 bytes) are expanded in place too. A negative
+  control (`gcbarrier_negative_control.sh`) shows the tests fail on a DMD whose clusters forget their barrier, and
+  `gcbarrier_dmd_suite.sh` runs DMD's `runnable` and `compilable` tests with the flag (0 failures).
+* **LDC**: the card byte is stored with release ordering off x86 (`stlrb` on aarch64, compiled and read, not run);
+  `-preview=gcbarrier` is the shared switch (`-gc-card-marking` stays as the hidden spelling).
+* **GDC**: a GCC plugin, `gdc-gcbarrier/`, a GIMPLE pass that runs before the lowering passes (once the CFG is built GCC
+  folds a 16-byte memcpy into an integer move and the pointer type is lost). It needs a GCC with plugin headers: GCC
+  15.3.0 was built from source. gdc reserves `D_*` versions, so the plugin defines `D_GCBarrier` through the
+  frontend's exported function. No clustering of adjacent stores yet.
+* **symgc on druntime 2.111** (GDC 15): no thread-init hook, so the collector attaches druntime threads through its
+  module's thread-local constructor, under the thread-list lock (patches 0052-0053). The first version raced.
+* **Exit test** (`plans/bench/core_bench/conformance.sh 10 60`, ALL OK): the battery (`mark_race`, `mark_race_glue`,
+  `finalizer_order`, `thread_exit_race`, `cards_precision`, `phobos_stress`) passes under all three, and the 500k city
+  (60 s, 6 job threads, 2 GiB) has 0 frames over 16 ms: DMD worst 8.5 ms, LDC 8.3 ms, GDC 10.3 ms. Without the plugin the
+  same GDC build of `mark_race` loses objects (17,936 violations in 10 s; 0 with it).
+* **Not met / not done**: the LDC "within 10% of today's pass" check is trivially met on x86-64 (the assembly of
+  `barrier_micro` is identical to before) but the cost of GDC's barrier was not measured with `barrier_micro`; LDC calls
+  symgc's `__sd_gc_card_range` while DMD calls druntime's `_d_gcBarrierRange` (two names for one job, left until the
+  druntime pull request); 8 GiB stress, bullet hell and the 30-60 min soak were not re-run; nothing was run off Linux
+  x86-64.
